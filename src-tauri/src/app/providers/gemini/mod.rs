@@ -341,7 +341,7 @@ impl ProviderSession for GeminiSession {
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
 
-        let _ = self.transport.request(
+        let _ = self.transport.request_with_timeout(
             "session/prompt",
             json!({
                 "sessionId": sid,
@@ -352,6 +352,7 @@ impl ProviderSession for GeminiSession {
                     }
                 ]
             }),
+            Some(std::time::Duration::from_secs(1800)), // 30 mins for thinking, tool execution, and user approvals
         ).await?;
 
         // In ACP v1, response to session/prompt signifies that turn execution has completed
@@ -393,19 +394,27 @@ impl ProviderSession for GeminiSession {
         };
 
         let result_payload = if approved {
-            // Find option matching allow, or default to first option ID
+            // Real ACP protocol: options contain optionId, name, kind
             let option_id = options
                 .iter()
                 .find_map(|opt| {
-                    let id = opt.get("id").and_then(|v| v.as_str())?;
-                    if id.contains("allow") {
-                        Some(id.to_string())
+                    let option_id = opt.get("optionId").and_then(|v| v.as_str())?;
+                    let kind = opt.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                    if kind.eq_ignore_ascii_case("allow")
+                        || kind.contains("allow")
+                        || option_id.to_lowercase().contains("allow")
+                    {
+                        Some(option_id.to_string())
                     } else {
                         None
                     }
                 })
                 .or_else(|| {
-                    options.first().and_then(|opt| opt.get("id")).and_then(|v| v.as_str()).map(ToString::to_string)
+                    options
+                        .first()
+                        .and_then(|opt| opt.get("optionId"))
+                        .and_then(|v| v.as_str())
+                        .map(ToString::to_string)
                 })
                 .unwrap_or_else(|| "allow".to_string());
 

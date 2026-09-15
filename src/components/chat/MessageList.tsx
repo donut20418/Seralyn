@@ -1,4 +1,4 @@
-import React, { useRef, useEffect } from 'react';
+import { useRef, useEffect } from 'react';
 import { Message, ProviderKind } from '../../lib/types';
 import { MessageBubble } from './MessageBubble';
 import { StreamingText } from './StreamingText';

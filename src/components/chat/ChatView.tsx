@@ -1,4 +1,3 @@
-import React from 'react';
 import type { Message, ProviderKind, ProviderStatus } from '../../lib/types';
 import { ProviderSelector } from '../providers/ProviderSelector';
 import { MessageList } from './MessageList';

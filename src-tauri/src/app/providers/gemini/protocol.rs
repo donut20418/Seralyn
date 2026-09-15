@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpRequest {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: serde_json::Value,
     pub method: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub params: Option<serde_json::Value>,
@@ -14,7 +14,7 @@ pub struct AcpRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AcpResponse {
     pub jsonrpc: String,
-    pub id: u64,
+    pub id: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -40,7 +40,7 @@ pub enum AcpMessage {
 }
 
 /// Helper to create a request
-pub fn make_acp_request(id: u64, method: &str, params: Option<serde_json::Value>) -> AcpRequest {
+pub fn make_acp_request(id: serde_json::Value, method: &str, params: Option<serde_json::Value>) -> AcpRequest {
     AcpRequest {
         jsonrpc: "2.0".to_string(),
         id,

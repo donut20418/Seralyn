@@ -134,8 +134,19 @@ impl JsonRpcTransport {
         (transport, notif_rx, server_req_rx)
     }
 
-    /// Sends a JSON-RPC request and synchronously awaits the matching response.
+    /// Sends a JSON-RPC request and synchronously awaits the matching response (default 30s timeout).
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
+        self.request_with_timeout(method, params, Some(std::time::Duration::from_secs(30))).await
+    }
+
+    /// Sends a JSON-RPC request with a configurable timeout.
+    /// If timeout is None, awaits response without time limit (for long-running operations like agent prompts).
+    pub async fn request_with_timeout(
+        &self,
+        method: &str,
+        params: Value,
+        timeout_opt: Option<std::time::Duration>,
+    ) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let (reply_tx, reply_rx) = oneshot::channel();
 
@@ -158,13 +169,20 @@ impl JsonRpcTransport {
             return Err(e);
         }
 
-        match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
-            Ok(Ok(res)) => res,
-            Ok(Err(_)) => Err(AppError::Provider("JSON-RPC response channel dropped".to_string())),
-            Err(_) => {
-                let mut pending = self.pending_requests.lock().await;
-                pending.remove(&id);
-                Err(AppError::Provider(format!("JSON-RPC request '{method}' timed out after 30s")))
+        if let Some(dur) = timeout_opt {
+            match tokio::time::timeout(dur, reply_rx).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(_)) => Err(AppError::Provider("JSON-RPC response channel dropped".to_string())),
+                Err(_) => {
+                    let mut pending = self.pending_requests.lock().await;
+                    pending.remove(&id);
+                    Err(AppError::Provider(format!("JSON-RPC request '{method}' timed out after {:?}", dur)))
+                }
+            }
+        } else {
+            match reply_rx.await {
+                Ok(res) => res,
+                Err(_) => Err(AppError::Provider("JSON-RPC response channel dropped".to_string())),
             }
         }
     }

@@ -106,7 +106,7 @@ impl Provider for CodexProvider {
         let (approval_policy, sandbox) = match config.permission_mode {
             PermissionMode::Safe => ("on-request", "read-only"),
             PermissionMode::Workspace => ("on-request", "workspace-write"),
-            PermissionMode::FullAccess => ("never", "full-access"),
+            PermissionMode::FullAccess => ("never", "danger-full-access"),
         };
 
         let mut start_params = json!({

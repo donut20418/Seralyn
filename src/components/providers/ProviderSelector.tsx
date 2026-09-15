@@ -1,4 +1,3 @@
-import React from 'react';
 import { ProviderStatus as IProviderStatus, ProviderKind } from '../../lib/types';
 
 interface ProviderSelectorProps {

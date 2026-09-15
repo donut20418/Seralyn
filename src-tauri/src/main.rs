@@ -69,20 +69,21 @@ async fn send_message(
     let provider_kind = ProviderKind::from_str(&provider).map_err(|e| e.to_string())?;
 
     let (tx, mut rx) = mpsc::channel(100);
+    let app_clone = app.clone();
+
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let Err(e) = app_clone.emit("conversation-event", &event) {
+                error!("Failed to emit event: {}", e);
+            }
+        }
+    });
 
     state
         .conversation_manager
         .send_message(&conversation_id, &content, provider_kind, tx)
         .await
         .map_err(|e| e.to_string())?;
-
-    tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            if let Err(e) = app.emit("conversation-event", &event) {
-                error!("Failed to emit event: {}", e);
-            }
-        }
-    });
 
     Ok(())
 }

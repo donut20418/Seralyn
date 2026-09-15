@@ -138,13 +138,13 @@ impl ConversationManager {
                     event_sender: internal_tx,
                 };
                 
-                let (sess, provider_session_id) = match &existing_record {
+                let (sess, provider_session_id): (Arc<dyn ProviderSession>, String) = match &existing_record {
                     Some(record) if record.provider_session_id.is_some() => {
                         let native_id = record.provider_session_id.as_ref().unwrap();
                         match provider.resume_session(native_id, config.clone()).await {
                             Ok(sess) => (Arc::from(sess), record.id.clone()),
                             Err(_) => {
-                                let sess = Arc::from(provider.create_session(config).await?);
+                                let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
                                 let rec = provider_sessions::create_provider_session(
                                     &self.db,
                                     conversation_id,
@@ -157,11 +157,11 @@ impl ConversationManager {
                         }
                     }
                     Some(record) => {
-                        let sess = Arc::from(provider.create_session(config).await?);
+                        let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
                         (sess, record.id.clone())
                     }
                     None => {
-                        let sess = Arc::from(provider.create_session(config).await?);
+                        let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
                         let rec = provider_sessions::create_provider_session(
                             &self.db,
                             conversation_id,

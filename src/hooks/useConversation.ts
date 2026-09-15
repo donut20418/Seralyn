@@ -75,7 +75,8 @@ export function useConversation() {
         break;
       case 'TextDelta':
         if (event.payload.kind === 'Text') {
-          setStreamingContent(prev => prev + event.payload.content);
+          const delta = event.payload.content;
+          setStreamingContent(prev => prev + delta);
         }
         break;
       case 'SessionFinished':

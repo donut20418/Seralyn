@@ -73,6 +73,27 @@ impl Database {
             );
         }
 
+        // 3. Check if DB from Phase 1.2 already has sync cursor columns
+        let has_seq_column: bool = {
+            let mut stmt = conn.prepare("PRAGMA table_info(messages)").ok();
+            if let Some(ref mut stmt) = stmt {
+                let rows = stmt.query_map([], |row| {
+                    let col_name: String = row.get(1)?;
+                    Ok(col_name)
+                }).ok();
+                rows.map(|mut r| r.any(|c| c.as_deref() == Ok("seq"))).unwrap_or(false)
+            } else {
+                false
+            }
+        };
+
+        if has_seq_column {
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)",
+                [],
+            );
+        }
+
         let migrations: Vec<(i32, &str)> = vec![
             (1, MIGRATION_001),
             (2, MIGRATION_002),
@@ -96,6 +117,27 @@ impl Database {
                     [ver],
                 ).map_err(|e| AppError::Database(e.to_string()))?;
             }
+        }
+
+        // 4. Backfill sequence numbers for legacy messages where seq == 0
+        let zero_seq_count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE seq = 0",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(0);
+
+        if zero_seq_count > 0 {
+            tracing::info!("Backfilling seq for {} legacy messages...", zero_seq_count);
+            let _ = conn.execute_batch(
+                "UPDATE messages
+                 SET seq = (
+                     SELECT COUNT(*)
+                     FROM messages m2
+                     WHERE m2.conversation_id = messages.conversation_id
+                       AND (m2.created_at < messages.created_at OR (m2.created_at = messages.created_at AND m2.rowid <= messages.rowid))
+                 )
+                 WHERE seq = 0;"
+            );
         }
 
         Ok(())

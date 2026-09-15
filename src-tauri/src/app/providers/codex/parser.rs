@@ -19,7 +19,7 @@ pub fn parse_codex_line(line: &str) -> Result<Option<CodexMessage>> {
         return Ok(None);
     }
 
-    let value: Value = serde_json::from_str(line).map_err(AppError::Json)?;
+    let value: Value = serde_json::from_str(line)?;
 
     let msg = serde_json::from_value::<JsonRpcMessage>(value.clone());
     match msg {

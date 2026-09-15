@@ -1,4 +1,3 @@
-import React from 'react';
 import { ConversationSummary } from '../../lib/types';
 import { ConversationItem } from './ConversationItem';
 
