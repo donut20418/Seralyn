@@ -152,11 +152,20 @@ impl JsonRpcTransport {
         });
 
         let line = serde_json::to_string(&payload)?;
-        self.process.send_line(&line).await?;
+        if let Err(e) = self.process.send_line(&line).await {
+            let mut pending = self.pending_requests.lock().await;
+            pending.remove(&id);
+            return Err(e);
+        }
 
-        match reply_rx.await {
-            Ok(res) => res,
-            Err(_) => Err(AppError::Provider("JSON-RPC response channel dropped".to_string())),
+        match tokio::time::timeout(std::time::Duration::from_secs(30), reply_rx).await {
+            Ok(Ok(res)) => res,
+            Ok(Err(_)) => Err(AppError::Provider("JSON-RPC response channel dropped".to_string())),
+            Err(_) => {
+                let mut pending = self.pending_requests.lock().await;
+                pending.remove(&id);
+                Err(AppError::Provider(format!("JSON-RPC request '{method}' timed out after 30s")))
+            }
         }
     }
 

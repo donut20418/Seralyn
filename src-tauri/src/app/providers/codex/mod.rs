@@ -1,12 +1,13 @@
 pub mod parser;
 pub mod protocol;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::app::conversation::context::format_context_for_prompt;
@@ -15,7 +16,7 @@ use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::json_rpc::{JsonRpcNotification, JsonRpcServerRequest, JsonRpcTransport};
 use crate::app::process::{detect_executable, spawn, SpawnConfig};
 use crate::app::providers::{
-    AuthStatus, InstallationInfo, Provider, ProviderCapabilities,
+    AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
     ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
 use parser::{codex_notification_to_normalized, codex_server_request_to_normalized};
@@ -101,14 +102,27 @@ impl Provider for CodexProvider {
         // 2. initialized notification
         transport.notify("initialized", json!({})).await?;
 
-        // 3. thread/start request -> await response containing threadId
-        let thread_resp = transport.request(
-            "thread/start",
-            json!({
-                "instructions": config.system_prompt.unwrap_or_default(),
-                "model": config.model.unwrap_or_default(),
-            }),
-        ).await?;
+        // 3. Map permissions to sandbox and approvalPolicy
+        let (approval_policy, sandbox) = match config.permission_mode {
+            PermissionMode::Safe => ("on-request", "read-only"),
+            PermissionMode::Workspace => ("on-request", "workspace-write"),
+            PermissionMode::FullAccess => ("never", "full-access"),
+        };
+
+        let mut start_params = json!({
+            "approvalPolicy": approval_policy,
+            "sandbox": sandbox,
+        });
+
+        if let Some(prompt) = config.system_prompt.filter(|s| !s.is_empty()) {
+            start_params["baseInstructions"] = json!(prompt);
+        }
+        if let Some(model) = config.model.filter(|m| !m.is_empty()) {
+            start_params["model"] = json!(model);
+        }
+
+        // 4. thread/start request -> await response containing threadId
+        let thread_resp = transport.request("thread/start", start_params).await?;
 
         let thread_id = thread_resp
             .get("thread")
@@ -191,6 +205,7 @@ pub struct CodexSession {
     created_at: String,
     notif_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcNotification>>>>,
     server_req_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcServerRequest>>>>,
+    pending_approvals: Arc<Mutex<HashMap<String, (String, Option<Value>)>>>,
 }
 
 impl CodexSession {
@@ -211,6 +226,7 @@ impl CodexSession {
             created_at: Utc::now().to_rfc3339(),
             notif_rx: Arc::new(Mutex::new(Some(notif_rx))),
             server_req_rx: Arc::new(Mutex::new(Some(server_req_rx))),
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -228,6 +244,7 @@ impl CodexSession {
         let conv_id = self.conversation_id.clone();
         let thread_id_holder = self.thread_id.clone();
         let active_turn_id_holder = self.active_turn_id.clone();
+        let pending_approvals = self.pending_approvals.clone();
 
         tokio::spawn(async move {
             let mut notif_rx = match notif_rx_opt {
@@ -268,10 +285,21 @@ impl CodexSession {
                     Some(server_req) = server_req_rx.recv() => {
                         let proto_req = ProtoRequest {
                             jsonrpc: server_req.jsonrpc.unwrap_or_else(|| "2.0".to_string()),
-                            id: server_req.id,
-                            method: server_req.method,
-                            params: server_req.params,
+                            id: server_req.id.clone(),
+                            method: server_req.method.clone(),
+                            params: server_req.params.clone(),
                         };
+
+                        // Store pending approval for response formatting
+                        let id_str = match &server_req.id {
+                            Value::Number(n) => n.to_string(),
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        {
+                            let mut pa = pending_approvals.lock().await;
+                            pa.insert(id_str, (server_req.method.clone(), server_req.params.clone()));
+                        }
 
                         let current_tid = thread_id_holder.read().await.clone();
                         if let Some(event) = codex_server_request_to_normalized(
@@ -291,7 +319,7 @@ impl CodexSession {
 
 #[async_trait]
 impl ProviderSession for CodexSession {
-    async fn send(&mut self, message: ProviderMessage) -> Result<()> {
+    async fn send(&self, message: ProviderMessage) -> Result<()> {
         let tid = self.thread_id.read().await.clone().unwrap_or_default();
 
         // Cross-provider context injection:
@@ -321,7 +349,7 @@ impl ProviderSession for CodexSession {
         Ok(())
     }
 
-    async fn interrupt(&mut self) -> Result<()> {
+    async fn interrupt(&self) -> Result<()> {
         let tid = self.thread_id.read().await.clone().unwrap_or_default();
         let active_turn = self.active_turn_id.read().await.clone();
 
@@ -339,11 +367,11 @@ impl ProviderSession for CodexSession {
         Ok(())
     }
 
-    async fn cancel(&mut self) -> Result<()> {
+    async fn cancel(&self) -> Result<()> {
         self.interrupt().await
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         self.transport.process().shutdown(Duration::from_secs(5)).await?;
         Ok(())
     }
@@ -352,13 +380,39 @@ impl ProviderSession for CodexSession {
         self.thread_id.try_read().ok().and_then(|g| g.clone())
     }
 
-    async fn respond_to_approval(&mut self, request_id: &str, approved: bool) -> Result<()> {
+    async fn respond_to_approval(&self, request_id: &str, approved: bool) -> Result<()> {
         let id_val = match request_id.parse::<u64>() {
             Ok(n) => json!(n),
             Err(_) => json!(request_id),
         };
-        let decision = if approved { "accept" } else { "decline" };
-        self.transport.respond_success(id_val, json!({ "decision": decision })).await
+
+        let req_info = {
+            let mut pa = self.pending_approvals.lock().await;
+            pa.remove(request_id)
+        };
+
+        let result_payload = match req_info {
+            Some((ref method, Some(ref params))) if method == "item/permissions/requestApproval" => {
+                if approved {
+                    let permissions = params.get("permissions").cloned().unwrap_or_else(|| json!({}));
+                    json!({
+                        "permissions": permissions,
+                        "scope": "turn"
+                    })
+                } else {
+                    json!({
+                        "permissions": {},
+                        "scope": "turn"
+                    })
+                }
+            }
+            _ => {
+                let decision = if approved { "accept" } else { "decline" };
+                json!({ "decision": decision })
+            }
+        };
+
+        self.transport.respond_success(id_val, result_payload).await
     }
 
     fn metadata(&self) -> SessionMetadata {

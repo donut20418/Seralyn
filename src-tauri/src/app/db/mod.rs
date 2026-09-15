@@ -8,6 +8,7 @@ pub mod messages;
 pub mod provider_sessions;
 
 const MIGRATION_001: &str = include_str!("../../../migrations/001_initial.sql");
+const MIGRATION_002: &str = include_str!("../../../migrations/002_sync_cursor.sql");
 
 pub struct Database {
     pub conn: Mutex<Connection>,
@@ -42,8 +43,61 @@ impl Database {
 
     pub fn run_migrations(&self) -> Result<()> {
         let conn = self.conn.lock().unwrap();
-        conn.execute_batch(MIGRATION_001)
-            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 1. Ensure schema_migrations table exists
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at TEXT NOT NULL DEFAULT (datetime('now'))
+            );"
+        ).map_err(|e| AppError::Database(e.to_string()))?;
+
+        // 2. Check if legacy database without schema_migrations already has baseline tables
+        let has_conversations: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='conversations')",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        let has_v1: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 1)",
+            [],
+            |row| row.get(0),
+        ).unwrap_or(false);
+
+        if has_conversations && !has_v1 {
+            // Existing DB already has baseline tables; record version 1 as applied
+            let _ = conn.execute(
+                "INSERT OR IGNORE INTO schema_migrations (version) VALUES (1)",
+                [],
+            );
+        }
+
+        let migrations: Vec<(i32, &str)> = vec![
+            (1, MIGRATION_001),
+            (2, MIGRATION_002),
+        ];
+
+        for (ver, sql) in migrations {
+            let is_applied: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?1)",
+                [ver],
+                |row| row.get(0),
+            ).unwrap_or(false);
+
+            if !is_applied {
+                tracing::info!("Applying database migration {:03}...", ver);
+                conn.execute_batch(sql).map_err(|e| {
+                    AppError::Database(format!("Migration {:03} failed: {}", ver, e))
+                })?;
+
+                conn.execute(
+                    "INSERT INTO schema_migrations (version) VALUES (?1)",
+                    [ver],
+                ).map_err(|e| AppError::Database(e.to_string()))?;
+            }
+        }
+
         Ok(())
     }
 

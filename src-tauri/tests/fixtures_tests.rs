@@ -239,7 +239,7 @@ async fn test_cross_provider_sync_cursor_full_cycle() {
 
     #[async_trait]
     impl ProviderSession for MockSession {
-        async fn send(&mut self, message: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+        async fn send(&self, message: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
             self.history.lock().await.push(message.clone());
             
             // Emit streaming response
@@ -268,11 +268,11 @@ async fn test_cross_provider_sync_cursor_full_cycle() {
             let _ = self.event_sender.send(finished).await;
             Ok(())
         }
-        async fn interrupt(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
-        async fn cancel(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
-        async fn close(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         fn native_session_id(&self) -> Option<String> { Some("mock-sid".into()) }
-        async fn respond_to_approval(&mut self, _id: &str, _app: bool) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn respond_to_approval(&self, _id: &str, _app: bool) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         fn metadata(&self) -> SessionMetadata {
             SessionMetadata {
                 provider: self.provider,

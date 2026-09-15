@@ -64,22 +64,22 @@ pub trait Provider: Send + Sync {
 pub trait ProviderSession: Send + Sync {
     /// Send a message to the provider and start streaming the response.
     /// Events will be emitted through the events channel.
-    async fn send(&mut self, message: ProviderMessage) -> Result<()>;
+    async fn send(&self, message: ProviderMessage) -> Result<()>;
 
     /// Interrupt the current generation (provider may continue from interruption point).
-    async fn interrupt(&mut self) -> Result<()>;
+    async fn interrupt(&self) -> Result<()>;
 
     /// Cancel the current operation entirely.
-    async fn cancel(&mut self) -> Result<()>;
+    async fn cancel(&self) -> Result<()>;
 
     /// Close the session gracefully.
-    async fn close(&mut self) -> Result<()>;
+    async fn close(&self) -> Result<()>;
 
     /// Get the native provider session ID (if available).
     fn native_session_id(&self) -> Option<String>;
 
     /// Respond to a pending approval or permission request.
-    async fn respond_to_approval(&mut self, _request_id: &str, _approved: bool) -> Result<()> {
+    async fn respond_to_approval(&self, _request_id: &str, _approved: bool) -> Result<()> {
         Ok(())
     }
 
@@ -242,6 +242,11 @@ impl ProviderManager {
             Arc::new(gemini::GeminiProvider::new()),
         );
 
+        Self { providers }
+    }
+
+    /// Creates a ProviderManager with custom providers (used in testing).
+    pub fn with_providers(providers: HashMap<ProviderKind, Arc<dyn Provider>>) -> Self {
         Self { providers }
     }
 

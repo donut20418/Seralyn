@@ -13,7 +13,6 @@ CREATE TABLE IF NOT EXISTS conversations (
 CREATE TABLE IF NOT EXISTS messages (
     id                  TEXT PRIMARY KEY,
     conversation_id     TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    seq                 INTEGER NOT NULL DEFAULT 0,
     parent_id           TEXT REFERENCES messages(id),
     role                TEXT NOT NULL CHECK(role IN ('user', 'assistant', 'system', 'tool')),
     content             TEXT NOT NULL,
@@ -25,7 +24,6 @@ CREATE TABLE IF NOT EXISTS messages (
     metadata_json       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id, created_at);
-CREATE INDEX IF NOT EXISTS idx_messages_conversation_seq ON messages(conversation_id, seq);
 CREATE INDEX IF NOT EXISTS idx_messages_parent ON messages(parent_id);
 
 CREATE TABLE IF NOT EXISTS provider_sessions (
@@ -37,7 +35,6 @@ CREATE TABLE IF NOT EXISTS provider_sessions (
     created_at          TEXT NOT NULL DEFAULT (datetime('now')),
     last_used_at        TEXT,
     status              TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'closed', 'error')),
-    synced_through_seq  INTEGER NOT NULL DEFAULT 0,
     metadata_json       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_provider_sessions_conversation ON provider_sessions(conversation_id);
@@ -77,7 +74,7 @@ CREATE TABLE IF NOT EXISTS settings (
 
 -- Insert default settings
 INSERT OR IGNORE INTO settings (key, value) VALUES ('default_provider', 'claude');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('permission_mode', 'workspace');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('permission_mode', 'safe');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_compact_warning', '0.7');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_compact_threshold', '0.8');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('auto_compact_critical', '0.9');

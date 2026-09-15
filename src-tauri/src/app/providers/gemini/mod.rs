@@ -1,12 +1,13 @@
 pub mod parser;
 pub mod protocol;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use serde_json::json;
+use serde_json::{json, Value};
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::app::conversation::context::format_context_for_prompt;
@@ -105,17 +106,12 @@ impl Provider for GeminiProvider {
         let process = Arc::new(spawn(spawn_config).await?);
         let (transport, notif_rx, server_req_rx) = JsonRpcTransport::new(process);
 
-        // Step 1: initialize request -> await response (advertise loadSession capability)
+        // Step 1: ACP v1 initialize request -> await response
         let _ = transport.request(
             "initialize",
             json!({
-                "clientInfo": {
-                    "name": "Seralyn",
-                    "version": "0.1.0"
-                },
-                "capabilities": {
-                    "loadSession": true
-                }
+                "protocolVersion": 1,
+                "clientCapabilities": {}
             }),
         ).await?;
 
@@ -181,17 +177,12 @@ impl Provider for GeminiProvider {
         let process = Arc::new(spawn(spawn_config).await?);
         let (transport, notif_rx, server_req_rx) = JsonRpcTransport::new(process);
 
-        // Step 1: initialize -> await response
+        // Step 1: ACP v1 initialize -> await response
         let _ = transport.request(
             "initialize",
             json!({
-                "clientInfo": {
-                    "name": "Seralyn",
-                    "version": "0.1.0"
-                },
-                "capabilities": {
-                    "loadSession": true
-                }
+                "protocolVersion": 1,
+                "clientCapabilities": {}
             }),
         ).await?;
 
@@ -230,6 +221,7 @@ pub struct GeminiSession {
     created_at: String,
     notif_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcNotification>>>>,
     server_req_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcServerRequest>>>>,
+    pending_permissions: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
 impl GeminiSession {
@@ -251,6 +243,7 @@ impl GeminiSession {
             created_at: Utc::now().to_rfc3339(),
             notif_rx: Arc::new(Mutex::new(Some(notif_rx))),
             server_req_rx: Arc::new(Mutex::new(Some(server_req_rx))),
+            pending_permissions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -267,6 +260,7 @@ impl GeminiSession {
         let event_sender = self.event_sender.clone();
         let conv_id = self.conversation_id.clone();
         let session_id_holder = self.session_id.clone();
+        let pending_permissions = self.pending_permissions.clone();
 
         tokio::spawn(async move {
             let mut notif_rx = match notif_rx_opt {
@@ -299,10 +293,29 @@ impl GeminiSession {
                     Some(server_req) = server_req_rx.recv() => {
                         let proto_req = AcpRequest {
                             jsonrpc: server_req.jsonrpc.unwrap_or_else(|| "2.0".to_string()),
-                            id: server_req.id,
-                            method: server_req.method,
-                            params: server_req.params,
+                            id: server_req.id.clone(),
+                            method: server_req.method.clone(),
+                            params: server_req.params.clone(),
                         };
+
+                        // Store options for ACP permission outcome response
+                        let id_str = match &server_req.id {
+                            Value::Number(n) => n.to_string(),
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        };
+                        let options = server_req
+                            .params
+                            .as_ref()
+                            .and_then(|p| p.get("options"))
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+
+                        {
+                            let mut pp = pending_permissions.lock().await;
+                            pp.insert(id_str, options);
+                        }
 
                         let current_sid = session_id_holder.read().await.clone();
                         if let Some(event) = gemini_server_request_to_normalized(
@@ -322,7 +335,7 @@ impl GeminiSession {
 
 #[async_trait]
 impl ProviderSession for GeminiSession {
-    async fn send(&mut self, message: ProviderMessage) -> Result<()> {
+    async fn send(&self, message: ProviderMessage) -> Result<()> {
         let sid = self.session_id.read().await.clone().unwrap_or_default();
 
         // Cross-provider context injection:
@@ -341,21 +354,24 @@ impl ProviderSession for GeminiSession {
             }),
         ).await?;
 
+        // In ACP v1, response to session/prompt signifies that turn execution has completed
+        let finished = NormalizedEvent::session_finished(ProviderKind::Gemini, self.conversation_id.clone());
+        let _ = self.event_sender.send(finished).await;
+
         Ok(())
     }
 
-    async fn interrupt(&mut self) -> Result<()> {
+    async fn interrupt(&self) -> Result<()> {
         self.cancel().await
     }
 
-    async fn cancel(&mut self) -> Result<()> {
+    async fn cancel(&self) -> Result<()> {
         let sid = self.session_id.read().await.clone().unwrap_or_default();
-        // Immediately notify session/cancel over transport
         let _ = self.transport.notify("session/cancel", json!({ "sessionId": sid })).await;
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         self.cancel().await?;
         self.transport.process().shutdown(Duration::from_secs(5)).await?;
         Ok(())
@@ -365,19 +381,49 @@ impl ProviderSession for GeminiSession {
         self.session_id.try_read().ok().and_then(|g| g.clone())
     }
 
-    async fn respond_to_approval(&mut self, request_id: &str, approved: bool) -> Result<()> {
+    async fn respond_to_approval(&self, request_id: &str, approved: bool) -> Result<()> {
         let id_val = match request_id.parse::<u64>() {
             Ok(n) => json!(n),
             Err(_) => json!(request_id),
         };
-        let option = if approved { "allow" } else { "deny" };
-        self.transport.respond_success(
-            id_val,
+
+        let options = {
+            let mut pp = self.pending_permissions.lock().await;
+            pp.remove(request_id).unwrap_or_default()
+        };
+
+        let result_payload = if approved {
+            // Find option matching allow, or default to first option ID
+            let option_id = options
+                .iter()
+                .find_map(|opt| {
+                    let id = opt.get("id").and_then(|v| v.as_str())?;
+                    if id.contains("allow") {
+                        Some(id.to_string())
+                    } else {
+                        None
+                    }
+                })
+                .or_else(|| {
+                    options.first().and_then(|opt| opt.get("id")).and_then(|v| v.as_str()).map(ToString::to_string)
+                })
+                .unwrap_or_else(|| "allow".to_string());
+
             json!({
-                "optionId": option,
-                "decision": option
-            }),
-        ).await
+                "outcome": {
+                    "outcome": "selected",
+                    "optionId": option_id
+                }
+            })
+        } else {
+            json!({
+                "outcome": {
+                    "outcome": "cancelled"
+                }
+            })
+        };
+
+        self.transport.respond_success(id_val, result_payload).await
     }
 
     fn metadata(&self) -> SessionMetadata {

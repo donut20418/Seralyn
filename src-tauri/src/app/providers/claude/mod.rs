@@ -1,5 +1,6 @@
 pub mod parser;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -107,7 +108,7 @@ pub struct ClaudeSession {
     config: SessionConfig,
     native_session_id: Arc<RwLock<Option<String>>>,
     model: Option<String>,
-    active: bool,
+    active: Arc<AtomicBool>,
     created_at: String,
     current_process: Arc<Mutex<Option<Arc<ManagedProcess>>>>,
 }
@@ -118,7 +119,7 @@ impl ClaudeSession {
             model: config.model.clone(),
             config,
             native_session_id: Arc::new(RwLock::new(native_session_id)),
-            active: true,
+            active: Arc::new(AtomicBool::new(true)),
             created_at: Utc::now().to_rfc3339(),
             current_process: Arc::new(Mutex::new(None)),
         }
@@ -127,12 +128,10 @@ impl ClaudeSession {
 
 #[async_trait]
 impl ProviderSession for ClaudeSession {
-    async fn send(&mut self, message: ProviderMessage) -> Result<()> {
+    async fn send(&self, message: ProviderMessage) -> Result<()> {
         let sid_opt = self.native_session_id.read().await.clone();
 
         // Cross-provider context injection:
-        // format_context_for_prompt injects delta messages if there are any missed turns.
-        // If message.context is empty (session is up to date), it returns message.content unchanged.
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
 
         let mut args = vec![
@@ -215,11 +214,11 @@ impl ProviderSession for ClaudeSession {
         Ok(())
     }
 
-    async fn interrupt(&mut self) -> Result<()> {
+    async fn interrupt(&self) -> Result<()> {
         self.cancel().await
     }
 
-    async fn cancel(&mut self) -> Result<()> {
+    async fn cancel(&self) -> Result<()> {
         let cp = self.current_process.lock().await;
         if let Some(p) = cp.as_ref() {
             let _ = p.kill().await;
@@ -227,9 +226,9 @@ impl ProviderSession for ClaudeSession {
         Ok(())
     }
 
-    async fn close(&mut self) -> Result<()> {
+    async fn close(&self) -> Result<()> {
         self.cancel().await?;
-        self.active = false;
+        self.active.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -237,7 +236,7 @@ impl ProviderSession for ClaudeSession {
         self.native_session_id.try_read().ok().and_then(|g| g.clone())
     }
 
-    async fn respond_to_approval(&mut self, _request_id: &str, _approved: bool) -> Result<()> {
+    async fn respond_to_approval(&self, _request_id: &str, _approved: bool) -> Result<()> {
         Ok(())
     }
 
@@ -251,6 +250,6 @@ impl ProviderSession for ClaudeSession {
     }
 
     fn is_active(&self) -> bool {
-        self.active
+        self.active.load(Ordering::SeqCst)
     }
 }
