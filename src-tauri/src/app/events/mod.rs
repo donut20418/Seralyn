@@ -6,6 +6,7 @@ use uuid::Uuid;
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
 pub enum ProviderKind {
     Claude,
     Codex,
@@ -15,9 +16,9 @@ pub enum ProviderKind {
 impl Display for ProviderKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ProviderKind::Claude => write!(f, "Claude"),
-            ProviderKind::Codex => write!(f, "Codex"),
-            ProviderKind::Gemini => write!(f, "Gemini"),
+            ProviderKind::Claude => write!(f, "claude"),
+            ProviderKind::Codex => write!(f, "codex"),
+            ProviderKind::Gemini => write!(f, "gemini"),
         }
     }
 }

@@ -79,6 +79,7 @@ export function useConversation() {
         }
         break;
       case 'SessionFinished':
+      case 'Error':
         setIsStreaming(false);
         selectConversation(currentConversationId); 
         setStreamingContent('');

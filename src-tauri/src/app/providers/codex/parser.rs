@@ -99,16 +99,64 @@ pub fn codex_notification_to_normalized(
                 }
             }
         }
+        "item/agentMessage/delta" => {
+            if let Some(params) = &notification.params {
+                let text = params.get("delta").or_else(|| params.get("text"))
+                    .and_then(|v| v.as_str());
+                if let Some(t) = text {
+                    event.event_type = EventType::TextDelta;
+                    event.payload = EventPayload::Text {
+                        content: t.to_string(),
+                    };
+                    return Some(event);
+                }
+            }
+        }
+        "item/started" => {
+            if let Some(params) = &notification.params {
+                let tool_id = params.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tool_name = params.get("name").or_else(|| params.get("type"))
+                    .and_then(|v| v.as_str()).unwrap_or("tool").to_string();
+                event.event_type = EventType::ToolStarted;
+                event.payload = EventPayload::Tool {
+                    tool_id,
+                    tool_name,
+                    input: params.get("input").or_else(|| params.get("arguments")).cloned(),
+                    output: None,
+                    status: Some("started".to_string()),
+                };
+                return Some(event);
+            }
+        }
+        "item/completed" => {
+            if let Some(params) = &notification.params {
+                let tool_id = params.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let tool_name = params.get("name").or_else(|| params.get("type"))
+                    .and_then(|v| v.as_str()).unwrap_or("").to_string();
+                event.event_type = EventType::ToolResult;
+                event.payload = EventPayload::Tool {
+                    tool_id,
+                    tool_name,
+                    input: None,
+                    output: params.get("output").or_else(|| params.get("result")).cloned(),
+                    status: Some("completed".to_string()),
+                };
+                return Some(event);
+            }
+        }
+        "turn/completed" => {
+            event.event_type = EventType::SessionFinished;
+            event.payload = EventPayload::Empty;
+            return Some(event);
+        }
         "turn/finished" => {
             event.event_type = EventType::SessionFinished;
             event.payload = EventPayload::Empty;
             
-            // Note: In an actual implementation, you might want to return two events or 
-            // handle the usage update separately. We will map usage into UsageUpdated.
             if let Some(params) = &notification.params {
                 if let Some(usage_val) = params.get("usage") {
-                    let prompt_tokens = usage_val.get("prompt_tokens").and_then(|v| v.as_u64());
-                    let completion_tokens = usage_val.get("completion_tokens").and_then(|v| v.as_u64());
+                    let prompt_tokens = usage_val.get("prompt_tokens").or_else(|| usage_val.get("input_tokens")).and_then(|v| v.as_u64());
+                    let completion_tokens = usage_val.get("completion_tokens").or_else(|| usage_val.get("output_tokens")).and_then(|v| v.as_u64());
                     
                     event.event_type = EventType::UsageUpdated;
                     event.payload = EventPayload::Usage {
@@ -123,13 +171,7 @@ pub fn codex_notification_to_normalized(
                 }
             }
             
-            // To properly match requirements, returning just SessionFinished for now if no usage,
-            // otherwise returning UsageUpdated might be fine, or returning a composite if supported.
-            // As per instructions, "turn/finished -> SessionFinished + usage extraction", we'll just
-            // set it to SessionFinished as the primary event for `turn/finished` since usage extraction
-            // can be handled appropriately. Let's stick to SessionFinished primarily.
             if event.event_type == EventType::TextDelta {
-                // If unchanged from placeholder
                 event.event_type = EventType::SessionFinished;
             }
             return Some(event);

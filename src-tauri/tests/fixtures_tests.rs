@@ -208,3 +208,160 @@ fn test_cross_provider_conversation_persistence() {
     assert_eq!(msgs[5].role, "assistant");
     assert_eq!(msgs[5].provider.as_deref(), Some("gemini"));
 }
+
+#[tokio::test]
+async fn test_cross_provider_context_handover_flow() {
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+    use async_trait::async_trait;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::conversation::context::format_context_for_prompt;
+    use seralyn_lib::app::providers::{
+        AuthStatus, InstallationInfo, Provider, ProviderCapabilities, ProviderMessage,
+        ProviderSession, SessionConfig, SessionMetadata,
+    };
+
+    // A mock session that records all received messages and emits simulated responses
+    struct MockSession {
+        provider: ProviderKind,
+        history: Arc<Mutex<Vec<ProviderMessage>>>,
+        event_sender: tokio::sync::mpsc::Sender<NormalizedEvent>,
+        conv_id: String,
+    }
+
+    #[async_trait]
+    impl ProviderSession for MockSession {
+        async fn send(&mut self, message: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+            self.history.lock().await.push(message.clone());
+            
+            // Emit streaming response
+            let started = NormalizedEvent::new(
+                EventType::SessionStarted,
+                self.provider,
+                self.conv_id.clone(),
+                EventPayload::Session { session_id: Some("mock-sid".into()), model: None },
+            );
+            let _ = self.event_sender.send(started).await;
+
+            let delta = NormalizedEvent::new(
+                EventType::TextDelta,
+                self.provider,
+                self.conv_id.clone(),
+                EventPayload::Text { content: format!("Response from {}", self.provider) },
+            );
+            let _ = self.event_sender.send(delta).await;
+
+            let finished = NormalizedEvent::new(
+                EventType::SessionFinished,
+                self.provider,
+                self.conv_id.clone(),
+                EventPayload::Empty,
+            );
+            let _ = self.event_sender.send(finished).await;
+            Ok(())
+        }
+        async fn interrupt(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn cancel(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        fn native_session_id(&self) -> Option<&str> { Some("mock-sid") }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: self.provider,
+                native_session_id: Some("mock-sid".into()),
+                model: None,
+                created_at: "".into(),
+            }
+        }
+        fn is_active(&self) -> bool { true }
+    }
+
+    struct MockProvider {
+        kind: ProviderKind,
+        history: Arc<Mutex<Vec<ProviderMessage>>>,
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn kind(&self) -> ProviderKind { self.kind }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<InstallationInfo> {
+            Ok(InstallationInfo { installed: true, executable_path: None, version: None })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<AuthStatus> {
+            Ok(AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            Ok(Box::new(MockSession {
+                provider: self.kind,
+                history: self.history.clone(),
+                event_sender: config.event_sender,
+                conv_id: config.conversation_id,
+            }))
+        }
+        async fn resume_session(&self, _id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            self.create_session(config).await
+        }
+    }
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let claude_history = Arc::new(Mutex::new(Vec::new()));
+    let codex_history = Arc::new(Mutex::new(Vec::new()));
+    let gemini_history = Arc::new(Mutex::new(Vec::new()));
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Claude, Arc::new(MockProvider { kind: ProviderKind::Claude, history: claude_history.clone() }) as Arc<dyn Provider>);
+    provider_map.insert(ProviderKind::Codex, Arc::new(MockProvider { kind: ProviderKind::Codex, history: codex_history.clone() }) as Arc<dyn Provider>);
+    provider_map.insert(ProviderKind::Gemini, Arc::new(MockProvider { kind: ProviderKind::Gemini, history: gemini_history.clone() }) as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+
+    let conv = manager.create_conversation(Some("Context Handover Test")).unwrap();
+
+    // Turn 1: Claude
+    let (tx1, mut rx1) = tokio::sync::mpsc::channel(10);
+    tokio::spawn(async move { while rx1.recv().await.is_some() {} });
+    manager.send_message(&conv.id, "Question 1", ProviderKind::Claude, tx1).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let c_msgs = claude_history.lock().await;
+    assert_eq!(c_msgs.len(), 1);
+    assert_eq!(c_msgs[0].content, "Question 1");
+    assert!(c_msgs[0].context.is_empty(), "Turn 1 must have no prior context");
+    drop(c_msgs);
+
+    // Turn 2: Switch to Codex -> must receive Question 1 and Claude response in context!
+    let (tx2, mut rx2) = tokio::sync::mpsc::channel(10);
+    tokio::spawn(async move { while rx2.recv().await.is_some() {} });
+    manager.send_message(&conv.id, "Question 2", ProviderKind::Codex, tx2).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let codex_msgs = codex_history.lock().await;
+    assert_eq!(codex_msgs.len(), 1);
+    assert_eq!(codex_msgs[0].content, "Question 2");
+    assert_eq!(codex_msgs[0].context.len(), 2, "Turn 2 must receive Turn 1 (user + assistant) in context");
+    assert_eq!(codex_msgs[0].context[0].content, "Question 1");
+    assert_eq!(codex_msgs[0].context[1].content, "Response from claude");
+
+    // Test prompt formatting
+    let formatted = format_context_for_prompt(&codex_msgs[0].context, &codex_msgs[0].content);
+    assert!(formatted.contains("Assistant (claude): Response from claude"));
+    assert!(formatted.contains("Question 2"));
+    drop(codex_msgs);
+
+    // Turn 3: Switch to Gemini -> must receive all 4 prior turns in context!
+    let (tx3, mut rx3) = tokio::sync::mpsc::channel(10);
+    tokio::spawn(async move { while rx3.recv().await.is_some() {} });
+    manager.send_message(&conv.id, "Question 3", ProviderKind::Gemini, tx3).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let gemini_msgs = gemini_history.lock().await;
+    assert_eq!(gemini_msgs.len(), 1);
+    assert_eq!(gemini_msgs[0].content, "Question 3");
+    assert_eq!(gemini_msgs[0].context.len(), 4, "Turn 3 must receive all 4 prior messages from Claude and Codex");
+    assert_eq!(gemini_msgs[0].context[0].content, "Question 1");
+    assert_eq!(gemini_msgs[0].context[1].content, "Response from claude");
+    assert_eq!(gemini_msgs[0].context[2].content, "Question 2");
+    assert_eq!(gemini_msgs[0].context[3].content, "Response from codex");
+}

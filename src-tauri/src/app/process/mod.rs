@@ -6,14 +6,14 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
-use tokio::sync::mpsc;
+use tokio::process::{Child, Command};
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::timeout;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
-use crate::app::error::Result;
+use crate::app::error::{AppError, Result};
 
 /// Information about a detected executable
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -33,17 +33,15 @@ pub struct SpawnConfig {
     pub startup_timeout: Duration,
 }
 
-/// A managed background process that provides line-by-line stdout/stderr communication
+/// A managed background process that decouples stdin writing from stdout/stderr reading
+/// to prevent any deadlocks between reader and writer loops.
 pub struct ManagedProcess {
-    child: Child,
-    stdin: ChildStdin,
-    #[allow(dead_code)]
-    stdout_task: tokio::task::JoinHandle<()>,
-    #[allow(dead_code)]
-    stderr_task: tokio::task::JoinHandle<()>,
-    stdout_rx: mpsc::Receiver<String>,
-    stderr_rx: mpsc::Receiver<String>,
+    child: Arc<Mutex<Child>>,
+    stdin_tx: mpsc::Sender<String>,
+    stdout_rx: Arc<Mutex<mpsc::Receiver<String>>>,
+    stderr_rx: Arc<Mutex<mpsc::Receiver<String>>>,
     alive: Arc<AtomicBool>,
+    pid: Option<u32>,
 }
 
 /// Detects an executable by name and optionally gets its version
@@ -97,14 +95,16 @@ pub async fn spawn(config: SpawnConfig) -> Result<ManagedProcess> {
     cmd.stderr(std::process::Stdio::piped());
 
     #[cfg(windows)]
-    cmd.creation_flags(0x08000000);
+    cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
 
     let mut child = cmd.spawn().map_err(|e| {
         tracing::error!("Failed to spawn process {}: {}", config.executable, e);
         e
     })?;
 
-    let stdin = child.stdin.take().ok_or_else(|| {
+    let pid = child.id();
+
+    let mut stdin = child.stdin.take().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture stdin")
     })?;
 
@@ -116,27 +116,44 @@ pub async fn spawn(config: SpawnConfig) -> Result<ManagedProcess> {
         std::io::Error::new(std::io::ErrorKind::Other, "Failed to capture stderr")
     })?;
 
+    // Dedicated stdin writing channel: writes never block reading
+    let (stdin_tx, mut stdin_rx) = mpsc::channel::<String>(1000);
+    let name_stdin = config.executable.clone();
+    tokio::spawn(async move {
+        while let Some(line) = stdin_rx.recv().await {
+            let mut data = line;
+            if !data.ends_with('\n') {
+                data.push('\n');
+            }
+            if let Err(e) = stdin.write_all(data.as_bytes()).await {
+                tracing::warn!("[{}] Stdin write error: {}", name_stdin, e);
+                break;
+            }
+            if let Err(e) = stdin.flush().await {
+                tracing::warn!("[{}] Stdin flush error: {}", name_stdin, e);
+                break;
+            }
+        }
+    });
+
     let (stdout_tx, stdout_rx) = mpsc::channel(1000);
     let (stderr_tx, stderr_rx) = mpsc::channel(1000);
 
     let alive = Arc::new(AtomicBool::new(true));
 
-    let alive_stdout = alive.clone();
     let name_stdout = config.executable.clone();
-    let stdout_task = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut reader = BufReader::new(stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             if stdout_tx.send(line).await.is_err() {
                 break;
             }
         }
-        alive_stdout.store(false, Ordering::SeqCst);
-        tracing::info!("Stdout closed for {}", name_stdout);
+        tracing::debug!("Stdout stream ended for {}", name_stdout);
     });
 
-    let alive_stderr = alive.clone();
     let name_stderr = config.executable.clone();
-    let stderr_task = tokio::spawn(async move {
+    tokio::spawn(async move {
         let mut reader = BufReader::new(stderr).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             tracing::warn!("[{}] stderr: {}", name_stderr, line);
@@ -144,72 +161,89 @@ pub async fn spawn(config: SpawnConfig) -> Result<ManagedProcess> {
                 break;
             }
         }
-        alive_stderr.store(false, Ordering::SeqCst);
-        tracing::info!("Stderr closed for {}", name_stderr);
+        tracing::debug!("Stderr stream ended for {}", name_stderr);
     });
 
+    let child_arc = Arc::new(Mutex::new(child));
+    let alive_monitor = alive.clone();
+    let child_for_monitor = child_arc.clone();
+    let name_monitor = config.executable.clone();
+
+    // Process lifecycle monitor: only marks alive = false when process actually terminates
+    tokio::spawn(async move {
+        let mut guard = child_for_monitor.lock().await;
+        match guard.wait().await {
+            Ok(status) => {
+                tracing::info!("[{}] Process exited with status: {}", name_monitor, status);
+            }
+            Err(e) => {
+                tracing::warn!("[{}] Process wait error: {}", name_monitor, e);
+            }
+        }
+        alive_monitor.store(false, Ordering::SeqCst);
+    });
+
+    // Check startup timeout: ensure process didn't immediately crash
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    if !alive.load(Ordering::SeqCst) {
+        return Err(AppError::Process(format!(
+            "Process '{}' exited immediately after launch",
+            config.executable
+        )));
+    }
+
     Ok(ManagedProcess {
-        child,
-        stdin,
-        stdout_task,
-        stderr_task,
-        stdout_rx,
-        stderr_rx,
+        child: child_arc,
+        stdin_tx,
+        stdout_rx: Arc::new(Mutex::new(stdout_rx)),
+        stderr_rx: Arc::new(Mutex::new(stderr_rx)),
         alive,
+        pid,
     })
 }
 
 impl ManagedProcess {
-    /// Sends a line of text to the process's stdin
-    pub async fn send_line(&mut self, line: &str) -> Result<()> {
-        let mut data = String::with_capacity(line.len() + 1);
-        data.push_str(line);
-        data.push('\n');
-
-        self.stdin.write_all(data.as_bytes()).await.map_err(|e| {
-            tracing::error!("Failed to write to stdin: {}", e);
-            e
-        })?;
-        self.stdin.flush().await.map_err(|e| {
-            tracing::error!("Failed to flush stdin: {}", e);
-            e
-        })?;
-
-        Ok(())
+    /// Non-blocking asynchronous line write to stdin.
+    /// Can be called concurrently without locking the stdout reader.
+    pub async fn send_line(&self, line: &str) -> Result<()> {
+        self.stdin_tx.send(line.to_string()).await.map_err(|_| {
+            AppError::Process("Failed to send line to stdin (channel closed)".to_string())
+        })
     }
 
-    /// Receives the next line of stdout, blocking until available
-    pub async fn recv_stdout_line(&mut self) -> Result<Option<String>> {
-        Ok(self.stdout_rx.recv().await)
+    /// Receives the next line of stdout
+    pub async fn recv_stdout_line(&self) -> Result<Option<String>> {
+        let mut guard = self.stdout_rx.lock().await;
+        Ok(guard.recv().await)
     }
 
     /// Non-blockingly checks for the next line of stderr
-    pub fn try_recv_stderr(&mut self) -> Option<String> {
-        self.stderr_rx.try_recv().ok()
+    pub fn try_recv_stderr(&self) -> Option<String> {
+        if let Ok(mut guard) = self.stderr_rx.try_lock() {
+            guard.try_recv().ok()
+        } else {
+            None
+        }
     }
 
-    /// Checks if the process and its communication tasks are still alive
+    /// Checks if the child process is still running
     pub fn is_alive(&self) -> bool {
         self.alive.load(Ordering::SeqCst)
     }
 
     /// Gracefully attempts to shut down the process, falling back to a hard kill on timeout
-    pub async fn shutdown(&mut self, timeout_duration: Duration) -> Result<()> {
+    pub async fn shutdown(&self, timeout_duration: Duration) -> Result<()> {
         if !self.is_alive() {
             return Ok(());
         }
 
-        if let Ok(Some(_)) = self.child.try_wait() {
-            self.alive.store(false, Ordering::SeqCst);
-            return Ok(());
-        }
-
-        if timeout(timeout_duration, self.child.wait()).await.is_err() {
+        let mut child_guard = self.child.lock().await;
+        if timeout(timeout_duration, child_guard.wait()).await.is_err() {
             tracing::info!(
                 "Process shutdown timeout, forcing kill (PID: {:?})",
-                self.pid()
+                self.pid
             );
-            let _ = self.child.kill().await;
+            let _ = child_guard.kill().await;
         }
 
         self.alive.store(false, Ordering::SeqCst);
@@ -218,14 +252,16 @@ impl ManagedProcess {
 
     /// Retrieves the system PID of the managed process
     pub fn pid(&self) -> Option<u32> {
-        self.child.id()
+        self.pid
     }
 }
 
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
         if self.alive.load(Ordering::SeqCst) {
-            let _ = self.child.start_kill();
+            if let Ok(mut guard) = self.child.try_lock() {
+                let _ = guard.start_kill();
+            }
         }
     }
 }
@@ -236,7 +272,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_detect_executable() {
-        // 'cmd' is virtually guaranteed to exist on Windows machines.
         let result = detect_executable("cmd").await;
         assert!(result.is_ok(), "Should find cmd executable on Windows");
 

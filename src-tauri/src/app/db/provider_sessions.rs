@@ -82,6 +82,15 @@ pub fn update_session_used(db: &Database, id: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn update_native_session_id(db: &Database, id: &str, native_session_id: &str) -> Result<()> {
+    let conn = db.conn.lock().unwrap();
+    conn.execute(
+        "UPDATE provider_sessions SET provider_session_id = ?1 WHERE id = ?2",
+        params![native_session_id, id],
+    ).map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 pub fn close_session(db: &Database, id: &str) -> Result<()> {
     let conn = db.conn.lock().unwrap();
     conn.execute(
@@ -130,20 +139,22 @@ mod tests {
         db.run_migrations().unwrap();
 
         let conv = create_conversation(&db, None).unwrap();
-        let session = create_provider_session(&db, &conv.id, "openai", Some("sess_123"), Some("gpt-4")).unwrap();
-        assert_eq!(session.provider, "openai");
+        let session = create_provider_session(&db, &conv.id, "codex", Some("sess_123"), Some("gpt-4")).unwrap();
+        assert_eq!(session.provider, "codex");
 
-        let active = get_active_session(&db, &conv.id, "openai").unwrap().unwrap();
+        let active = get_active_session(&db, &conv.id, "codex").unwrap().unwrap();
         assert_eq!(active.id, session.id);
 
         update_session_used(&db, &session.id).unwrap();
+        update_native_session_id(&db, &session.id, "sess_456").unwrap();
         
         let sessions = get_sessions_for_conversation(&db, &conv.id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].last_used_at.is_some());
+        assert_eq!(sessions[0].provider_session_id.as_deref(), Some("sess_456"));
 
         close_session(&db, &session.id).unwrap();
-        let closed = get_active_session(&db, &conv.id, "openai").unwrap();
+        let closed = get_active_session(&db, &conv.id, "codex").unwrap();
         assert!(closed.is_none());
     }
 }

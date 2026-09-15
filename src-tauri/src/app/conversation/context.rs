@@ -27,6 +27,27 @@ pub fn estimate_context_tokens(context: &[ContextMessage], _token_manager: &Toke
     context.iter().map(|msg| TokenManager::estimate_tokens(&msg.content)).sum()
 }
 
+/// Formats prior cross-provider conversation history and current prompt into a unified message.
+pub fn format_context_for_prompt(context: &[ContextMessage], current_prompt: &str) -> String {
+    if context.is_empty() {
+        return current_prompt.to_string();
+    }
+
+    let mut out = String::from("[Prior Conversation History Across Providers]\n");
+    for msg in context {
+        let label = match (msg.role.as_str(), msg.provider.as_deref()) {
+            ("user", _) => "User".to_string(),
+            ("assistant", Some(p)) => format!("Assistant ({p})"),
+            ("assistant", None) => "Assistant".to_string(),
+            (other, _) => other.to_string(),
+        };
+        out.push_str(&format!("{label}: {}\n\n", msg.content.trim()));
+    }
+    out.push_str("[End of Prior History]\n\n");
+    out.push_str(current_prompt);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

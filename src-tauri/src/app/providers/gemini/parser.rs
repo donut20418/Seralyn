@@ -2,7 +2,7 @@ use serde_json::Value;
 
 use crate::app::error::Result;
 use crate::app::events::{EventPayload, EventType, NormalizedEvent, ProviderKind};
-use super::protocol::{AcpMessage, AcpNotification};
+pub use super::protocol::{AcpMessage, AcpNotification, AcpRequest, AcpResponse};
 
 /// Parse a raw JSON-RPC line from Gemini ACP into an AcpMessage.
 pub fn parse_gemini_line(line: &str) -> Result<Option<AcpMessage>> {
@@ -27,9 +27,13 @@ pub fn gemini_notification_to_normalized(
     session_id: Option<&str>,
 ) -> Option<NormalizedEvent> {
     let payload = match notification.method.as_str() {
-        "agent/progress" => {
+        "session/update" | "agent/progress" => {
             if let Some(params) = &notification.params {
-                if let Some(content) = params.get("content").and_then(|v| v.as_str()) {
+                if let Some(content) = params.get("content")
+                    .or_else(|| params.get("delta"))
+                    .or_else(|| params.get("text"))
+                    .and_then(|v| v.as_str())
+                {
                     EventPayload::Text {
                         content: content.to_string(),
                     }
@@ -44,11 +48,11 @@ pub fn gemini_notification_to_normalized(
                 return None;
             }
         }
-        "agent/toolCall" => {
+        "session/toolCall" | "agent/toolCall" => {
             if let Some(params) = &notification.params {
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
                 let tool_id = params.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let input = params.get("arguments").cloned();
+                let input = params.get("arguments").or_else(|| params.get("input")).cloned();
                 
                 EventPayload::Tool {
                     tool_id,
@@ -61,12 +65,12 @@ pub fn gemini_notification_to_normalized(
                 return None;
             }
         }
-        "agent/approval" => {
+        "session/approval" | "agent/approval" => {
             if let Some(params) = &notification.params {
                 let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
                 let approval_id = params.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
                 let description = params.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let input = params.get("arguments").cloned();
+                let input = params.get("arguments").or_else(|| params.get("input")).cloned();
                 
                 EventPayload::Approval {
                     approval_id,
@@ -78,7 +82,7 @@ pub fn gemini_notification_to_normalized(
                 return None;
             }
         }
-        "agent/complete" => {
+        "session/complete" | "session/cancel" | "agent/complete" => {
             EventPayload::Empty
         }
         _ => return None,

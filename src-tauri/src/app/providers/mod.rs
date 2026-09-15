@@ -208,7 +208,7 @@ pub enum PermissionMode {
 
 impl Default for PermissionMode {
     fn default() -> Self {
-        Self::Workspace
+        Self::Safe
     }
 }
 

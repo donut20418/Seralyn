@@ -83,7 +83,11 @@ impl ConversationManager {
         provider_kind: ProviderKind,
         event_sender: mpsc::Sender<NormalizedEvent>,
     ) -> Result<()> {
-        // 1. Save user message to DB
+        // 1. Build context from prior conversation history BEFORE saving current turn
+        // (Ensures prior context does NOT duplicate the current user turn)
+        let context = build_context(&self.db, conversation_id, 50)?;
+
+        // 2. Save user message to DB
         messages::create_message(
             &self.db,
             conversation_id,
@@ -96,8 +100,9 @@ impl ConversationManager {
             None,
         )?;
 
-        // 2. Get or create a provider session
+        // 3. Get or create a provider session
         let provider = self.provider_manager.get(provider_kind.clone())?;
+        let provider_str = provider_kind.to_string();
         
         let mut sessions = self.active_sessions.lock().await;
         let session_key = (conversation_id.to_string(), provider_kind.clone());
@@ -108,34 +113,66 @@ impl ConversationManager {
             let config = SessionConfig {
                 conversation_id: conversation_id.to_string(),
                 working_dir: None,
-                permission_mode: PermissionMode::Workspace,
+                permission_mode: PermissionMode::Safe,
                 system_prompt: None,
                 model: None,
                 env: HashMap::new(),
                 event_sender: internal_tx,
             };
             
-            let session = provider.create_session(config).await?;
-            
-            let record = provider_sessions::create_provider_session(
-                &self.db,
-                conversation_id,
-                &provider_kind.to_string(),
-                session.native_session_id(),
-                session.metadata().model.as_deref(),
-            )?;
+            // Check SQLite if an active native session already exists from earlier run
+            let existing_record = provider_sessions::get_active_session(&self.db, conversation_id, &provider_str)?;
+            let (session, provider_session_id) = match existing_record {
+                Some(record) if record.provider_session_id.is_some() => {
+                    let native_id = record.provider_session_id.as_ref().unwrap();
+                    match provider.resume_session(native_id, config.clone()).await {
+                        Ok(sess) => (sess, record.id),
+                        Err(_) => {
+                            let sess = provider.create_session(config).await?;
+                            let rec = provider_sessions::create_provider_session(
+                                &self.db,
+                                conversation_id,
+                                &provider_str,
+                                sess.native_session_id(),
+                                sess.metadata().model.as_deref(),
+                            )?;
+                            (sess, rec.id)
+                        }
+                    }
+                }
+                Some(record) => {
+                    let sess = provider.create_session(config).await?;
+                    (sess, record.id)
+                }
+                None => {
+                    let sess = provider.create_session(config).await?;
+                    let rec = provider_sessions::create_provider_session(
+                        &self.db,
+                        conversation_id,
+                        &provider_str,
+                        sess.native_session_id(),
+                        sess.metadata().model.as_deref(),
+                    )?;
+                    (sess, rec.id)
+                }
+            };
             
             let db_clone = self.db.clone();
             let event_sender_clone = event_sender.clone();
             let conv_id = conversation_id.to_string();
             let pk = provider_kind.clone();
-            let provider_session_id = record.id.clone();
+            let ps_id = provider_session_id.clone();
             
-            // 6. Spawn a tokio task that listens for events from the session
+            // 4. Spawn a tokio task that listens for events from the session
             tokio::spawn(async move {
                 let mut current_text = String::new();
                 
                 while let Some(event) = internal_rx.recv().await {
+                    // Update native session ID in DB when reported by provider
+                    if let EventPayload::Session { session_id: Some(sid), .. } = &event.payload {
+                        let _ = provider_sessions::update_native_session_id(&db_clone, &ps_id, sid);
+                    }
+
                     if let EventPayload::Text { content } = &event.payload {
                         current_text.push_str(content);
                     }
@@ -150,7 +187,7 @@ impl ConversationManager {
                                 &current_text,
                                 Some(&pk.to_string()),
                                 None,
-                                Some(&provider_session_id),
+                                Some(&ps_id),
                                 None,
                             );
                             current_text.clear();
@@ -168,20 +205,17 @@ impl ConversationManager {
 
         let session = sessions.get_mut(&session_key).unwrap();
 
-        // 3. Build context from conversation history
-        let context = build_context(&self.db, conversation_id, 50)?;
-
-        // 4. Create ProviderMessage with content + context
+        // 5. Create ProviderMessage with content + context
         let msg = ProviderMessage {
             content: content.to_string(),
             context,
             attachments: vec![],
         };
 
-        // 5. Call session.send(message)
+        // 6. Call session.send(message)
         session.send(msg).await?;
         
-        if let Some(record) = provider_sessions::get_active_session(&self.db, conversation_id, &provider_kind.to_string())? {
+        if let Some(record) = provider_sessions::get_active_session(&self.db, conversation_id, &provider_str)? {
             provider_sessions::update_session_used(&self.db, &record.id)?;
         }
 

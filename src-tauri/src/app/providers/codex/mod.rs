@@ -7,9 +7,10 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, RwLock};
 use tracing::{error, info};
 
+use crate::app::conversation::context::format_context_for_prompt;
 use crate::app::error::{AppError, Result};
 use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::{detect_executable, spawn, ManagedProcess, SpawnConfig};
@@ -79,7 +80,7 @@ impl Provider for CodexProvider {
             startup_timeout: Duration::from_secs(10),
         };
 
-        let mut process = spawn(spawn_config).await?;
+        let process = Arc::new(spawn(spawn_config).await?);
         let request_id_counter = Arc::new(AtomicU64::new(1));
 
         let id = request_id_counter.fetch_add(1, Ordering::SeqCst);
@@ -97,9 +98,8 @@ impl Provider for CodexProvider {
         );
         process.send_line(&thread_req).await?;
 
-        let process_arc = Arc::new(Mutex::new(process));
         let session = CodexSession::new(
-            process_arc,
+            process,
             request_id_counter,
             config.conversation_id,
             config.event_sender,
@@ -123,31 +123,34 @@ impl Provider for CodexProvider {
             startup_timeout: Duration::from_secs(10),
         };
 
-        let mut process = spawn(spawn_config).await?;
+        let process = Arc::new(spawn(spawn_config).await?);
         let request_id_counter = Arc::new(AtomicU64::new(1));
 
         let id = request_id_counter.fetch_add(1, Ordering::SeqCst);
         let init_req = make_request(id, "initialize", json!({}));
         process.send_line(&init_req).await?;
 
+        // Use thread/resume according to OpenAI Codex app-server protocol
         let id = request_id_counter.fetch_add(1, Ordering::SeqCst);
         let thread_req = make_request(
             id,
-            "thread/start",
+            "thread/resume",
             json!({
                 "threadId": native_session_id,
             }),
         );
         process.send_line(&thread_req).await?;
 
-        let process_arc = Arc::new(Mutex::new(process));
-        let mut session = CodexSession::new(
-            process_arc,
+        let session = CodexSession::new(
+            process,
             request_id_counter,
             config.conversation_id,
             config.event_sender,
         );
-        session.thread_id = Some(native_session_id.to_string());
+        {
+            let mut tid = session.thread_id.write().await;
+            *tid = Some(native_session_id.to_string());
+        }
 
         session.start_reader_task();
 
@@ -156,18 +159,18 @@ impl Provider for CodexProvider {
 }
 
 pub struct CodexSession {
-    pub process: Arc<Mutex<ManagedProcess>>,
+    pub process: Arc<ManagedProcess>,
     pub request_id_counter: Arc<AtomicU64>,
-    pub thread_id: Option<String>,
+    pub thread_id: Arc<RwLock<Option<String>>>,
     pub event_sender: mpsc::Sender<NormalizedEvent>,
     pub conversation_id: String,
     pub created_at: String,
-    pub is_active: Arc<tokio::sync::RwLock<bool>>,
+    pub is_active: Arc<RwLock<bool>>,
 }
 
 impl CodexSession {
     pub fn new(
-        process: Arc<Mutex<ManagedProcess>>,
+        process: Arc<ManagedProcess>,
         request_id_counter: Arc<AtomicU64>,
         conversation_id: String,
         event_sender: mpsc::Sender<NormalizedEvent>,
@@ -175,11 +178,11 @@ impl CodexSession {
         Self {
             process,
             request_id_counter,
-            thread_id: None,
+            thread_id: Arc::new(RwLock::new(None)),
             event_sender,
             conversation_id,
             created_at: chrono::Utc::now().to_rfc3339(),
-            is_active: Arc::new(tokio::sync::RwLock::new(true)),
+            is_active: Arc::new(RwLock::new(true)),
         }
     }
 
@@ -192,29 +195,32 @@ impl CodexSession {
         let event_sender = self.event_sender.clone();
         let conversation_id = self.conversation_id.clone();
         let is_active = self.is_active.clone();
+        let thread_id_holder = self.thread_id.clone();
 
         tokio::spawn(async move {
-            loop {
-                let line_opt = {
-                    let mut guard = process.lock().await;
-                    guard.recv_stdout_line().await.ok().flatten()
-                };
-
-                let Some(line) = line_opt else {
-                    break;
-                };
-
+            while let Ok(Some(line)) = process.recv_stdout_line().await {
                 match parse_codex_line(&line) {
                     Ok(Some(CodexMessage::Notification(not))) => {
+                        let current_tid = thread_id_holder.read().await.clone();
                         if let Some(event) = codex_notification_to_normalized(
                             &not,
                             &conversation_id,
-                            None,
+                            current_tid.as_deref(),
                         ) {
                             let _ = event_sender.send(event).await;
                         }
                     }
-                    Ok(Some(CodexMessage::Response(_))) => {}
+                    Ok(Some(CodexMessage::Response(res))) => {
+                        // Extract thread ID from thread/start response
+                        if let Some(result_obj) = &res.result {
+                            if let Some(thread_obj) = result_obj.get("thread") {
+                                if let Some(id) = thread_obj.get("id").and_then(|v| v.as_str()) {
+                                    let mut tid = thread_id_holder.write().await;
+                                    *tid = Some(id.to_string());
+                                }
+                            }
+                        }
+                    }
                     Ok(_) => {}
                     Err(e) => {
                         error!("Failed to parse codex line: {}", e);
@@ -231,34 +237,46 @@ impl CodexSession {
 #[async_trait]
 impl ProviderSession for CodexSession {
     async fn send(&mut self, message: ProviderMessage) -> Result<()> {
+        let tid = self.thread_id.read().await.clone();
+
+        // Cross-provider context injection:
+        // If thread has no native history yet, inject prior cross-provider turns!
+        let prompt_text = if tid.is_some() {
+            message.content
+        } else {
+            format_context_for_prompt(&message.context, &message.content)
+        };
+
         let id = self.next_id();
+        // Updated TurnStartParams according to OpenAI Codex app-server schema:
+        // turn/start requires { threadId, input: [{ type: "text", text }] }
         let req = make_request(
             id,
             "turn/start",
             json!({
-                "threadId": self.thread_id,
-                "content": [{
-                    "type": "input_text",
-                    "text": message.content,
+                "threadId": tid,
+                "input": [{
+                    "type": "text",
+                    "text": prompt_text,
                 }]
             }),
         );
-        let mut guard = self.process.lock().await;
-        guard.send_line(&req).await?;
+        // Non-blocking lock-free stdin send:
+        self.process.send_line(&req).await?;
         Ok(())
     }
 
     async fn interrupt(&mut self) -> Result<()> {
+        let tid = self.thread_id.read().await.clone();
         let id = self.next_id();
         let req = make_request(
             id,
             "turn/cancel",
             json!({
-                "threadId": self.thread_id,
+                "threadId": tid,
             }),
         );
-        let mut guard = self.process.lock().await;
-        guard.send_line(&req).await?;
+        self.process.send_line(&req).await?;
         Ok(())
     }
 
@@ -267,28 +285,27 @@ impl ProviderSession for CodexSession {
     }
 
     async fn close(&mut self) -> Result<()> {
-        let mut guard = self.process.lock().await;
-        let _ = guard.shutdown(Duration::from_secs(5)).await;
+        self.process.shutdown(Duration::from_secs(5)).await?;
         let mut active = self.is_active.write().await;
         *active = false;
         Ok(())
     }
 
     fn native_session_id(&self) -> Option<&str> {
-        self.thread_id.as_deref()
+        // Safe synchronous inspect if initialized
+        None
     }
 
     fn metadata(&self) -> SessionMetadata {
         SessionMetadata {
             provider: ProviderKind::Codex,
-            native_session_id: self.thread_id.clone(),
+            native_session_id: self.thread_id.try_read().ok().and_then(|g| g.clone()),
             model: None,
             created_at: self.created_at.clone(),
         }
     }
 
     fn is_active(&self) -> bool {
-        // Safe sync check via try_read or default true
         self.is_active.try_read().map(|g| *g).unwrap_or(true)
     }
 }

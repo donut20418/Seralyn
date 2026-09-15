@@ -7,42 +7,7 @@ pub mod conversations;
 pub mod messages;
 pub mod provider_sessions;
 
-const MIGRATION_001: &str = r#"
-CREATE TABLE IF NOT EXISTS conversations (
-    id TEXT PRIMARY KEY,
-    title TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    archived INTEGER NOT NULL DEFAULT 0,
-    metadata_json TEXT
-);
-
-CREATE TABLE IF NOT EXISTS provider_sessions (
-    id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    provider TEXT NOT NULL,
-    provider_session_id TEXT,
-    model TEXT,
-    created_at TEXT NOT NULL,
-    last_used_at TEXT,
-    status TEXT NOT NULL,
-    metadata_json TEXT
-);
-
-CREATE TABLE IF NOT EXISTS messages (
-    id TEXT PRIMARY KEY,
-    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-    parent_id TEXT REFERENCES messages(id),
-    role TEXT NOT NULL,
-    content TEXT NOT NULL,
-    provider TEXT,
-    model TEXT,
-    provider_session_id TEXT REFERENCES provider_sessions(id),
-    created_at TEXT NOT NULL,
-    token_estimate INTEGER,
-    metadata_json TEXT
-);
-"#;
+const MIGRATION_001: &str = include_str!("../../../migrations/001_initial.sql");
 
 pub struct Database {
     pub conn: Mutex<Connection>,
