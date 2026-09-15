@@ -9,6 +9,7 @@ use rusqlite::params;
 pub struct Message {
     pub id: String,
     pub conversation_id: String,
+    pub seq: i64,
     pub parent_id: Option<String>,
     pub role: String,
     pub content: String,
@@ -36,11 +37,18 @@ pub fn create_message(
     let now = Utc::now().to_rfc3339();
 
     let conn = db.conn.lock().unwrap();
+
+    let next_seq: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM messages WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get(0),
+    ).map_err(|e| AppError::Database(e.to_string()))?;
+
     conn.execute(
         "INSERT INTO messages (
-            id, conversation_id, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![id, conversation_id, parent_id, role, content, provider, model, provider_session_id, now, token_estimate],
+            id, conversation_id, seq, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![id, conversation_id, next_seq, parent_id, role, content, provider, model, provider_session_id, now, token_estimate],
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
     conn.execute(
@@ -51,6 +59,7 @@ pub fn create_message(
     Ok(Message {
         id,
         conversation_id: conversation_id.to_string(),
+        seq: next_seq,
         parent_id: parent_id.map(|s| s.to_string()),
         role: role.to_string(),
         content: content.to_string(),
@@ -66,23 +75,24 @@ pub fn create_message(
 pub fn get_messages(db: &Database, conversation_id: &str) -> Result<Vec<Message>> {
     let conn = db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
-         FROM messages WHERE conversation_id = ?1 ORDER BY created_at ASC"
+        "SELECT id, conversation_id, seq, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
+         FROM messages WHERE conversation_id = ?1 ORDER BY seq ASC"
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
     let iter = stmt.query_map(params![conversation_id], |row| {
         Ok(Message {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
-            parent_id: row.get(2)?,
-            role: row.get(3)?,
-            content: row.get(4)?,
-            provider: row.get(5)?,
-            model: row.get(6)?,
-            provider_session_id: row.get(7)?,
-            created_at: row.get(8)?,
-            token_estimate: row.get(9)?,
-            metadata_json: row.get(10)?,
+            seq: row.get(2)?,
+            parent_id: row.get(3)?,
+            role: row.get(4)?,
+            content: row.get(5)?,
+            provider: row.get(6)?,
+            model: row.get(7)?,
+            provider_session_id: row.get(8)?,
+            created_at: row.get(9)?,
+            token_estimate: row.get(10)?,
+            metadata_json: row.get(11)?,
         })
     }).map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -96,22 +106,23 @@ pub fn get_messages(db: &Database, conversation_id: &str) -> Result<Vec<Message>
 pub fn get_message(db: &Database, id: &str) -> Result<Message> {
     let conn = db.conn.lock().unwrap();
     conn.query_row(
-        "SELECT id, conversation_id, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
+        "SELECT id, conversation_id, seq, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
          FROM messages WHERE id = ?1",
         params![id],
         |row| {
             Ok(Message {
                 id: row.get(0)?,
                 conversation_id: row.get(1)?,
-                parent_id: row.get(2)?,
-                role: row.get(3)?,
-                content: row.get(4)?,
-                provider: row.get(5)?,
-                model: row.get(6)?,
-                provider_session_id: row.get(7)?,
-                created_at: row.get(8)?,
-                token_estimate: row.get(9)?,
-                metadata_json: row.get(10)?,
+                seq: row.get(2)?,
+                parent_id: row.get(3)?,
+                role: row.get(4)?,
+                content: row.get(5)?,
+                provider: row.get(6)?,
+                model: row.get(7)?,
+                provider_session_id: row.get(8)?,
+                created_at: row.get(9)?,
+                token_estimate: row.get(10)?,
+                metadata_json: row.get(11)?,
             })
         },
     ).map_err(|e| AppError::Database(e.to_string()))
@@ -121,24 +132,25 @@ pub fn get_recent_messages(db: &Database, conversation_id: &str, limit: usize) -
     let conn = db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT * FROM (
-            SELECT id, conversation_id, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
-            FROM messages WHERE conversation_id = ?1 ORDER BY created_at DESC LIMIT ?2
-         ) ORDER BY created_at ASC"
+            SELECT id, conversation_id, seq, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
+            FROM messages WHERE conversation_id = ?1 ORDER BY seq DESC LIMIT ?2
+         ) ORDER BY seq ASC"
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
     let iter = stmt.query_map(params![conversation_id, limit], |row| {
         Ok(Message {
             id: row.get(0)?,
             conversation_id: row.get(1)?,
-            parent_id: row.get(2)?,
-            role: row.get(3)?,
-            content: row.get(4)?,
-            provider: row.get(5)?,
-            model: row.get(6)?,
-            provider_session_id: row.get(7)?,
-            created_at: row.get(8)?,
-            token_estimate: row.get(9)?,
-            metadata_json: row.get(10)?,
+            seq: row.get(2)?,
+            parent_id: row.get(3)?,
+            role: row.get(4)?,
+            content: row.get(5)?,
+            provider: row.get(6)?,
+            model: row.get(7)?,
+            provider_session_id: row.get(8)?,
+            created_at: row.get(9)?,
+            token_estimate: row.get(10)?,
+            metadata_json: row.get(11)?,
         })
     }).map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -158,6 +170,15 @@ pub fn count_messages(db: &Database, conversation_id: &str) -> Result<i64> {
     ).map_err(|e| AppError::Database(e.to_string()))
 }
 
+pub fn get_latest_seq(db: &Database, conversation_id: &str) -> Result<i64> {
+    let conn = db.conn.lock().unwrap();
+    conn.query_row(
+        "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE conversation_id = ?1",
+        params![conversation_id],
+        |row| row.get(0),
+    ).map_err(|e| AppError::Database(e.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,9 +193,11 @@ mod tests {
         let msg = create_message(&db, &conv.id, None, "user", "hello", None, None, None, None).unwrap();
         assert_eq!(msg.content, "hello");
         assert_eq!(msg.conversation_id, conv.id);
+        assert_eq!(msg.seq, 1);
 
         let fetched = get_message(&db, &msg.id).unwrap();
         assert_eq!(fetched.id, msg.id);
+        assert_eq!(fetched.seq, 1);
 
         let msgs = get_messages(&db, &conv.id).unwrap();
         assert_eq!(msgs.len(), 1);
@@ -182,9 +205,12 @@ mod tests {
         let count = count_messages(&db, &conv.id).unwrap();
         assert_eq!(count, 1);
 
-        create_message(&db, &conv.id, None, "assistant", "hi", None, None, None, None).unwrap();
+        let msg2 = create_message(&db, &conv.id, None, "assistant", "hi", None, None, None, None).unwrap();
+        assert_eq!(msg2.seq, 2);
+
         let recent = get_recent_messages(&db, &conv.id, 1).unwrap();
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].content, "hi");
+        assert_eq!(recent[0].seq, 2);
     }
 }

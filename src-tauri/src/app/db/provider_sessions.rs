@@ -15,6 +15,7 @@ pub struct ProviderSessionRecord {
     pub created_at: String,
     pub last_used_at: Option<String>,
     pub status: String,
+    pub synced_through_seq: i64,
     pub metadata_json: Option<String>,
 }
 
@@ -30,9 +31,9 @@ pub fn create_provider_session(
 
     let conn = db.conn.lock().unwrap();
     conn.execute(
-        "INSERT INTO provider_sessions (id, conversation_id, provider, provider_session_id, model, created_at, status)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id, conversation_id, provider, provider_session_id, model, now, "active"],
+        "INSERT INTO provider_sessions (id, conversation_id, provider, provider_session_id, model, created_at, status, synced_through_seq)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![id, conversation_id, provider, provider_session_id, model, now, "active", 0],
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
     Ok(ProviderSessionRecord {
@@ -44,6 +45,7 @@ pub fn create_provider_session(
         created_at: now,
         last_used_at: None,
         status: "active".to_string(),
+        synced_through_seq: 0,
         metadata_json: None,
     })
 }
@@ -51,7 +53,7 @@ pub fn create_provider_session(
 pub fn get_active_session(db: &Database, conversation_id: &str, provider: &str) -> Result<Option<ProviderSessionRecord>> {
     let conn = db.conn.lock().unwrap();
     conn.query_row(
-        "SELECT id, conversation_id, provider, provider_session_id, model, created_at, last_used_at, status, metadata_json
+        "SELECT id, conversation_id, provider, provider_session_id, model, created_at, last_used_at, status, synced_through_seq, metadata_json
          FROM provider_sessions 
          WHERE conversation_id = ?1 AND provider = ?2 AND status = 'active'
          ORDER BY created_at DESC LIMIT 1",
@@ -66,7 +68,8 @@ pub fn get_active_session(db: &Database, conversation_id: &str, provider: &str) 
                 created_at: row.get(5)?,
                 last_used_at: row.get(6)?,
                 status: row.get(7)?,
-                metadata_json: row.get(8)?,
+                synced_through_seq: row.get(8)?,
+                metadata_json: row.get(9)?,
             })
         },
     ).optional().map_err(|e| AppError::Database(e.to_string()))
@@ -91,6 +94,15 @@ pub fn update_native_session_id(db: &Database, id: &str, native_session_id: &str
     Ok(())
 }
 
+pub fn update_synced_seq(db: &Database, id: &str, seq: i64) -> Result<()> {
+    let conn = db.conn.lock().unwrap();
+    conn.execute(
+        "UPDATE provider_sessions SET synced_through_seq = ?1 WHERE id = ?2",
+        params![seq, id],
+    ).map_err(|e| AppError::Database(e.to_string()))?;
+    Ok(())
+}
+
 pub fn close_session(db: &Database, id: &str) -> Result<()> {
     let conn = db.conn.lock().unwrap();
     conn.execute(
@@ -103,7 +115,7 @@ pub fn close_session(db: &Database, id: &str) -> Result<()> {
 pub fn get_sessions_for_conversation(db: &Database, conversation_id: &str) -> Result<Vec<ProviderSessionRecord>> {
     let conn = db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, conversation_id, provider, provider_session_id, model, created_at, last_used_at, status, metadata_json
+        "SELECT id, conversation_id, provider, provider_session_id, model, created_at, last_used_at, status, synced_through_seq, metadata_json
          FROM provider_sessions WHERE conversation_id = ?1 ORDER BY created_at DESC"
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -117,7 +129,8 @@ pub fn get_sessions_for_conversation(db: &Database, conversation_id: &str) -> Re
             created_at: row.get(5)?,
             last_used_at: row.get(6)?,
             status: row.get(7)?,
-            metadata_json: row.get(8)?,
+            synced_through_seq: row.get(8)?,
+            metadata_json: row.get(9)?,
         })
     }).map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -141,17 +154,24 @@ mod tests {
         let conv = create_conversation(&db, None).unwrap();
         let session = create_provider_session(&db, &conv.id, "codex", Some("sess_123"), Some("gpt-4")).unwrap();
         assert_eq!(session.provider, "codex");
+        assert_eq!(session.synced_through_seq, 0);
 
         let active = get_active_session(&db, &conv.id, "codex").unwrap().unwrap();
         assert_eq!(active.id, session.id);
+        assert_eq!(active.synced_through_seq, 0);
 
         update_session_used(&db, &session.id).unwrap();
         update_native_session_id(&db, &session.id, "sess_456").unwrap();
+        update_synced_seq(&db, &session.id, 5).unwrap();
+
+        let updated = get_active_session(&db, &conv.id, "codex").unwrap().unwrap();
+        assert_eq!(updated.synced_through_seq, 5);
         
         let sessions = get_sessions_for_conversation(&db, &conv.id).unwrap();
         assert_eq!(sessions.len(), 1);
         assert!(sessions[0].last_used_at.is_some());
         assert_eq!(sessions[0].provider_session_id.as_deref(), Some("sess_456"));
+        assert_eq!(sessions[0].synced_through_seq, 5);
 
         close_session(&db, &session.id).unwrap();
         let closed = get_active_session(&db, &conv.id, "codex").unwrap();

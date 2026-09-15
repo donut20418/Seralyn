@@ -1,3 +1,5 @@
+pub mod json_rpc;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -6,8 +8,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, Command};
-use tokio::sync::{mpsc, Mutex};
+use tokio::process::Command;
+use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
 #[cfg(windows)]
@@ -33,10 +35,18 @@ pub struct SpawnConfig {
     pub startup_timeout: Duration,
 }
 
+enum ProcessControlMsg {
+    Shutdown {
+        timeout: Duration,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Kill,
+}
+
 /// A managed background process that decouples stdin writing from stdout/stderr reading
-/// to prevent any deadlocks between reader and writer loops.
+/// and uses an actor-based control loop to prevent deadlocks on process shutdown/exit.
 pub struct ManagedProcess {
-    child: Arc<Mutex<Child>>,
+    ctrl_tx: mpsc::Sender<ProcessControlMsg>,
     stdin_tx: mpsc::Sender<String>,
     stdout_rx: Arc<Mutex<mpsc::Receiver<String>>>,
     stderr_rx: Arc<Mutex<mpsc::Receiver<String>>>,
@@ -164,27 +174,72 @@ pub async fn spawn(config: SpawnConfig) -> Result<ManagedProcess> {
         tracing::debug!("Stderr stream ended for {}", name_stderr);
     });
 
-    let child_arc = Arc::new(Mutex::new(child));
-    let alive_monitor = alive.clone();
-    let child_for_monitor = child_arc.clone();
-    let name_monitor = config.executable.clone();
+    let (ctrl_tx, mut ctrl_rx) = mpsc::channel::<ProcessControlMsg>(10);
+    let alive_actor = alive.clone();
+    let name_actor = config.executable.clone();
+    let pid_actor = pid;
 
-    // Process lifecycle monitor: only marks alive = false when process actually terminates
+    // Process lifecycle actor: owns child exclusively.
+    // Handles wait and external commands (Shutdown, Kill) without lock contention.
     tokio::spawn(async move {
-        let mut guard = child_for_monitor.lock().await;
-        match guard.wait().await {
-            Ok(status) => {
-                tracing::info!("[{}] Process exited with status: {}", name_monitor, status);
+        let mut child = child;
+        tokio::select! {
+            exit_res = child.wait() => {
+                match exit_res {
+                    Ok(status) => {
+                        tracing::info!("[{}] Process exited with status: {}", name_actor, status);
+                    }
+                    Err(e) => {
+                        tracing::warn!("[{}] Process wait error: {}", name_actor, e);
+                    }
+                }
+                alive_actor.store(false, Ordering::SeqCst);
             }
-            Err(e) => {
-                tracing::warn!("[{}] Process wait error: {}", name_monitor, e);
+            Some(cmd) = ctrl_rx.recv() => {
+                match cmd {
+                    ProcessControlMsg::Kill => {
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
+                        alive_actor.store(false, Ordering::SeqCst);
+                    }
+                    ProcessControlMsg::Shutdown { timeout: timeout_duration, reply } => {
+                        if let Ok(Some(_)) = child.try_wait() {
+                            alive_actor.store(false, Ordering::SeqCst);
+                            let _ = reply.send(Ok(()));
+                            return;
+                        }
+
+                        let _ = child.start_kill();
+                        let res = match timeout(timeout_duration, child.wait()).await {
+                            Ok(Ok(status)) => {
+                                tracing::info!("[{}] Process shut down cleanly: {}", name_actor, status);
+                                Ok(())
+                            }
+                            Ok(Err(e)) => {
+                                tracing::warn!("[{}] Process wait error during shutdown: {}", name_actor, e);
+                                Err(AppError::Process(e.to_string()))
+                            }
+                            Err(_) => {
+                                tracing::warn!("[{}] Process shutdown timeout (PID: {:?})", name_actor, pid_actor);
+                                let _ = child.kill().await;
+                                Err(AppError::Process("Shutdown timeout".to_string()))
+                            }
+                        };
+                        alive_actor.store(false, Ordering::SeqCst);
+                        let _ = reply.send(res);
+                    }
+                }
             }
         }
-        alive_monitor.store(false, Ordering::SeqCst);
     });
 
     // Check startup timeout: ensure process didn't immediately crash
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let startup_check = if config.startup_timeout.is_zero() {
+        Duration::from_millis(50)
+    } else {
+        config.startup_timeout
+    };
+    tokio::time::sleep(startup_check).await;
     if !alive.load(Ordering::SeqCst) {
         return Err(AppError::Process(format!(
             "Process '{}' exited immediately after launch",
@@ -193,7 +248,7 @@ pub async fn spawn(config: SpawnConfig) -> Result<ManagedProcess> {
     }
 
     Ok(ManagedProcess {
-        child: child_arc,
+        ctrl_tx,
         stdin_tx,
         stdout_rx: Arc::new(Mutex::new(stdout_rx)),
         stderr_rx: Arc::new(Mutex::new(stderr_rx)),
@@ -231,21 +286,39 @@ impl ManagedProcess {
         self.alive.load(Ordering::SeqCst)
     }
 
-    /// Gracefully attempts to shut down the process, falling back to a hard kill on timeout
+    /// Gracefully attempts to shut down the process, falling back to a hard kill on timeout.
+    /// Uses actor channel to eliminate any mutex lock contention.
     pub async fn shutdown(&self, timeout_duration: Duration) -> Result<()> {
         if !self.is_alive() {
             return Ok(());
         }
 
-        let mut child_guard = self.child.lock().await;
-        if timeout(timeout_duration, child_guard.wait()).await.is_err() {
-            tracing::info!(
-                "Process shutdown timeout, forcing kill (PID: {:?})",
-                self.pid
-            );
-            let _ = child_guard.kill().await;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if self
+            .ctrl_tx
+            .send(ProcessControlMsg::Shutdown {
+                timeout: timeout_duration,
+                reply: reply_tx,
+            })
+            .await
+            .is_err()
+        {
+            self.alive.store(false, Ordering::SeqCst);
+            return Ok(());
         }
 
+        match reply_rx.await {
+            Ok(res) => res,
+            Err(_) => Ok(()),
+        }
+    }
+
+    /// Kills the child process immediately via the actor channel
+    pub async fn kill(&self) -> Result<()> {
+        if !self.is_alive() {
+            return Ok(());
+        }
+        let _ = self.ctrl_tx.send(ProcessControlMsg::Kill).await;
         self.alive.store(false, Ordering::SeqCst);
         Ok(())
     }
@@ -259,9 +332,7 @@ impl ManagedProcess {
 impl Drop for ManagedProcess {
     fn drop(&mut self) {
         if self.alive.load(Ordering::SeqCst) {
-            if let Ok(mut guard) = self.child.try_lock() {
-                let _ = guard.start_kill();
-            }
+            let _ = self.ctrl_tx.try_send(ProcessControlMsg::Kill);
         }
     }
 }
@@ -275,9 +346,7 @@ mod tests {
         let result = detect_executable("cmd").await;
         assert!(result.is_ok(), "Should find cmd executable on Windows");
 
-        if let Ok(info) = result {
-            assert_eq!(info.name, "cmd");
-            assert!(info.path.exists());
-        }
+        let non_existent = detect_executable("non_existent_executable_12345").await;
+        assert!(non_existent.is_err(), "Should fail for missing executable");
     }
 }

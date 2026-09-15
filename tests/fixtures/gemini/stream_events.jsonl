@@ -1,5 +1,6 @@
-{"jsonrpc":"2.0","method":"agent/progress","params":{"type":"text","content":"Here's"}}
-{"jsonrpc":"2.0","method":"agent/progress","params":{"type":"text","content":" what I can help with."}}
-{"jsonrpc":"2.0","method":"agent/toolCall","params":{"id":"tool_001","name":"readFile","input":{"path":"main.rs"}}}
-{"jsonrpc":"2.0","method":"agent/progress","params":{"type":"text","content":"\n\nI've read the file."}}
-{"jsonrpc":"2.0","method":"agent/complete","params":{"status":"success"}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_123","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"Here's"}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_123","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":" what I can help with."}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_123","update":{"sessionUpdate":"tool_call","toolCall":{"id":"tool_001","name":"readFile","arguments":{"path":"main.rs"}}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_123","update":{"sessionUpdate":"tool_call_update","toolCallUpdate":{"id":"tool_001","status":"completed","output":"fn main() {}"}}}}}
+{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"sess_123","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"\n\nI've read the file."}}}}
+{"jsonrpc":"2.0","method":"session/complete","params":{"sessionId":"sess_123"}}

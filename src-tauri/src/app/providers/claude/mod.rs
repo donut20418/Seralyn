@@ -1,29 +1,33 @@
+pub mod parser;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use tokio::sync::Mutex;
-use tracing::{error, info};
+use tokio::sync::{Mutex, RwLock};
 
 use crate::app::conversation::context::format_context_for_prompt;
-use crate::app::error::{AppError, Result};
+use crate::app::error::Result;
 use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::{detect_executable, spawn, ManagedProcess, SpawnConfig};
 use crate::app::providers::{
-    AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities, ProviderMessage,
-    ProviderSession, SessionConfig, SessionMetadata,
+    AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
+    ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
-
-pub mod parser;
-
 use parser::{claude_event_to_normalized, parse_claude_line, ClaudeEvent};
 
-pub struct ClaudeProvider {}
+pub struct ClaudeProvider;
 
 impl ClaudeProvider {
     pub fn new() -> Self {
-        Self {}
+        Self
+    }
+}
+
+impl Default for ClaudeProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -49,14 +53,15 @@ impl Provider for ClaudeProvider {
     }
 
     async fn check_authentication(&self) -> Result<AuthStatus> {
-        let output = tokio::process::Command::new("claude")
-            .arg("auth")
-            .arg("status")
-            .output()
-            .await;
+        let spawn_config = SpawnConfig {
+            executable: "claude".to_string(),
+            args: vec!["doctor".to_string()],
+            working_dir: None,
+            env: std::collections::HashMap::new(),
+            startup_timeout: Duration::from_secs(5),
+        };
 
-        match output {
-            Ok(out) if out.status.success() => Ok(AuthStatus::Authenticated),
+        match spawn(spawn_config).await {
             Ok(_) => Ok(AuthStatus::NotAuthenticated),
             Err(_) => Ok(AuthStatus::Unknown),
         }
@@ -100,7 +105,7 @@ impl Provider for ClaudeProvider {
 
 pub struct ClaudeSession {
     config: SessionConfig,
-    native_session_id: Option<String>,
+    native_session_id: Arc<RwLock<Option<String>>>,
     model: Option<String>,
     active: bool,
     created_at: String,
@@ -112,7 +117,7 @@ impl ClaudeSession {
         Self {
             model: config.model.clone(),
             config,
-            native_session_id,
+            native_session_id: Arc::new(RwLock::new(native_session_id)),
             active: true,
             created_at: Utc::now().to_rfc3339(),
             current_process: Arc::new(Mutex::new(None)),
@@ -123,14 +128,12 @@ impl ClaudeSession {
 #[async_trait]
 impl ProviderSession for ClaudeSession {
     async fn send(&mut self, message: ProviderMessage) -> Result<()> {
+        let sid_opt = self.native_session_id.read().await.clone();
+
         // Cross-provider context injection:
-        // If this is a fresh Claude session (no native session yet) or switching from another provider,
-        // format prior conversation turns into prompt so Claude has complete history!
-        let prompt_text = if self.native_session_id.is_some() {
-            message.content
-        } else {
-            format_context_for_prompt(&message.context, &message.content)
-        };
+        // format_context_for_prompt injects delta messages if there are any missed turns.
+        // If message.context is empty (session is up to date), it returns message.content unchanged.
+        let prompt_text = format_context_for_prompt(&message.context, &message.content);
 
         let mut args = vec![
             "-p".to_string(),
@@ -139,8 +142,8 @@ impl ProviderSession for ClaudeSession {
             "stream-json".to_string(),
         ];
 
-        // Correct resume flag semantics
-        if let Some(sid) = &self.native_session_id {
+        // Resume flag semantics
+        if let Some(sid) = &sid_opt {
             args.push("--resume".to_string());
             args.push(sid.clone());
         }
@@ -158,7 +161,7 @@ impl ProviderSession for ClaudeSession {
             startup_timeout: Duration::from_secs(10),
         };
 
-        let mut process = spawn(spawn_config).await?;
+        let process = spawn(spawn_config).await?;
         let process_arc = Arc::new(process);
         {
             let mut cp = self.current_process.lock().await;
@@ -169,8 +172,7 @@ impl ProviderSession for ClaudeSession {
         let provider = ProviderKind::Claude;
         let conv_id = self.config.conversation_id.clone();
         let current_process_holder = self.current_process.clone();
-
-        let mut latest_sid = self.native_session_id.clone();
+        let sid_holder = self.native_session_id.clone();
         let process_for_task = process_arc.clone();
 
         tokio::spawn(async move {
@@ -179,15 +181,18 @@ impl ProviderSession for ClaudeSession {
                 if let Ok(Some(event)) = parse_claude_line(&line) {
                     if let ClaudeEvent::Result { session_id, .. } = &event {
                         if let Some(sid) = session_id {
-                            latest_sid = Some(sid.clone());
+                            let mut guard = sid_holder.write().await;
+                            *guard = Some(sid.clone());
                         }
                     }
+
+                    let current_sid = sid_holder.read().await.clone();
 
                     if let Some(normalized) = claude_event_to_normalized(
                         event,
                         provider.clone(),
                         &conv_id,
-                        latest_sid.as_deref(),
+                        current_sid.as_deref(),
                     ) {
                         if normalized.event_type == crate::app::events::EventType::SessionFinished {
                             finished_sent = true;
@@ -217,7 +222,7 @@ impl ProviderSession for ClaudeSession {
     async fn cancel(&mut self) -> Result<()> {
         let cp = self.current_process.lock().await;
         if let Some(p) = cp.as_ref() {
-            let _ = p.shutdown(Duration::from_secs(2)).await;
+            let _ = p.kill().await;
         }
         Ok(())
     }
@@ -228,14 +233,18 @@ impl ProviderSession for ClaudeSession {
         Ok(())
     }
 
-    fn native_session_id(&self) -> Option<&str> {
-        self.native_session_id.as_deref()
+    fn native_session_id(&self) -> Option<String> {
+        self.native_session_id.try_read().ok().and_then(|g| g.clone())
+    }
+
+    async fn respond_to_approval(&mut self, _request_id: &str, _approved: bool) -> Result<()> {
+        Ok(())
     }
 
     fn metadata(&self) -> SessionMetadata {
         SessionMetadata {
             provider: ProviderKind::Claude,
-            native_session_id: self.native_session_id.clone(),
+            native_session_id: self.native_session_id(),
             model: self.model.clone(),
             created_at: self.created_at.clone(),
         }

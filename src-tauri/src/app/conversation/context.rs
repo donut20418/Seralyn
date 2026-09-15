@@ -1,6 +1,8 @@
+use rusqlite::params;
+
 use crate::app::db::Database;
 use crate::app::db::messages::get_recent_messages;
-use crate::app::error::Result;
+use crate::app::error::{AppError, Result};
 use crate::app::providers::ContextMessage;
 use crate::app::tokens::TokenManager;
 
@@ -20,6 +22,43 @@ pub fn build_context(db: &Database, conversation_id: &str, max_messages: usize) 
         });
     }
     
+    Ok(context)
+}
+
+/// Builds the context delta between a provider session's sync cursor (`after_seq`)
+/// and the current user message (`before_seq`).
+/// Only messages in range (after_seq, before_seq) are returned.
+pub fn build_context_delta(
+    db: &Database,
+    conversation_id: &str,
+    after_seq: i64,
+    before_seq: i64,
+) -> Result<Vec<ContextMessage>> {
+    let conn = db.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT role, content, provider
+         FROM messages
+         WHERE conversation_id = ?1 AND seq > ?2 AND seq < ?3
+         ORDER BY seq ASC"
+    ).map_err(|e| AppError::Database(e.to_string()))?;
+
+    let iter = stmt.query_map(params![conversation_id, after_seq, before_seq], |row| {
+        Ok(ContextMessage {
+            role: row.get(0)?,
+            content: row.get(1)?,
+            provider: row.get(2)?,
+        })
+    }).map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut context = Vec::new();
+    for row in iter {
+        let msg = row.map_err(|e| AppError::Database(e.to_string()))?;
+        if msg.role == "system" || msg.role == "tool" {
+            continue;
+        }
+        context.push(msg);
+    }
+
     Ok(context)
 }
 
@@ -67,6 +106,36 @@ mod tests {
         assert_eq!(ctx.len(), 1);
         assert_eq!(ctx[0].role, "user");
         assert_eq!(ctx[0].content, "Hello");
+    }
+
+    #[test]
+    fn test_build_context_delta() {
+        let db = Database::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+
+        let conv = create_conversation(&db, None).unwrap();
+        // seq 1
+        create_message(&db, &conv.id, None, "user", "Turn 1", None, None, None, None).unwrap();
+        // seq 2
+        create_message(&db, &conv.id, None, "assistant", "Answer 1", Some("claude"), None, None, None).unwrap();
+        // seq 3
+        create_message(&db, &conv.id, None, "user", "Turn 2", None, None, None, None).unwrap();
+        // seq 4
+        create_message(&db, &conv.id, None, "assistant", "Answer 2", Some("codex"), None, None, None).unwrap();
+        // seq 5
+        create_message(&db, &conv.id, None, "user", "Turn 3", None, None, None, None).unwrap();
+
+        // If provider synced up to seq 2 (e.g. Claude), and current turn is seq 5:
+        // delta should contain seq 3 (user) and seq 4 (assistant codex)
+        let delta = build_context_delta(&db, &conv.id, 2, 5).unwrap();
+        assert_eq!(delta.len(), 2);
+        assert_eq!(delta[0].content, "Turn 2");
+        assert_eq!(delta[1].content, "Answer 2");
+        assert_eq!(delta[1].provider.as_deref(), Some("codex"));
+
+        // If provider synced up to seq 4, and current turn is seq 5: delta is empty
+        let delta_none = build_context_delta(&db, &conv.id, 4, 5).unwrap();
+        assert!(delta_none.is_empty());
     }
     
     #[test]

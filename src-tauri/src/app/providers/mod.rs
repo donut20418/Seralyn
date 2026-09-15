@@ -76,7 +76,12 @@ pub trait ProviderSession: Send + Sync {
     async fn close(&mut self) -> Result<()>;
 
     /// Get the native provider session ID (if available).
-    fn native_session_id(&self) -> Option<&str>;
+    fn native_session_id(&self) -> Option<String>;
+
+    /// Respond to a pending approval or permission request.
+    async fn respond_to_approval(&mut self, _request_id: &str, _approved: bool) -> Result<()> {
+        Ok(())
+    }
 
     /// Get session metadata.
     fn metadata(&self) -> SessionMetadata;

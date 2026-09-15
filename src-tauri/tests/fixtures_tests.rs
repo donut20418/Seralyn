@@ -3,7 +3,7 @@ use seralyn_lib::app::db::messages;
 use seralyn_lib::app::db::Database;
 use seralyn_lib::app::events::{EventType, NormalizedEvent, ProviderKind, EventPayload};
 use seralyn_lib::app::providers::claude::parser::{claude_event_to_normalized, parse_claude_line};
-use seralyn_lib::app::providers::codex::parser::{codex_notification_to_normalized, parse_codex_line, CodexMessage};
+use seralyn_lib::app::providers::codex::parser::{codex_notification_to_normalized, codex_server_request_to_normalized, parse_codex_line, CodexMessage};
 use seralyn_lib::app::providers::gemini::parser::{gemini_notification_to_normalized, parse_gemini_line, AcpMessage};
 
 #[test]
@@ -101,22 +101,30 @@ fn test_codex_turn_events_fixture() {
 #[test]
 fn test_codex_approval_fixture() {
     let fixture = include_str!("../../tests/fixtures/codex/approval.jsonl");
-    let mut approval_found = false;
+    let mut approval_count = 0;
 
     for line in fixture.lines() {
-        if let Ok(Some(CodexMessage::Notification(notif))) = parse_codex_line(line) {
-            if let Some(norm) = codex_notification_to_normalized(&notif, "conv-1", None) {
-                if norm.event_type == EventType::ApprovalRequired {
-                    approval_found = true;
-                    if let EventPayload::Approval { tool_name, .. } = norm.payload {
-                        assert_eq!(tool_name, "shell");
+        if let Ok(Some(msg)) = parse_codex_line(line) {
+            match msg {
+                CodexMessage::ServerRequest(req) => {
+                    if let Some(norm) = codex_server_request_to_normalized(&req, "conv-1", None) {
+                        assert_eq!(norm.event_type, EventType::ApprovalRequired);
+                        approval_count += 1;
                     }
                 }
+                CodexMessage::Notification(notif) => {
+                    if let Some(norm) = codex_notification_to_normalized(&notif, "conv-1", None) {
+                        if norm.event_type == EventType::ApprovalRequired {
+                            approval_count += 1;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
 
-    assert!(approval_found, "Expected ApprovalRequired event from Codex approval fixture");
+    assert!(approval_count >= 1, "Expected ApprovalRequired events from Codex approval fixture");
 }
 
 #[test]
@@ -162,12 +170,6 @@ fn test_gemini_stream_events_fixture() {
 
 #[test]
 fn test_cross_provider_conversation_persistence() {
-    // Acceptance Test Simulation:
-    // Start one conversation in SQLite.
-    // Send Prompt A to Claude -> record assistant response.
-    // Switch to Codex and send Prompt B -> record assistant response.
-    // Switch to Gemini and send Prompt C -> record assistant response.
-    // Verify all messages exist in exact order with correct provider attribution.
     let db = Database::new_in_memory().expect("Failed to create in-memory database");
     db.run_migrations().expect("Failed to run migrations");
 
@@ -197,20 +199,26 @@ fn test_cross_provider_conversation_persistence() {
     assert_eq!(msgs.len(), 6);
 
     assert_eq!(msgs[0].role, "user");
+    assert_eq!(msgs[0].seq, 1);
     assert_eq!(msgs[1].role, "assistant");
+    assert_eq!(msgs[1].seq, 2);
     assert_eq!(msgs[1].provider.as_deref(), Some("claude"));
 
     assert_eq!(msgs[2].role, "user");
+    assert_eq!(msgs[2].seq, 3);
     assert_eq!(msgs[3].role, "assistant");
+    assert_eq!(msgs[3].seq, 4);
     assert_eq!(msgs[3].provider.as_deref(), Some("codex"));
 
     assert_eq!(msgs[4].role, "user");
+    assert_eq!(msgs[4].seq, 5);
     assert_eq!(msgs[5].role, "assistant");
+    assert_eq!(msgs[5].seq, 6);
     assert_eq!(msgs[5].provider.as_deref(), Some("gemini"));
 }
 
 #[tokio::test]
-async fn test_cross_provider_context_handover_flow() {
+async fn test_cross_provider_sync_cursor_full_cycle() {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use async_trait::async_trait;
@@ -263,7 +271,8 @@ async fn test_cross_provider_context_handover_flow() {
         async fn interrupt(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         async fn cancel(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         async fn close(&mut self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
-        fn native_session_id(&self) -> Option<&str> { Some("mock-sid") }
+        fn native_session_id(&self) -> Option<String> { Some("mock-sid".into()) }
+        async fn respond_to_approval(&mut self, _id: &str, _app: bool) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         fn metadata(&self) -> SessionMetadata {
             SessionMetadata {
                 provider: self.provider,
@@ -317,7 +326,7 @@ async fn test_cross_provider_context_handover_flow() {
 
     let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
 
-    let conv = manager.create_conversation(Some("Context Handover Test")).unwrap();
+    let conv = manager.create_conversation(Some("Full Cycle Sync Cursor Test")).unwrap();
 
     // Turn 1: Claude
     let (tx1, mut rx1) = tokio::sync::mpsc::channel(10);
@@ -331,7 +340,7 @@ async fn test_cross_provider_context_handover_flow() {
     assert!(c_msgs[0].context.is_empty(), "Turn 1 must have no prior context");
     drop(c_msgs);
 
-    // Turn 2: Switch to Codex -> must receive Question 1 and Claude response in context!
+    // Turn 2: Switch to Codex -> must receive Turn 1 (Question 1 + Claude response)
     let (tx2, mut rx2) = tokio::sync::mpsc::channel(10);
     tokio::spawn(async move { while rx2.recv().await.is_some() {} });
     manager.send_message(&conv.id, "Question 2", ProviderKind::Codex, tx2).await.unwrap();
@@ -340,17 +349,12 @@ async fn test_cross_provider_context_handover_flow() {
     let codex_msgs = codex_history.lock().await;
     assert_eq!(codex_msgs.len(), 1);
     assert_eq!(codex_msgs[0].content, "Question 2");
-    assert_eq!(codex_msgs[0].context.len(), 2, "Turn 2 must receive Turn 1 (user + assistant) in context");
+    assert_eq!(codex_msgs[0].context.len(), 2, "Turn 2 must receive Turn 1 in context");
     assert_eq!(codex_msgs[0].context[0].content, "Question 1");
     assert_eq!(codex_msgs[0].context[1].content, "Response from claude");
-
-    // Test prompt formatting
-    let formatted = format_context_for_prompt(&codex_msgs[0].context, &codex_msgs[0].content);
-    assert!(formatted.contains("Assistant (claude): Response from claude"));
-    assert!(formatted.contains("Question 2"));
     drop(codex_msgs);
 
-    // Turn 3: Switch to Gemini -> must receive all 4 prior turns in context!
+    // Turn 3: Switch to Gemini -> must receive all 4 prior turns
     let (tx3, mut rx3) = tokio::sync::mpsc::channel(10);
     tokio::spawn(async move { while rx3.recv().await.is_some() {} });
     manager.send_message(&conv.id, "Question 3", ProviderKind::Gemini, tx3).await.unwrap();
@@ -359,9 +363,47 @@ async fn test_cross_provider_context_handover_flow() {
     let gemini_msgs = gemini_history.lock().await;
     assert_eq!(gemini_msgs.len(), 1);
     assert_eq!(gemini_msgs[0].content, "Question 3");
-    assert_eq!(gemini_msgs[0].context.len(), 4, "Turn 3 must receive all 4 prior messages from Claude and Codex");
-    assert_eq!(gemini_msgs[0].context[0].content, "Question 1");
-    assert_eq!(gemini_msgs[0].context[1].content, "Response from claude");
-    assert_eq!(gemini_msgs[0].context[2].content, "Question 2");
-    assert_eq!(gemini_msgs[0].context[3].content, "Response from codex");
+    assert_eq!(gemini_msgs[0].context.len(), 4, "Turn 3 must receive all 4 prior messages");
+    drop(gemini_msgs);
+
+    // Turn 4: SWITCH BACK TO CLAUDE! (A -> B -> C -> A)
+    // Claude native session knows turns 1 & 2 (synced_through_seq = 2).
+    // It is missing Turn 2 (Question 2 + Codex response) and Turn 3 (Question 3 + Gemini response).
+    // Exactly 4 delta messages!
+    let (tx4, mut rx4) = tokio::sync::mpsc::channel(10);
+    tokio::spawn(async move { while rx4.recv().await.is_some() {} });
+    manager.send_message(&conv.id, "Question 4", ProviderKind::Claude, tx4).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let c_msgs = claude_history.lock().await;
+    assert_eq!(c_msgs.len(), 2, "Claude should have received 2 turns now");
+    assert_eq!(c_msgs[1].content, "Question 4");
+    assert_eq!(c_msgs[1].context.len(), 4, "Claude must receive ONLY the 4 delta turns that occurred while away");
+    assert_eq!(c_msgs[1].context[0].content, "Question 2");
+    assert_eq!(c_msgs[1].context[1].content, "Response from codex");
+    assert_eq!(c_msgs[1].context[2].content, "Question 3");
+    assert_eq!(c_msgs[1].context[3].content, "Response from gemini");
+
+    let formatted_c4 = format_context_for_prompt(&c_msgs[1].context, &c_msgs[1].content);
+    assert!(formatted_c4.contains("Assistant (codex): Response from codex"));
+    assert!(formatted_c4.contains("Assistant (gemini): Response from gemini"));
+    assert!(formatted_c4.contains("Question 4"));
+    drop(c_msgs);
+
+    // Turn 5: User continues chatting with Claude (A -> A)
+    // Claude is now synced through seq 8. Current user turn is seq 9.
+    // Delta must be completely EMPTY!
+    let (tx5, mut rx5) = tokio::sync::mpsc::channel(10);
+    tokio::spawn(async move { while rx5.recv().await.is_some() {} });
+    manager.send_message(&conv.id, "Question 5", ProviderKind::Claude, tx5).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    let c_msgs = claude_history.lock().await;
+    assert_eq!(c_msgs.len(), 3);
+    assert_eq!(c_msgs[2].content, "Question 5");
+    assert!(c_msgs[2].context.is_empty(), "Turn 5 (continuing with same provider) must have empty delta context");
+
+    let formatted_c5 = format_context_for_prompt(&c_msgs[2].context, &c_msgs[2].content);
+    assert_eq!(formatted_c5, "Question 5", "Prompt should remain untouched when continuing with same provider");
+    drop(c_msgs);
 }

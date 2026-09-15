@@ -1,32 +1,37 @@
-use std::sync::atomic::{AtomicU64, Ordering};
+pub mod parser;
+pub mod protocol;
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::json;
-use tokio::sync::{mpsc, RwLock};
-use tracing::{error, info};
+use tokio::sync::{mpsc, Mutex, RwLock};
 
 use crate::app::conversation::context::format_context_for_prompt;
-use crate::app::error::{AppError, Result};
+use crate::app::error::Result;
 use crate::app::events::{NormalizedEvent, ProviderKind};
-use crate::app::process::{detect_executable, spawn, ManagedProcess, SpawnConfig};
+use crate::app::process::json_rpc::{JsonRpcNotification, JsonRpcServerRequest, JsonRpcTransport};
+use crate::app::process::{detect_executable, spawn, SpawnConfig};
 use crate::app::providers::{
-    AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities, ProviderMessage,
-    ProviderSession, SessionConfig, SessionMetadata,
+    AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
+    ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
+use parser::{gemini_notification_to_normalized, gemini_server_request_to_normalized};
+use protocol::{AcpNotification, AcpRequest};
 
-pub mod parser;
-pub mod protocol;
-
-use protocol::{make_acp_notification, make_acp_request, AcpMessage};
-
-pub struct GeminiProvider {}
+pub struct GeminiProvider;
 
 impl GeminiProvider {
     pub fn new() -> Self {
-        Self {}
+        Self
+    }
+}
+
+impl Default for GeminiProvider {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -79,6 +84,12 @@ impl Provider for GeminiProvider {
             PermissionMode::FullAccess => "yolo",
         };
 
+        let cwd_str = config
+            .working_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+
         let spawn_config = SpawnConfig {
             executable: "gemini".to_string(),
             args: vec![
@@ -92,45 +103,48 @@ impl Provider for GeminiProvider {
         };
 
         let process = Arc::new(spawn(spawn_config).await?);
-        let request_id_counter = Arc::new(AtomicU64::new(1));
-        let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
-        let session_id_holder = Arc::new(RwLock::new(None));
+        let (transport, notif_rx, server_req_rx) = JsonRpcTransport::new(process);
 
-        // Step 1: initialize
-        let init_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
-        let init_req = make_acp_request(
-            init_id,
+        // Step 1: initialize request -> await response (advertise loadSession capability)
+        let _ = transport.request(
             "initialize",
-            Some(json!({
+            json!({
                 "clientInfo": {
                     "name": "Seralyn",
                     "version": "0.1.0"
+                },
+                "capabilities": {
+                    "loadSession": true
                 }
-            })),
-        );
-        process.send_line(&serde_json::to_string(&init_req).unwrap()).await?;
+            }),
+        ).await?;
 
-        // Step 2: session/new
-        let new_sess_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
-        let new_sess_req = make_acp_request(
-            new_sess_id,
+        // Step 2: session/new request -> await response to extract real sessionId
+        let new_resp = transport.request(
             "session/new",
-            Some(json!({
-                "instructions": config.system_prompt.unwrap_or_default(),
-            })),
-        );
-        process.send_line(&serde_json::to_string(&new_sess_req).unwrap()).await?;
+            json!({
+                "cwd": cwd_str,
+                "mcpServers": []
+            }),
+        ).await?;
+
+        let session_id = new_resp
+            .get("sessionId")
+            .or_else(|| new_resp.get("id"))
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
 
         let session = GeminiSession::new(
-            process,
-            session_id_holder,
+            transport,
+            session_id,
             config.conversation_id,
             config.model,
-            request_id_counter,
-            cancel_tx,
+            config.event_sender,
+            notif_rx,
+            server_req_rx,
         );
 
-        session.start_reader_task(config.event_sender, cancel_rx);
+        session.start_dispatcher();
 
         Ok(Box::new(session))
     }
@@ -146,6 +160,12 @@ impl Provider for GeminiProvider {
             PermissionMode::FullAccess => "yolo",
         };
 
+        let cwd_str = config
+            .working_dir
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| ".".to_string());
+
         let spawn_config = SpawnConfig {
             executable: "gemini".to_string(),
             args: vec![
@@ -159,133 +179,143 @@ impl Provider for GeminiProvider {
         };
 
         let process = Arc::new(spawn(spawn_config).await?);
-        let request_id_counter = Arc::new(AtomicU64::new(1));
-        let (cancel_tx, cancel_rx) = mpsc::channel::<()>(1);
-        let session_id_holder = Arc::new(RwLock::new(Some(native_session_id.to_string())));
+        let (transport, notif_rx, server_req_rx) = JsonRpcTransport::new(process);
 
-        // Initialize ACP
-        let init_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
-        let init_req = make_acp_request(
-            init_id,
+        // Step 1: initialize -> await response
+        let _ = transport.request(
             "initialize",
-            Some(json!({
+            json!({
                 "clientInfo": {
                     "name": "Seralyn",
                     "version": "0.1.0"
+                },
+                "capabilities": {
+                    "loadSession": true
                 }
-            })),
-        );
-        process.send_line(&serde_json::to_string(&init_req).unwrap()).await?;
+            }),
+        ).await?;
 
-        // Resume native session in ACP
-        let resume_id = request_id_counter.fetch_add(1, Ordering::SeqCst);
-        let resume_req = make_acp_request(
-            resume_id,
-            "session/resume",
-            Some(json!({
+        // Step 2: session/load request -> await response
+        let _ = transport.request(
+            "session/load",
+            json!({
                 "sessionId": native_session_id,
-            })),
-        );
-        process.send_line(&serde_json::to_string(&resume_req).unwrap()).await?;
+                "cwd": cwd_str,
+                "mcpServers": []
+            }),
+        ).await?;
 
         let session = GeminiSession::new(
-            process,
-            session_id_holder,
+            transport,
+            Some(native_session_id.to_string()),
             config.conversation_id,
             config.model,
-            request_id_counter,
-            cancel_tx,
+            config.event_sender,
+            notif_rx,
+            server_req_rx,
         );
 
-        session.start_reader_task(config.event_sender, cancel_rx);
+        session.start_dispatcher();
 
         Ok(Box::new(session))
     }
 }
 
 pub struct GeminiSession {
-    process: Arc<ManagedProcess>,
+    transport: Arc<JsonRpcTransport>,
     session_id: Arc<RwLock<Option<String>>>,
     conversation_id: String,
     model: Option<String>,
+    event_sender: mpsc::Sender<NormalizedEvent>,
     created_at: String,
-    request_id_counter: Arc<AtomicU64>,
-    cancel_tx: mpsc::Sender<()>,
-    is_active: Arc<RwLock<bool>>,
+    notif_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcNotification>>>>,
+    server_req_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcServerRequest>>>>,
 }
 
 impl GeminiSession {
     pub fn new(
-        process: Arc<ManagedProcess>,
-        session_id: Arc<RwLock<Option<String>>>,
+        transport: Arc<JsonRpcTransport>,
+        session_id: Option<String>,
         conversation_id: String,
         model: Option<String>,
-        request_id_counter: Arc<AtomicU64>,
-        cancel_tx: mpsc::Sender<()>,
+        event_sender: mpsc::Sender<NormalizedEvent>,
+        notif_rx: mpsc::Receiver<JsonRpcNotification>,
+        server_req_rx: mpsc::Receiver<JsonRpcServerRequest>,
     ) -> Self {
         Self {
-            process,
-            session_id,
+            transport,
+            session_id: Arc::new(RwLock::new(session_id)),
             conversation_id,
             model,
+            event_sender,
             created_at: Utc::now().to_rfc3339(),
-            request_id_counter,
-            cancel_tx,
-            is_active: Arc::new(RwLock::new(true)),
+            notif_rx: Arc::new(Mutex::new(Some(notif_rx))),
+            server_req_rx: Arc::new(Mutex::new(Some(server_req_rx))),
         }
     }
 
-    pub fn start_reader_task(
-        &self,
-        event_sender: mpsc::Sender<NormalizedEvent>,
-        mut cancel_rx: mpsc::Receiver<()>,
-    ) {
-        let process = self.process.clone();
+    pub fn start_dispatcher(&self) {
+        let notif_rx_opt = {
+            let mut guard = self.notif_rx.try_lock().ok();
+            guard.as_mut().and_then(|g| g.take())
+        };
+        let server_req_rx_opt = {
+            let mut guard = self.server_req_rx.try_lock().ok();
+            guard.as_mut().and_then(|g| g.take())
+        };
+
+        let event_sender = self.event_sender.clone();
         let conv_id = self.conversation_id.clone();
         let session_id_holder = self.session_id.clone();
-        let is_active = self.is_active.clone();
 
         tokio::spawn(async move {
-            while let Ok(Some(line)) = process.recv_stdout_line().await {
-                // Check for cancel request
-                if cancel_rx.try_recv().is_ok() {
-                    let cancel_notif = make_acp_notification("session/cancel", None);
-                    let _ = process.send_line(&serde_json::to_string(&cancel_notif).unwrap()).await;
-                }
+            let mut notif_rx = match notif_rx_opt {
+                Some(rx) => rx,
+                None => return,
+            };
+            let mut server_req_rx = match server_req_rx_opt {
+                Some(rx) => rx,
+                None => return,
+            };
 
-                if let Ok(Some(msg)) = parser::parse_gemini_line(&line) {
-                    match msg {
-                        AcpMessage::Response(res) => {
-                            // Handshake: initialized notification
-                            if res.id == 1 {
-                                let init_notif = make_acp_notification("initialized", None);
-                                let _ = process.send_line(&serde_json::to_string(&init_notif).unwrap()).await;
-                            }
-                            // Extract real sessionId from session/new response
-                            if let Some(result_obj) = &res.result {
-                                if let Some(sid) = result_obj.get("sessionId").and_then(|v| v.as_str()) {
-                                    let mut s = session_id_holder.write().await;
-                                    *s = Some(sid.to_string());
-                                }
-                            }
+            loop {
+                tokio::select! {
+                    Some(notif) = notif_rx.recv() => {
+                        let proto_notif = AcpNotification {
+                            jsonrpc: notif.jsonrpc.unwrap_or_else(|| "2.0".to_string()),
+                            method: notif.method,
+                            params: notif.params,
+                        };
+
+                        let current_sid = session_id_holder.read().await.clone();
+                        if let Some(event) = gemini_notification_to_normalized(
+                            &proto_notif,
+                            &conv_id,
+                            current_sid.as_deref(),
+                        ) {
+                            let _ = event_sender.send(event).await;
                         }
-                        AcpMessage::Notification(notif) => {
-                            let cur_sid = session_id_holder.read().await.clone();
-                            if let Some(event) = parser::gemini_notification_to_normalized(
-                                &notif,
-                                &conv_id,
-                                cur_sid.as_deref(),
-                            ) {
-                                let _ = event_sender.send(event).await;
-                            }
-                        }
-                        _ => {}
                     }
+                    Some(server_req) = server_req_rx.recv() => {
+                        let proto_req = AcpRequest {
+                            jsonrpc: server_req.jsonrpc.unwrap_or_else(|| "2.0".to_string()),
+                            id: server_req.id,
+                            method: server_req.method,
+                            params: server_req.params,
+                        };
+
+                        let current_sid = session_id_holder.read().await.clone();
+                        if let Some(event) = gemini_server_request_to_normalized(
+                            &proto_req,
+                            &conv_id,
+                            current_sid.as_deref(),
+                        ) {
+                            let _ = event_sender.send(event).await;
+                        }
+                    }
+                    else => break,
                 }
             }
-
-            let mut active = is_active.write().await;
-            *active = false;
         });
     }
 }
@@ -293,29 +323,24 @@ impl GeminiSession {
 #[async_trait]
 impl ProviderSession for GeminiSession {
     async fn send(&mut self, message: ProviderMessage) -> Result<()> {
-        let sid = self.session_id.read().await.clone();
+        let sid = self.session_id.read().await.clone().unwrap_or_default();
 
         // Cross-provider context injection:
-        // If session has no prior native turn, inject cross-provider turns
-        let prompt_text = if sid.is_some() {
-            message.content
-        } else {
-            format_context_for_prompt(&message.context, &message.content)
-        };
+        let prompt_text = format_context_for_prompt(&message.context, &message.content);
 
-        let req_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
-        let req = make_acp_request(
-            req_id,
+        let _ = self.transport.request(
             "session/prompt",
-            Some(json!({
+            json!({
                 "sessionId": sid,
                 "prompt": [
-                    { "type": "text", "text": prompt_text }
+                    {
+                        "type": "text",
+                        "text": prompt_text,
+                    }
                 ]
-            })),
-        );
-        let s = serde_json::to_string(&req).unwrap();
-        self.process.send_line(&s).await?;
+            }),
+        ).await?;
+
         Ok(())
     }
 
@@ -324,42 +349,47 @@ impl ProviderSession for GeminiSession {
     }
 
     async fn cancel(&mut self) -> Result<()> {
-        let _ = self.cancel_tx.send(()).await;
+        let sid = self.session_id.read().await.clone().unwrap_or_default();
+        // Immediately notify session/cancel over transport
+        let _ = self.transport.notify("session/cancel", json!({ "sessionId": sid })).await;
         Ok(())
     }
 
     async fn close(&mut self) -> Result<()> {
-        let req_id = self.request_id_counter.fetch_add(1, Ordering::SeqCst);
-        let shutdown = make_acp_request(req_id, "shutdown", None);
-        if let Ok(s) = serde_json::to_string(&shutdown) {
-            let _ = self.process.send_line(&s).await;
-        }
-
-        let exit = make_acp_notification("exit", None);
-        if let Ok(s) = serde_json::to_string(&exit) {
-            let _ = self.process.send_line(&s).await;
-        }
-
-        self.process.shutdown(Duration::from_secs(2)).await?;
-        let mut active = self.is_active.write().await;
-        *active = false;
+        self.cancel().await?;
+        self.transport.process().shutdown(Duration::from_secs(5)).await?;
         Ok(())
     }
 
-    fn native_session_id(&self) -> Option<&str> {
-        None
+    fn native_session_id(&self) -> Option<String> {
+        self.session_id.try_read().ok().and_then(|g| g.clone())
+    }
+
+    async fn respond_to_approval(&mut self, request_id: &str, approved: bool) -> Result<()> {
+        let id_val = match request_id.parse::<u64>() {
+            Ok(n) => json!(n),
+            Err(_) => json!(request_id),
+        };
+        let option = if approved { "allow" } else { "deny" };
+        self.transport.respond_success(
+            id_val,
+            json!({
+                "optionId": option,
+                "decision": option
+            }),
+        ).await
     }
 
     fn metadata(&self) -> SessionMetadata {
         SessionMetadata {
             provider: ProviderKind::Gemini,
-            native_session_id: self.session_id.try_read().ok().and_then(|g| g.clone()),
+            native_session_id: self.native_session_id(),
             model: self.model.clone(),
             created_at: self.created_at.clone(),
         }
     }
 
     fn is_active(&self) -> bool {
-        self.is_active.try_read().map(|g| *g).unwrap_or(true)
+        self.transport.is_active()
     }
 }
