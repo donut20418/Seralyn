@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"capabilities":{"textDocument":{"completion":true}},"serverInfo":{"name":"codex-app-server","version":"0.1.0"}}}

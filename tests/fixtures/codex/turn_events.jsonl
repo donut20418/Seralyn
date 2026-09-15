@@ -1,0 +1,7 @@
+{"jsonrpc":"2.0","method":"thread/started","params":{"thread":{"id":"thread_xyz789","model":"gpt-4.1","created_at":"2026-01-01T00:00:00Z"}}}
+{"jsonrpc":"2.0","method":"turn/update","params":{"type":"text_delta","text":"Here's"}}
+{"jsonrpc":"2.0","method":"turn/update","params":{"type":"text_delta","text":" a basic program"}}
+{"jsonrpc":"2.0","method":"turn/update","params":{"type":"tool_call_begin","tool_call":{"id":"call_001","name":"shell","arguments":"{\"command\":\"echo hello\"}"}}}
+{"jsonrpc":"2.0","method":"turn/update","params":{"type":"tool_call_output","tool_call_id":"call_001","output":"hello\n"}}
+{"jsonrpc":"2.0","method":"turn/update","params":{"type":"text_delta","text":"\n\nThe command ran successfully."}}
+{"jsonrpc":"2.0","method":"turn/finished","params":{"usage":{"input_tokens":50,"output_tokens":35,"total_tokens":85}}}

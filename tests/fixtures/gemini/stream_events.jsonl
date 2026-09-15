@@ -1,0 +1,5 @@
+{"jsonrpc":"2.0","method":"agent/progress","params":{"type":"text","content":"Here's"}}
+{"jsonrpc":"2.0","method":"agent/progress","params":{"type":"text","content":" what I can help with."}}
+{"jsonrpc":"2.0","method":"agent/toolCall","params":{"id":"tool_001","name":"readFile","input":{"path":"main.rs"}}}
+{"jsonrpc":"2.0","method":"agent/progress","params":{"type":"text","content":"\n\nI've read the file."}}
+{"jsonrpc":"2.0","method":"agent/complete","params":{"status":"success"}}

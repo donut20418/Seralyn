@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","method":"approval/request","params":{"id":"approval_001","tool_name":"shell","description":"Execute command: rm -rf /tmp/test","input":{"command":"rm -rf /tmp/test"}}}

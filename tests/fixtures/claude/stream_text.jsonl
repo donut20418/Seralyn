@@ -1,0 +1,8 @@
+{"type":"init","session_id":"sess_abc123","model":"claude-sonnet-4-20250514","tools":[],"mcp_servers":[]}
+{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Here's"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" a basic"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" Rust program:"}}}
+{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"\n\n```rust\nfn main() {\n    println!(\"Hello, world!\");\n}\n```"}}}
+{"type":"stream_event","event":{"type":"content_block_stop","index":0}}
+{"type":"result","session_id":"sess_abc123","result":{"type":"success"},"usage":{"input_tokens":42,"output_tokens":28,"cache_read_input_tokens":0,"cache_creation_input_tokens":0},"model":"claude-sonnet-4-20250514"}
