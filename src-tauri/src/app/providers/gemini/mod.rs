@@ -86,7 +86,7 @@ impl Provider for GeminiProvider {
             "initialize",
             Some(json!({
                 "clientInfo": {
-                    "name": "MyAI",
+                    "name": "Seralyn",
                     "version": "1.0.0"
                 }
             })),

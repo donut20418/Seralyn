@@ -84,10 +84,10 @@ impl Database {
 
     pub fn default_path() -> PathBuf {
         let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
-        path.push("MyAI");
+        path.push("Seralyn");
         path.push("data");
         std::fs::create_dir_all(&path).ok();
-        path.push("myai.db");
+        path.push("seralyn.db");
         path
     }
 }

@@ -1,10 +1,10 @@
-use myai_lib::app::db::conversations::{self, Conversation};
-use myai_lib::app::db::messages;
-use myai_lib::app::db::Database;
-use myai_lib::app::events::{EventType, NormalizedEvent, ProviderKind, EventPayload};
-use myai_lib::app::providers::claude::parser::{claude_event_to_normalized, parse_claude_line};
-use myai_lib::app::providers::codex::parser::{codex_notification_to_normalized, parse_codex_line, CodexMessage};
-use myai_lib::app::providers::gemini::parser::{gemini_notification_to_normalized, parse_gemini_line, AcpMessage};
+use seralyn_lib::app::db::conversations::{self, Conversation};
+use seralyn_lib::app::db::messages;
+use seralyn_lib::app::db::Database;
+use seralyn_lib::app::events::{EventType, NormalizedEvent, ProviderKind, EventPayload};
+use seralyn_lib::app::providers::claude::parser::{claude_event_to_normalized, parse_claude_line};
+use seralyn_lib::app::providers::codex::parser::{codex_notification_to_normalized, parse_codex_line, CodexMessage};
+use seralyn_lib::app::providers::gemini::parser::{gemini_notification_to_normalized, parse_gemini_line, AcpMessage};
 
 #[test]
 fn test_claude_stream_text_fixture() {

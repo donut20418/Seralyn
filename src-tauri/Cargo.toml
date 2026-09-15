@@ -1,18 +1,18 @@
 [package]
-name = "myai"
+name = "seralyn"
 version = "0.1.0"
 description = "Unified Multi-Provider AI Desktop Application"
-authors = ["MyAI Team"]
+authors = ["Seralyn Team"]
 edition = "2021"
 rust-version = "1.77"
 
 [lib]
-name = "myai_lib"
+name = "seralyn_lib"
 crate-type = ["lib", "staticlib", "cdylib"]
 path = "src/lib.rs"
 
 [[bin]]
-name = "myai"
+name = "seralyn"
 path = "src/main.rs"
 
 [build-dependencies]

@@ -1,4 +1,4 @@
--- MyAI Phase 1 Initial Schema
+-- Seralyn Phase 1 Initial Schema
 -- Source of truth for all conversation data
 
 CREATE TABLE IF NOT EXISTS conversations (

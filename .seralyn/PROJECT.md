@@ -1,7 +1,7 @@
-# MyAI — Unified Multi-Provider AI Desktop
+# Seralyn — Unified Multi-Provider AI Desktop
 
 ## Overview
-MyAI is a Windows-first Tauri desktop app providing one unified conversation 
+Seralyn is a Windows-first Tauri desktop app providing one unified conversation 
 interface over Claude Code CLI, Codex CLI, and Gemini CLI.
 
 ## Principles
@@ -17,7 +17,7 @@ interface over Claude Code CLI, Codex CLI, and Gemini CLI.
 - Desktop: Tauri v2
 - Backend: Rust + Tokio
 - Storage: SQLite (rusqlite)
-- Location: %LOCALAPPDATA%/MyAI/
+- Location: %LOCALAPPDATA%/Seralyn/
 
 ## Provider Protocols
 - Claude: `claude --print --output-format stream-json`

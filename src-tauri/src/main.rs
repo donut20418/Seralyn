@@ -1,11 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-use myai_lib::app::conversation::{
+use seralyn_lib::app::conversation::{
     Conversation, ConversationManager, ConversationSummary, ConversationWithMessages,
 };
-use myai_lib::app::db::Database;
-use myai_lib::app::events::ProviderKind;
-use myai_lib::app::providers::{ProviderManager, ProviderStatus};
+use seralyn_lib::app::db::Database;
+use seralyn_lib::app::events::ProviderKind;
+use seralyn_lib::app::providers::{ProviderManager, ProviderStatus};
 use std::str::FromStr;
 use std::sync::Arc;
 use tauri::{AppHandle, Emitter, State};
@@ -132,7 +132,7 @@ fn main() {
         )
         .init();
 
-    info!("Starting MyAI...");
+    info!("Starting Seralyn...");
 
     let db_path = Database::default_path();
     let db = match Database::new(&db_path) {

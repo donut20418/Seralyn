@@ -14,7 +14,7 @@ export function Sidebar({ conversations, activeId, onSelect, onNew, onDelete }: 
   return (
     <div className="sidebar">
       <div className="sidebar-header">
-        <h2>MyAI</h2>
+        <h2>Seralyn</h2>
         <button className="new-chat-btn" onClick={onNew}>+ New</button>
       </div>
       <div className="conversation-list">

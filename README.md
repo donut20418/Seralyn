@@ -1,4 +1,4 @@
-# MyAI — Unified Multi-Provider AI Desktop
+# Seralyn — Unified Multi-Provider AI Desktop
 
 A Windows-first Tauri desktop application providing one unified conversation interface over multiple AI coding CLIs.
 
@@ -50,11 +50,11 @@ npm run tauri build
 
 ## Data Storage
 
-Persistent data is stored at `%LOCALAPPDATA%/MyAI/`:
+Persistent data is stored at `%LOCALAPPDATA%/Seralyn/`:
 
 ```
-%LOCALAPPDATA%/MyAI/
-├── data/myai.db          # SQLite database
+%LOCALAPPDATA%/Seralyn/
+├── data/seralyn.db       # SQLite database
 ├── attachments/          # Chat attachments (Phase 2)
 ├── skills/               # Canonical skills (Phase 4)
 ├── prompts/              # System prompts (Phase 4)

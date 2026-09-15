@@ -1,6 +1,6 @@
 {
   "identifier": "default",
-  "description": "Default capabilities for MyAI",
+  "description": "Default capabilities for Seralyn",
   "windows": ["main"],
   "permissions": [
     "core:default",
