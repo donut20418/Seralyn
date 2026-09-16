@@ -509,31 +509,33 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     let manager1 = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map.clone())));
     let conv = manager1.create_conversation(Some("Claude Resume Test")).unwrap();
 
-    // Turn 1:
+    // Turn 1 on manager1:
     let (tx1, mut rx1) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
-    let mut text_acc = String::new();
-    let collect_task = tokio::spawn(async move {
+    let mut text_acc1 = String::new();
+    let collect_task1 = tokio::spawn(async move {
         while let Some(ev) = rx1.recv().await {
             if let EventPayload::Text { content } = &ev.payload {
-                text_acc.push_str(content.as_str());
+                text_acc1.push_str(content.as_str());
             }
             if ev.event_type == EventType::SessionFinished {
                 break;
             }
         }
-        text_acc
+        text_acc1
     });
 
     manager1.send_message(&conv.id, "Turn 1 Question", ProviderKind::Claude, tx1).await.unwrap();
-    let streamed_result = collect_task.await.unwrap();
-    assert_eq!(streamed_result, "Hello from Claude!");
+    let streamed_result1 = collect_task1.await.unwrap();
+    assert_eq!(streamed_result1, "Hello from Claude!");
 
     // Wait a brief moment for background event processing to commit DB writes
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
-    // Verify Assistant message saved in SQLite
+    // Verify Turn 1 saved in SQLite
     let msgs = messages::get_messages(&db, &conv.id).unwrap();
-    assert_eq!(msgs.len(), 2, "Should have 1 user message + 1 assistant message");
+    assert_eq!(msgs.len(), 2, "Turn 1: Should have 1 user message + 1 assistant message");
+    assert_eq!(msgs[0].role, "user");
+    assert_eq!(msgs[0].seq, 1);
     assert_eq!(msgs[1].role, "assistant");
     assert_eq!(msgs[1].content, "Hello from Claude!");
     assert_eq!(msgs[1].seq, 2);
@@ -542,21 +544,73 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     let active_sess = provider_sessions::get_active_session(&db, &conv.id, "claude").unwrap().unwrap();
     assert_eq!(active_sess.provider_session_id, Some("claude-native-xyz-123".to_string()));
 
+    // Turn 2 on manager1 WITHOUT RESTART (testing dynamic event routing & persistent event bus!):
+    let (tx2, mut rx2) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
+    let mut text_acc2 = String::new();
+    let collect_task2 = tokio::spawn(async move {
+        while let Some(ev) = rx2.recv().await {
+            if let EventPayload::Text { content } = &ev.payload {
+                text_acc2.push_str(content.as_str());
+            }
+            if ev.event_type == EventType::SessionFinished {
+                break;
+            }
+        }
+        text_acc2
+    });
+
+    manager1.send_message(&conv.id, "Turn 2 in same session", ProviderKind::Claude, tx2).await.unwrap();
+    let streamed_result2 = collect_task2.await.unwrap();
+    assert_eq!(streamed_result2, "Hello from Claude!", "Turn 2 must route events to rx2 successfully");
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Verify Turn 2 saved in SQLite with continuous sequence
+    let msgs2 = messages::get_messages(&db, &conv.id).unwrap();
+    assert_eq!(msgs2.len(), 4, "Turn 2: Should have 2 user messages + 2 assistant messages");
+    assert_eq!(msgs2[2].role, "user");
+    assert_eq!(msgs2[2].seq, 3);
+    assert_eq!(msgs2[3].role, "assistant");
+    assert_eq!(msgs2[3].seq, 4);
+
     // SIMULATE APP RESTART:
-    // Drop manager1 entirely
+    // Drop manager1 entirely (simulates quitting the desktop application)
     drop(manager1);
 
     // Create manager2 from the SAME db (as when user relaunches desktop app)
     let manager2 = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
 
-    // Turn 2 in the resumed conversation:
-    let (tx2, mut rx2) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
-    tokio::spawn(async move { while rx2.recv().await.is_some() {} });
-    manager2.send_message(&conv.id, "Turn 2 after restart", ProviderKind::Claude, tx2).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Turn 3 in the resumed conversation after restart:
+    let (tx3, mut rx3) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
+    let mut text_acc3 = String::new();
+    let collect_task3 = tokio::spawn(async move {
+        while let Some(ev) = rx3.recv().await {
+            if let EventPayload::Text { content } = &ev.payload {
+                text_acc3.push_str(content.as_str());
+            }
+            if ev.event_type == EventType::SessionFinished {
+                break;
+            }
+        }
+        text_acc3
+    });
+
+    manager2.send_message(&conv.id, "Turn 3 after restart", ProviderKind::Claude, tx3).await.unwrap();
+    let streamed_result3 = collect_task3.await.unwrap();
+    assert_eq!(streamed_result3, "Hello from Claude!", "Turn 3 must route events to rx3");
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // Verify that manager2 invoked resume_session with the persisted native session ID!
     let resumed = resumed_log.lock().await;
-    assert_eq!(resumed.len(), 1, "Must have called resume_session exactly once");
+    assert_eq!(resumed.len(), 1, "Must have called resume_session exactly once upon restart");
     assert_eq!(resumed[0], "claude-native-xyz-123", "Must resume with the exact native session ID persisted in Turn 1");
+
+    // Verify all 6 messages exist in continuous SQLite sequence
+    let msgs3 = messages::get_messages(&db, &conv.id).unwrap();
+    assert_eq!(msgs3.len(), 6, "Turn 3: Total 6 messages (3 user + 3 assistant)");
+    assert_eq!(msgs3[4].role, "user");
+    assert_eq!(msgs3[4].seq, 5);
+    assert_eq!(msgs3[5].role, "assistant");
+    assert_eq!(msgs3[5].seq, 6);
 }
