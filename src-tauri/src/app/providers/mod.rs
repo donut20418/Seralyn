@@ -200,6 +200,17 @@ pub struct SessionMetadata {
     pub created_at: String,
 }
 
+impl Default for SessionMetadata {
+    fn default() -> Self {
+        Self {
+            provider: ProviderKind::Claude,
+            native_session_id: None,
+            model: None,
+            created_at: String::new(),
+        }
+    }
+}
+
 /// Permission mode for provider operations.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum PermissionMode {

@@ -1,4 +1,4 @@
-use seralyn_lib::app::db::conversations::{self, Conversation};
+use seralyn_lib::app::db::conversations;
 use seralyn_lib::app::db::messages;
 use seralyn_lib::app::db::Database;
 use seralyn_lib::app::events::{EventType, NormalizedEvent, ProviderKind, EventPayload};
@@ -410,6 +410,7 @@ async fn test_cross_provider_sync_cursor_full_cycle() {
 
 #[tokio::test]
 async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
+    use std::sync::Arc;
     use seralyn_lib::app::conversation::ConversationManager;
     use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
     use seralyn_lib::app::db::provider_sessions;
@@ -454,7 +455,14 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
         async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         fn native_session_id(&self) -> Option<String> { Some(self.native_sid.clone()) }
-        fn metadata(&self) -> SessionMetadata { Default::default() }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: ProviderKind::Claude,
+                native_session_id: Some(self.native_sid.clone()),
+                model: Some("claude-opus-5".to_string()),
+                created_at: String::new(),
+            }
+        }
         fn is_active(&self) -> bool { true }
     }
 
@@ -507,7 +515,7 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     let collect_task = tokio::spawn(async move {
         while let Some(ev) = rx1.recv().await {
             if let EventPayload::Text { content } = &ev.payload {
-                text_acc.push_str(content);
+                text_acc.push_str(content.as_str());
             }
             if ev.event_type == EventType::SessionFinished {
                 break;
