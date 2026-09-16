@@ -185,3 +185,94 @@ where
     tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
     Ok(res)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_migration_fresh_db() {
+        let db = Database::new_in_memory().unwrap();
+        db.run_migrations().unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        assert!(table_has_column(&conn, "messages", "seq"));
+        assert!(table_has_column(&conn, "provider_sessions", "synced_through_seq"));
+
+        let v1: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 1)", [], |r| r.get(0)).unwrap();
+        let v2: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)", [], |r| r.get(0)).unwrap();
+        assert!(v1);
+        assert!(v2);
+    }
+
+    #[test]
+    fn test_migration_legacy_v1_db() {
+        let db = Database::new_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(MIGRATION_001).unwrap();
+            conn.execute(
+                "INSERT INTO conversations (id, title) VALUES ('conv-1', 'Legacy Chat')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, content) VALUES ('msg-1', 'conv-1', 'user', 'Hello')",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO messages (id, conversation_id, role, content) VALUES ('msg-2', 'conv-1', 'assistant', 'Hi')",
+                [],
+            ).unwrap();
+        }
+
+        db.run_migrations().unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        assert!(table_has_column(&conn, "messages", "seq"));
+        assert!(table_has_column(&conn, "provider_sessions", "synced_through_seq"));
+
+        let seq1: i64 = conn.query_row("SELECT seq FROM messages WHERE id = 'msg-1'", [], |r| r.get(0)).unwrap();
+        let seq2: i64 = conn.query_row("SELECT seq FROM messages WHERE id = 'msg-2'", [], |r| r.get(0)).unwrap();
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+    }
+
+    #[test]
+    fn test_migration_phase_1_2_complete_db() {
+        let db = Database::new_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(MIGRATION_001).unwrap();
+            conn.execute_batch(
+                "ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE provider_sessions ADD COLUMN synced_through_seq INTEGER NOT NULL DEFAULT 0;"
+            ).unwrap();
+        }
+
+        db.run_migrations().unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        let v2: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)", [], |r| r.get(0)).unwrap();
+        assert!(v2);
+    }
+
+    #[test]
+    fn test_migration_partial_state_repair() {
+        let db = Database::new_in_memory().unwrap();
+        {
+            let conn = db.conn.lock().unwrap();
+            conn.execute_batch(MIGRATION_001).unwrap();
+            conn.execute(
+                "ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;",
+                [],
+            ).unwrap();
+        }
+
+        db.run_migrations().unwrap();
+
+        let conn = db.conn.lock().unwrap();
+        assert!(table_has_column(&conn, "provider_sessions", "synced_through_seq"));
+        let v2: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)", [], |r| r.get(0)).unwrap();
+        assert!(v2);
+    }
+}

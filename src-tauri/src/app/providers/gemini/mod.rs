@@ -402,8 +402,6 @@ impl ProviderSession for GeminiSession {
                     || kind.eq_ignore_ascii_case("allow_always")
                     || kind.eq_ignore_ascii_case("allow")
                     || kind.starts_with("allow")
-                    || option_id.eq_ignore_ascii_case("allow_once")
-                    || option_id.eq_ignore_ascii_case("allow_always")
                 {
                     Some(option_id.to_string())
                 } else {

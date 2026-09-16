@@ -234,7 +234,8 @@ pub async fn spawn(config: SpawnConfig) -> Result<ManagedProcess> {
     });
 
     // Fast startup check: ensure process didn't immediately crash on spawn
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    let startup_check = config.startup_timeout.min(Duration::from_millis(50));
+    tokio::time::sleep(startup_check).await;
     if !alive.load(Ordering::SeqCst) {
         return Err(AppError::Process(format!(
             "Process '{}' exited immediately after launch",
