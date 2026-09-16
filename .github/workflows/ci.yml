@@ -45,7 +45,7 @@ jobs:
         run: cargo check --manifest-path src-tauri/Cargo.toml
 
       - name: Cargo Test
-        run: cargo test --manifest-path src-tauri/Cargo.toml
+        run: cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
 
   frontend-build:
     name: Frontend TypeScript & Vite Build
