@@ -510,7 +510,7 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     let conv = manager1.create_conversation(Some("Claude Resume Test")).unwrap();
 
     // Turn 1:
-    let (tx1, mut rx1) = tokio::sync::mpsc::channel(10);
+    let (tx1, mut rx1) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
     let mut text_acc = String::new();
     let collect_task = tokio::spawn(async move {
         while let Some(ev) = rx1.recv().await {
@@ -550,7 +550,7 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     let manager2 = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
 
     // Turn 2 in the resumed conversation:
-    let (tx2, mut rx2) = tokio::sync::mpsc::channel(10);
+    let (tx2, mut rx2) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
     tokio::spawn(async move { while rx2.recv().await.is_some() {} });
     manager2.send_message(&conv.id, "Turn 2 after restart", ProviderKind::Claude, tx2).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
