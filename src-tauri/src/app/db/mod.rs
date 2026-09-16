@@ -249,6 +249,8 @@ mod tests {
             ).unwrap();
         }
 
+        // Run migrations twice to verify idempotency
+        db.run_migrations().unwrap();
         db.run_migrations().unwrap();
 
         let conn = db.conn.lock().unwrap();
@@ -258,9 +260,10 @@ mod tests {
 
     #[test]
     fn test_migration_partial_state_repair() {
-        let db = Database::new_in_memory().unwrap();
+        // Case A: messages.seq exists, but provider_sessions.synced_through_seq is missing
+        let db_a = Database::new_in_memory().unwrap();
         {
-            let conn = db.conn.lock().unwrap();
+            let conn = db_a.conn.lock().unwrap();
             conn.execute_batch(MIGRATION_001).unwrap();
             conn.execute(
                 "ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;",
@@ -268,11 +271,31 @@ mod tests {
             ).unwrap();
         }
 
-        db.run_migrations().unwrap();
+        db_a.run_migrations().unwrap();
+        {
+            let conn = db_a.conn.lock().unwrap();
+            assert!(table_has_column(&conn, "provider_sessions", "synced_through_seq"));
+            let v2: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)", [], |r| r.get(0)).unwrap();
+            assert!(v2);
+        }
 
-        let conn = db.conn.lock().unwrap();
-        assert!(table_has_column(&conn, "provider_sessions", "synced_through_seq"));
-        let v2: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)", [], |r| r.get(0)).unwrap();
-        assert!(v2);
+        // Case B: provider_sessions.synced_through_seq exists, but messages.seq is missing
+        let db_b = Database::new_in_memory().unwrap();
+        {
+            let conn = db_b.conn.lock().unwrap();
+            conn.execute_batch(MIGRATION_001).unwrap();
+            conn.execute(
+                "ALTER TABLE provider_sessions ADD COLUMN synced_through_seq INTEGER NOT NULL DEFAULT 0;",
+                [],
+            ).unwrap();
+        }
+
+        db_b.run_migrations().unwrap();
+        {
+            let conn = db_b.conn.lock().unwrap();
+            assert!(table_has_column(&conn, "messages", "seq"));
+            let v2: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)", [], |r| r.get(0)).unwrap();
+            assert!(v2);
+        }
     }
 }

@@ -398,11 +398,7 @@ impl ProviderSession for GeminiSession {
             let allow_opt_id = options.iter().find_map(|opt| {
                 let option_id = opt.get("optionId").and_then(|v| v.as_str())?;
                 let kind = opt.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                if kind.eq_ignore_ascii_case("allow_once")
-                    || kind.eq_ignore_ascii_case("allow_always")
-                    || kind.eq_ignore_ascii_case("allow")
-                    || kind.starts_with("allow")
-                {
+                if kind.eq_ignore_ascii_case("allow_once") || kind.eq_ignore_ascii_case("allow_always") {
                     Some(option_id.to_string())
                 } else {
                     None
@@ -430,11 +426,7 @@ impl ProviderSession for GeminiSession {
             let reject_opt_id = options.iter().find_map(|opt| {
                 let option_id = opt.get("optionId").and_then(|v| v.as_str())?;
                 let kind = opt.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                if kind.eq_ignore_ascii_case("reject_once")
-                    || kind.eq_ignore_ascii_case("reject_always")
-                    || kind.eq_ignore_ascii_case("reject")
-                    || kind.starts_with("reject")
-                {
+                if kind.eq_ignore_ascii_case("reject_once") || kind.eq_ignore_ascii_case("reject_always") {
                     Some(option_id.to_string())
                 } else {
                     None
