@@ -294,10 +294,10 @@ mod tests {
     fn test_parse_system_init() {
         let line = r#"{"type":"system","subtype":"init","cwd":"/path/to","session_id":"sess-sys-999","model":"claude-opus-5"}"#;
         let event = parse_claude_line(line).unwrap().unwrap();
-        match event {
+        match &event {
             ClaudeEvent::Init { session_id, model } => {
-                assert_eq!(session_id, Some("sess-sys-999".to_string()));
-                assert_eq!(model, Some("claude-opus-5".to_string()));
+                assert_eq!(session_id.as_deref(), Some("sess-sys-999"));
+                assert_eq!(model.as_deref(), Some("claude-opus-5"));
             }
             _ => panic!("Expected Init event"),
         }

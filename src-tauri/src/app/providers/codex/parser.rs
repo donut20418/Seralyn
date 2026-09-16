@@ -1,7 +1,7 @@
 use chrono::Utc;
 use serde_json::Value;
 use uuid::Uuid;
-use crate::app::error::{AppError, Result};
+use crate::app::error::Result;
 use crate::app::events::{EventPayload, EventType, NormalizedEvent, ProviderKind, TokenConfidence};
 use super::protocol::{JsonRpcMessage, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse};
 

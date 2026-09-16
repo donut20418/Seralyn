@@ -3,7 +3,7 @@ use crate::app::db::Database;
 use crate::app::error::{AppError, Result};
 use chrono::Utc;
 use uuid::Uuid;
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {

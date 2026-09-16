@@ -13,7 +13,7 @@ use crate::app::db::messages;
 pub use crate::app::db::provider_sessions::ProviderSessionRecord;
 use crate::app::db::provider_sessions;
 use crate::app::db::Database;
-use crate::app::error::{AppError, Result};
+use crate::app::error::Result;
 use crate::app::events::{EventPayload, EventType, NormalizedEvent, ProviderKind};
 use crate::app::providers::{
     PermissionMode, ProviderManager, ProviderMessage, ProviderSession, ProviderStatus, SessionConfig,

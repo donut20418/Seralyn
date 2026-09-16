@@ -42,12 +42,10 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Cargo Check
-        run: cargo check --manifest-path src-tauri/Cargo.toml
+        run: cargo check --tests --manifest-path src-tauri/Cargo.toml
 
       - name: Cargo Test
-        shell: bash
-        run: |
-          cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture > test_output.txt 2>&1 || (cat test_output.txt >> $GITHUB_STEP_SUMMARY && exit 1)
+        run: cargo test --manifest-path src-tauri/Cargo.toml -- --nocapture
 
   frontend-build:
     name: Frontend TypeScript & Vite Build

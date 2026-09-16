@@ -258,7 +258,6 @@ fn extract_content_text(val: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn test_parse_gemini_real_acp_session_update() {
