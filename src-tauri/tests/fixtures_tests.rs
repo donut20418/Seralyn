@@ -524,7 +524,7 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // Verify Assistant message saved in SQLite
-    let msgs = messages::get_messages_for_conversation(&db, &conv.id).unwrap();
+    let msgs = messages::get_messages(&db, &conv.id).unwrap();
     assert_eq!(msgs.len(), 2, "Should have 1 user message + 1 assistant message");
     assert_eq!(msgs[1].role, "assistant");
     assert_eq!(msgs[1].content, "Hello from Claude!");

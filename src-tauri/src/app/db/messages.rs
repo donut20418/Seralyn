@@ -103,6 +103,10 @@ pub fn get_messages(db: &Database, conversation_id: &str) -> Result<Vec<Message>
     Ok(res)
 }
 
+pub fn get_messages_for_conversation(db: &Database, conversation_id: &str) -> Result<Vec<Message>> {
+    get_messages(db, conversation_id)
+}
+
 pub fn get_message(db: &Database, id: &str) -> Result<Message> {
     let conn = db.conn.lock().unwrap();
     conn.query_row(
