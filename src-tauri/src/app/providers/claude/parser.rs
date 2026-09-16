@@ -24,6 +24,9 @@ pub enum ClaudeEvent {
         text: Option<String>,
         thinking: Option<String>,
     },
+    AssistantMessage {
+        content: String,
+    },
     ToolUse {
         tool_id: String,
         tool_name: String,
@@ -35,6 +38,7 @@ pub enum ClaudeEvent {
     },
     Result {
         session_id: Option<String>,
+        result: Option<String>,
         usage: Option<ClaudeUsage>,
     },
     Error {
@@ -65,10 +69,39 @@ pub fn parse_claude_line(line: &str) -> Result<Option<ClaudeEvent>> {
     };
 
     match type_str {
+        "system" => {
+            let subtype = value.get("subtype").and_then(|v| v.as_str());
+            if subtype == Some("init") {
+                let session_id = value.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+                let model = value.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
+                Ok(Some(ClaudeEvent::Init { session_id, model }))
+            } else {
+                Ok(Some(ClaudeEvent::Unknown { raw: value }))
+            }
+        }
         "init" => {
             let session_id = value.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
             let model = value.get("model").and_then(|v| v.as_str()).map(|s| s.to_string());
             Ok(Some(ClaudeEvent::Init { session_id, model }))
+        }
+        "assistant" => {
+            let mut full_text = String::new();
+            if let Some(msg) = value.get("message") {
+                if let Some(content_arr) = msg.get("content").and_then(|v| v.as_array()) {
+                    for item in content_arr {
+                        if item.get("type").and_then(|v| v.as_str()) == Some("text") {
+                            if let Some(t) = item.get("text").and_then(|v| v.as_str()) {
+                                full_text.push_str(t);
+                            }
+                        }
+                    }
+                }
+            }
+            if !full_text.is_empty() {
+                Ok(Some(ClaudeEvent::AssistantMessage { content: full_text }))
+            } else {
+                Ok(Some(ClaudeEvent::Unknown { raw: value }))
+            }
         }
         "stream_event" => {
             let Some(event) = value.get("event") else {
@@ -117,12 +150,13 @@ pub fn parse_claude_line(line: &str) -> Result<Option<ClaudeEvent>> {
         }
         "result" => {
             let session_id = value.get("session_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let result = value.get("result").and_then(|v| v.as_str()).map(|s| s.to_string());
             let usage = if let Some(u) = value.get("usage") {
                 serde_json::from_value(u.clone()).ok()
             } else {
                 None
             };
-            Ok(Some(ClaudeEvent::Result { session_id, usage }))
+            Ok(Some(ClaudeEvent::Result { session_id, result, usage }))
         }
         "error" => {
             let (code, message) = if let Some(err_obj) = value.get("error") {
@@ -182,6 +216,10 @@ pub fn claude_event_to_normalized(
                 return None;
             }
         }
+        ClaudeEvent::AssistantMessage { content } => {
+            normalized.event_type = EventType::TextDelta;
+            normalized.payload = EventPayload::Text { content };
+        }
         ClaudeEvent::ToolUse { tool_id, tool_name, input } => {
             normalized.event_type = EventType::ToolStarted;
             normalized.payload = EventPayload::Tool {
@@ -202,7 +240,7 @@ pub fn claude_event_to_normalized(
                 status: None,
             };
         }
-        ClaudeEvent::Result { session_id: new_sid, usage } => {
+        ClaudeEvent::Result { session_id: new_sid, usage, .. } => {
             if let Some(sid) = new_sid {
                 normalized.provider_session_id = Some(sid);
             }
@@ -240,7 +278,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_init() {
+    fn test_parse_legacy_init() {
         let line = r#"{"type": "init", "session_id": "sid-123", "model": "claude-3-5-sonnet-20240620"}"#;
         let event = parse_claude_line(line).unwrap().unwrap();
         match event {
@@ -249,6 +287,43 @@ mod tests {
                 assert_eq!(model, Some("claude-3-5-sonnet-20240620".to_string()));
             }
             _ => panic!("Expected Init event"),
+        }
+    }
+
+    #[test]
+    fn test_parse_system_init() {
+        let line = r#"{"type":"system","subtype":"init","cwd":"/path/to","session_id":"sess-sys-999","model":"claude-opus-5"}"#;
+        let event = parse_claude_line(line).unwrap().unwrap();
+        match event {
+            ClaudeEvent::Init { session_id, model } => {
+                assert_eq!(session_id, Some("sess-sys-999".to_string()));
+                assert_eq!(model, Some("claude-opus-5".to_string()));
+            }
+            _ => panic!("Expected Init event"),
+        }
+
+        let norm = claude_event_to_normalized(event, ProviderKind::Claude, "conv-1", None).unwrap();
+        assert_eq!(norm.event_type, EventType::SessionStarted);
+        assert_eq!(norm.provider_session_id, Some("sess-sys-999".to_string()));
+    }
+
+    #[test]
+    fn test_parse_assistant_message() {
+        let line = r#"{"type":"assistant","message":{"model":"claude-opus-5","id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"Hello world from Claude!"}]}}"#;
+        let event = parse_claude_line(line).unwrap().unwrap();
+        match &event {
+            ClaudeEvent::AssistantMessage { content } => {
+                assert_eq!(content, "Hello world from Claude!");
+            }
+            _ => panic!("Expected AssistantMessage event"),
+        }
+
+        let norm = claude_event_to_normalized(event, ProviderKind::Claude, "conv-1", Some("sess-1")).unwrap();
+        assert_eq!(norm.event_type, EventType::TextDelta);
+        if let EventPayload::Text { content } = norm.payload {
+            assert_eq!(content, "Hello world from Claude!");
+        } else {
+            panic!("Expected Text payload");
         }
     }
 

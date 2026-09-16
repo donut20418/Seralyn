@@ -407,3 +407,145 @@ async fn test_cross_provider_sync_cursor_full_cycle() {
     assert_eq!(formatted_c5, "Question 5", "Prompt should remain untouched when continuing with same provider");
     drop(c_msgs);
 }
+
+#[tokio::test]
+async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
+    use seralyn_lib::app::db::provider_sessions;
+
+    struct ResumableClaudeSession {
+        event_sender: tokio::sync::mpsc::Sender<NormalizedEvent>,
+        conv_id: String,
+        native_sid: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for ResumableClaudeSession {
+        async fn send(&self, _msg: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+            let sender = self.event_sender.clone();
+            let conv_id = self.conv_id.clone();
+            let sid = self.native_sid.clone();
+            tokio::spawn(async move {
+                // Simulate Claude sending system/init
+                let init_line = format!(r#"{{"type":"system","subtype":"init","session_id":"{}","model":"claude-opus-5"}}"#, sid);
+                let ev = parse_claude_line(&init_line).unwrap().unwrap();
+                let norm = claude_event_to_normalized(ev, ProviderKind::Claude, &conv_id, None).unwrap();
+                let _ = sender.send(norm).await;
+
+                // Simulate token stream
+                let delta1 = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hello "}}}"#;
+                let ev1 = parse_claude_line(delta1).unwrap().unwrap();
+                let norm1 = claude_event_to_normalized(ev1, ProviderKind::Claude, &conv_id, Some(&sid)).unwrap();
+                let _ = sender.send(norm1).await;
+
+                let delta2 = r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"from Claude!"}}}"#;
+                let ev2 = parse_claude_line(delta2).unwrap().unwrap();
+                let norm2 = claude_event_to_normalized(ev2, ProviderKind::Claude, &conv_id, Some(&sid)).unwrap();
+                let _ = sender.send(norm2).await;
+
+                // Finish
+                let finish = NormalizedEvent::session_finished(ProviderKind::Claude, conv_id);
+                let _ = sender.send(finish).await;
+            });
+            Ok(())
+        }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        fn native_session_id(&self) -> Option<String> { Some(self.native_sid.clone()) }
+        fn metadata(&self) -> SessionMetadata { Default::default() }
+        fn is_active(&self) -> bool { true }
+    }
+
+    struct MockClaudeProvider {
+        resumed_with: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockClaudeProvider {
+        fn kind(&self) -> ProviderKind { ProviderKind::Claude }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: Some("2.1.270".to_string()) })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            Ok(Box::new(ResumableClaudeSession {
+                event_sender: config.event_sender,
+                conv_id: config.conversation_id,
+                native_sid: "claude-native-xyz-123".to_string(),
+            }))
+        }
+        async fn resume_session(&self, native_session_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            self.resumed_with.lock().await.push(native_session_id.to_string());
+            Ok(Box::new(ResumableClaudeSession {
+                event_sender: config.event_sender,
+                conv_id: config.conversation_id,
+                native_sid: native_session_id.to_string(),
+            }))
+        }
+    }
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let resumed_log = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = Arc::new(MockClaudeProvider { resumed_with: resumed_log.clone() });
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Claude, provider.clone() as Arc<dyn Provider>);
+
+    // Instance 1 of App / ConversationManager
+    let manager1 = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map.clone())));
+    let conv = manager1.create_conversation(Some("Claude Resume Test")).unwrap();
+
+    // Turn 1:
+    let (tx1, mut rx1) = tokio::sync::mpsc::channel(10);
+    let mut text_acc = String::new();
+    let collect_task = tokio::spawn(async move {
+        while let Some(ev) = rx1.recv().await {
+            if let EventPayload::Text { content } = ev.payload {
+                text_acc.push_str(&content);
+            }
+        }
+        text_acc
+    });
+
+    manager1.send_message(&conv.id, "Turn 1 Question", ProviderKind::Claude, tx1).await.unwrap();
+    let streamed_result = collect_task.await.unwrap();
+    assert_eq!(streamed_result, "Hello from Claude!");
+
+    // Wait a brief moment for background event processing to commit DB writes
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Verify Assistant message saved in SQLite
+    let msgs = messages::get_messages_for_conversation(&db, &conv.id).unwrap();
+    assert_eq!(msgs.len(), 2, "Should have 1 user message + 1 assistant message");
+    assert_eq!(msgs[1].role, "assistant");
+    assert_eq!(msgs[1].content, "Hello from Claude!");
+    assert_eq!(msgs[1].seq, 2);
+
+    // Verify native session ID was persisted in SQLite provider_sessions table
+    let active_sess = provider_sessions::get_active_session(&db, &conv.id, "claude").unwrap().unwrap();
+    assert_eq!(active_sess.provider_session_id, Some("claude-native-xyz-123".to_string()));
+
+    // SIMULATE APP RESTART:
+    // Drop manager1 entirely
+    drop(manager1);
+
+    // Create manager2 from the SAME db (as when user relaunches desktop app)
+    let manager2 = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+
+    // Turn 2 in the resumed conversation:
+    let (tx2, mut rx2) = tokio::sync::mpsc::channel(10);
+    tokio::spawn(async move { while rx2.recv().await.is_some() {} });
+    manager2.send_message(&conv.id, "Turn 2 after restart", ProviderKind::Claude, tx2).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Verify that manager2 invoked resume_session with the persisted native session ID!
+    let resumed = resumed_log.lock().await;
+    assert_eq!(resumed.len(), 1, "Must have called resume_session exactly once");
+    assert_eq!(resumed[0], "claude-native-xyz-123", "Must resume with the exact native session ID persisted in Turn 1");
+}

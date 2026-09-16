@@ -191,7 +191,13 @@ impl ConversationManager {
                     while let Some(event) = internal_rx.recv().await {
                         // Update native session ID in DB when reported by provider
                         if let EventPayload::Session { session_id: Some(sid), .. } = &event.payload {
-                            let _ = provider_sessions::update_native_session_id(&db_clone, &ps_id, sid);
+                            if !sid.trim().is_empty() {
+                                let _ = provider_sessions::update_native_session_id(&db_clone, &ps_id, sid);
+                            }
+                        } else if let Some(sid) = &event.provider_session_id {
+                            if !sid.trim().is_empty() {
+                                let _ = provider_sessions::update_native_session_id(&db_clone, &ps_id, sid);
+                            }
                         }
 
                         if let EventPayload::Text { content } = &event.payload {

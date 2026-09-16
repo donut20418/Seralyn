@@ -54,17 +54,47 @@ impl Provider for ClaudeProvider {
     }
 
     async fn check_authentication(&self) -> Result<AuthStatus> {
+        // 1. Check API key in environment
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            if !key.trim().is_empty() {
+                return Ok(AuthStatus::Authenticated);
+            }
+        }
+
+        // 2. Check claude auth status
         let spawn_config = SpawnConfig {
             executable: "claude".to_string(),
-            args: vec!["doctor".to_string()],
+            args: vec!["auth".to_string(), "status".to_string()],
             working_dir: None,
             env: std::collections::HashMap::new(),
             startup_timeout: Duration::from_secs(5),
         };
 
-        match spawn(spawn_config).await {
-            Ok(_) => Ok(AuthStatus::NotAuthenticated),
-            Err(_) => Ok(AuthStatus::Unknown),
+        let process = match spawn(spawn_config).await {
+            Ok(p) => p,
+            Err(_) => return Ok(AuthStatus::Unknown),
+        };
+
+        let mut output = String::new();
+        while let Ok(Some(line)) = process.recv_stdout_line().await {
+            output.push_str(&line);
+            output.push('\n');
+        }
+
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&output) {
+            if val.get("loggedIn").and_then(|v| v.as_bool()) == Some(true) {
+                return Ok(AuthStatus::Authenticated);
+            } else if val.get("loggedIn").and_then(|v| v.as_bool()) == Some(false) {
+                return Ok(AuthStatus::NotAuthenticated);
+            }
+        }
+
+        if output.contains("\"loggedIn\": true") || output.contains("\"loggedIn\":true") {
+            Ok(AuthStatus::Authenticated)
+        } else if output.contains("\"loggedIn\": false") || output.contains("\"loggedIn\":false") {
+            Ok(AuthStatus::NotAuthenticated)
+        } else {
+            Ok(AuthStatus::Unknown)
         }
     }
 
@@ -140,6 +170,7 @@ impl ProviderSession for ClaudeSession {
             "--output-format".to_string(),
             "stream-json".to_string(),
             "--verbose".to_string(),
+            "--include-partial-messages".to_string(),
         ];
 
         // Resume flag semantics
@@ -178,13 +209,37 @@ impl ProviderSession for ClaudeSession {
 
         tokio::spawn(async move {
             let mut finished_sent = false;
+            let mut streamed_deltas = false;
+
             while let Ok(Some(line)) = process_for_task.recv_stdout_line().await {
                 if let Ok(Some(event)) = parse_claude_line(&line) {
-                    if let ClaudeEvent::Result { session_id, .. } = &event {
-                        if let Some(sid) = session_id {
+                    // 1. Capture session ID as early as possible (Init or Result)
+                    match &event {
+                        ClaudeEvent::Init { session_id: Some(sid), .. } => {
                             let mut guard = sid_holder.write().await;
-                            *guard = Some(sid.clone());
+                            if guard.is_none() {
+                                *guard = Some(sid.clone());
+                            }
                         }
+                        ClaudeEvent::Result { session_id: Some(sid), .. } => {
+                            let mut guard = sid_holder.write().await;
+                            if guard.is_none() {
+                                *guard = Some(sid.clone());
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    // 2. Track whether token deltas have been streamed
+                    if let ClaudeEvent::ContentBlockDelta { delta_type, .. } = &event {
+                        if delta_type == "text_delta" {
+                            streamed_deltas = true;
+                        }
+                    }
+
+                    // 3. Suppress duplicate complete text if deltas have already streamed
+                    if streamed_deltas && matches!(&event, ClaudeEvent::AssistantMessage { .. }) {
+                        continue;
                     }
 
                     let current_sid = sid_holder.read().await.clone();

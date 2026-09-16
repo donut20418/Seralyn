@@ -86,6 +86,9 @@ pub fn update_session_used(db: &Database, id: &str) -> Result<()> {
 }
 
 pub fn update_native_session_id(db: &Database, id: &str, native_session_id: &str) -> Result<()> {
+    if native_session_id.trim().is_empty() {
+        return Ok(());
+    }
     let conn = db.conn.lock().unwrap();
     conn.execute(
         "UPDATE provider_sessions SET provider_session_id = ?1 WHERE id = ?2",
