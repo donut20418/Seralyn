@@ -18,6 +18,8 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 *.log
+job_log*.txt
+test_output*.txt
 
 # Environment & Secrets
 .env
