@@ -338,8 +338,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_detect_executable() {
-        let result = detect_executable("cmd").await;
-        assert!(result.is_ok(), "Should find cmd executable on Windows");
+        #[cfg(windows)]
+        let exe = "cmd";
+        #[cfg(not(windows))]
+        let exe = "sh";
+
+        let result = detect_executable(exe).await;
+        assert!(result.is_ok(), "Should find standard shell executable on platform");
 
         let non_existent = detect_executable("non_existent_executable_12345").await;
         assert!(non_existent.is_err(), "Should fail for missing executable");

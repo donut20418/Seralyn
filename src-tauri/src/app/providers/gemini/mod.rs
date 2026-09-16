@@ -394,42 +394,68 @@ impl ProviderSession for GeminiSession {
         };
 
         let result_payload = if approved {
-            // Real ACP protocol: options contain optionId, name, kind
-            let option_id = options
-                .iter()
-                .find_map(|opt| {
-                    let option_id = opt.get("optionId").and_then(|v| v.as_str())?;
-                    let kind = opt.get("kind").and_then(|v| v.as_str()).unwrap_or("");
-                    if kind.eq_ignore_ascii_case("allow")
-                        || kind.contains("allow")
-                        || option_id.to_lowercase().contains("allow")
-                    {
-                        Some(option_id.to_string())
-                    } else {
-                        None
-                    }
-                })
-                .or_else(|| {
-                    options
-                        .first()
-                        .and_then(|opt| opt.get("optionId"))
-                        .and_then(|v| v.as_str())
-                        .map(ToString::to_string)
-                })
-                .unwrap_or_else(|| "allow".to_string());
+            // Find option representing allow (allow_once, allow_always, etc.)
+            let allow_opt_id = options.iter().find_map(|opt| {
+                let option_id = opt.get("optionId").and_then(|v| v.as_str())?;
+                let kind = opt.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                if kind.eq_ignore_ascii_case("allow_once")
+                    || kind.eq_ignore_ascii_case("allow_always")
+                    || kind.eq_ignore_ascii_case("allow")
+                    || kind.starts_with("allow")
+                    || option_id.eq_ignore_ascii_case("allow_once")
+                    || option_id.eq_ignore_ascii_case("allow_always")
+                {
+                    Some(option_id.to_string())
+                } else {
+                    None
+                }
+            });
 
-            json!({
-                "outcome": {
-                    "outcome": "selected",
-                    "optionId": option_id
+            match allow_opt_id {
+                Some(option_id) => json!({
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": option_id
+                    }
+                }),
+                None => {
+                    tracing::warn!("No valid allow option found in Gemini ACP request; cancelling");
+                    json!({
+                        "outcome": {
+                            "outcome": "cancelled"
+                        }
+                    })
                 }
-            })
+            }
         } else {
-            json!({
-                "outcome": {
-                    "outcome": "cancelled"
+            // Find explicit reject option or default to cancelled outcome
+            let reject_opt_id = options.iter().find_map(|opt| {
+                let option_id = opt.get("optionId").and_then(|v| v.as_str())?;
+                let kind = opt.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+                if kind.eq_ignore_ascii_case("reject_once")
+                    || kind.eq_ignore_ascii_case("reject_always")
+                    || kind.eq_ignore_ascii_case("reject")
+                    || kind.starts_with("reject")
+                {
+                    Some(option_id.to_string())
+                } else {
+                    None
                 }
-            })
+            });
+
+            match reject_opt_id {
+                Some(option_id) => json!({
+                    "outcome": {
+                        "outcome": "selected",
+                        "optionId": option_id
+                    }
+                }),
+                None => json!({
+                    "outcome": {
+                        "outcome": "cancelled"
+                    }
+                }),
+            }
         };
 
         self.transport.respond_success(id_val, result_payload).await

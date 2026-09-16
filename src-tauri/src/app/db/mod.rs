@@ -73,21 +73,26 @@ impl Database {
             );
         }
 
-        // 3. Check if DB from Phase 1.2 already has sync cursor columns
-        let has_seq_column: bool = {
-            let mut stmt = conn.prepare("PRAGMA table_info(messages)").ok();
-            if let Some(ref mut stmt) = stmt {
-                let rows = stmt.query_map([], |row| {
-                    let col_name: String = row.get(1)?;
-                    Ok(col_name)
-                }).ok();
-                rows.map(|mut r| r.any(|c| c.as_deref() == Ok("seq"))).unwrap_or(false)
-            } else {
-                false
-            }
-        };
+        // 3. Check if DB from Phase 1.2 already has sync cursor columns, repairing partial migrations
+        let has_messages_seq = table_has_column(&conn, "messages", "seq");
+        let has_sessions_seq = table_has_column(&conn, "provider_sessions", "synced_through_seq");
 
-        if has_seq_column {
+        if has_messages_seq || has_sessions_seq {
+            if !has_messages_seq {
+                tracing::info!("Repairing missing messages.seq column...");
+                conn.execute_batch(
+                    "ALTER TABLE messages ADD COLUMN seq INTEGER NOT NULL DEFAULT 0;
+                     CREATE INDEX IF NOT EXISTS idx_messages_conversation_seq ON messages(conversation_id, seq);"
+                ).map_err(|e| AppError::Database(format!("Failed to repair messages.seq: {}", e)))?;
+            }
+            if !has_sessions_seq {
+                tracing::info!("Repairing missing provider_sessions.synced_through_seq column...");
+                conn.execute(
+                    "ALTER TABLE provider_sessions ADD COLUMN synced_through_seq INTEGER NOT NULL DEFAULT 0",
+                    [],
+                ).map_err(|e| AppError::Database(format!("Failed to repair synced_through_seq: {}", e)))?;
+            }
+
             let _ = conn.execute(
                 "INSERT OR IGNORE INTO schema_migrations (version) VALUES (2)",
                 [],
@@ -128,7 +133,7 @@ impl Database {
 
         if zero_seq_count > 0 {
             tracing::info!("Backfilling seq for {} legacy messages...", zero_seq_count);
-            let _ = conn.execute_batch(
+            conn.execute_batch(
                 "UPDATE messages
                  SET seq = (
                      SELECT COUNT(*)
@@ -137,7 +142,7 @@ impl Database {
                        AND (m2.created_at < messages.created_at OR (m2.created_at = messages.created_at AND m2.rowid <= messages.rowid))
                  )
                  WHERE seq = 0;"
-            );
+            ).map_err(|e| AppError::Database(format!("Failed to backfill legacy message seq: {}", e)))?;
         }
 
         Ok(())
@@ -151,6 +156,24 @@ impl Database {
         path.push("seralyn.db");
         path
     }
+}
+
+fn table_has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    let pragma = format!("PRAGMA table_info({})", table);
+    let mut stmt = match conn.prepare(&pragma) {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+    let rows = match stmt.query_map([], |row| row.get::<_, String>(1)) {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    for col in rows.flatten() {
+        if col.eq_ignore_ascii_case(column) {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn execute_in_transaction<F, T>(conn: &mut Connection, f: F) -> Result<T>
