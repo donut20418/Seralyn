@@ -506,8 +506,11 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     let mut text_acc = String::new();
     let collect_task = tokio::spawn(async move {
         while let Some(ev) = rx1.recv().await {
-            if let EventPayload::Text { content } = ev.payload {
-                text_acc.push_str(&content);
+            if let EventPayload::Text { content } = &ev.payload {
+                text_acc.push_str(content);
+            }
+            if ev.event_type == EventType::SessionFinished {
+                break;
             }
         }
         text_acc
@@ -518,7 +521,7 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     assert_eq!(streamed_result, "Hello from Claude!");
 
     // Wait a brief moment for background event processing to commit DB writes
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // Verify Assistant message saved in SQLite
     let msgs = messages::get_messages_for_conversation(&db, &conv.id).unwrap();
