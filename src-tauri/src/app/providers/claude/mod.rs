@@ -139,6 +139,7 @@ impl ProviderSession for ClaudeSession {
             prompt_text,
             "--output-format".to_string(),
             "stream-json".to_string(),
+            "--verbose".to_string(),
         ];
 
         // Resume flag semantics
@@ -161,6 +162,7 @@ impl ProviderSession for ClaudeSession {
         };
 
         let process = spawn(spawn_config).await?;
+        let _ = process.send_line("").await;
         let process_arc = Arc::new(process);
         {
             let mut cp = self.current_process.lock().await;
