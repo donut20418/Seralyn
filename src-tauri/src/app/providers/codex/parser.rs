@@ -219,6 +219,20 @@ pub fn codex_notification_to_normalized(
                 return Some(event);
             }
         }
+        "error" => {
+            let msg = notification.params.as_ref()
+                .and_then(|p| p.get("error"))
+                .and_then(|e| e.get("message").or_else(|| e.get("msg")))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown Codex error")
+                .to_string();
+            event.event_type = EventType::Error;
+            event.payload = EventPayload::Error {
+                code: None,
+                message: msg,
+            };
+            return Some(event);
+        }
         _ => {}
     }
     None
