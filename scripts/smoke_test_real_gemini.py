@@ -13,24 +13,19 @@ print(f"Target CLI: {cmd}")
 env = os.environ.copy()
 api_key = env.get("GEMINI_API_KEY")
 
-if not api_key:
-    print("\n" + "="*70)
-    print("[AUTH REQUIRED] GEMINI_API_KEY environment variable is not set.")
-    print("To execute real upstream model turns and test native context memory:")
-    print("1. Obtain a Gemini API key from https://aistudio.google.com/apikey")
-    print("2. Set it in your terminal:")
-    print("     PowerShell: $env:GEMINI_API_KEY = \"AIzaSy...\"")
-    print("     CMD:        set GEMINI_API_KEY=AIzaSy...")
-    print("3. Re-run: python scripts\\smoke_test_real_gemini.py")
-    print("="*70 + "\n")
-    sys.exit(1)
-
-auth_params = {
-    "methodId": "gemini-api-key",
-    "_meta": {
-        "api-key": api_key
+if api_key:
+    print("Authentication mode: Optional GEMINI_API_KEY override detected.")
+    auth_params = {
+        "methodId": "gemini-api-key",
+        "_meta": {
+            "api-key": api_key
+        }
     }
-}
+else:
+    print("Authentication mode: Defaulting to 'oauth-personal' (Log in with Google).")
+    auth_params = {
+        "methodId": "oauth-personal"
+    }
 
 def read_until_response(proc, req_id, timeout_sec=30):
     t0 = time.time()

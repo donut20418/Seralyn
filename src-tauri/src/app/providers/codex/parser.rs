@@ -195,8 +195,10 @@ pub fn codex_notification_to_normalized(
                         .or_else(|| source_last.get("reasoning_tokens"))
                         .and_then(|v| v.as_u64());
 
-                    let context_tokens = total
-                        .and_then(|t| t.get("totalTokens").or_else(|| t.get("total_tokens")))
+                    let context_tokens = source_last
+                        .get("totalTokens")
+                        .or_else(|| source_last.get("total_tokens"))
+                        .or_else(|| total.and_then(|t| t.get("totalTokens").or_else(|| t.get("total_tokens"))))
                         .or_else(|| u.get("totalTokens"))
                         .or_else(|| u.get("total_tokens"))
                         .and_then(|v| v.as_u64());
@@ -387,7 +389,7 @@ mod tests {
                     assert_eq!(output_tokens, Some(45));
                     assert_eq!(cache_read_tokens, Some(30));
                     assert_eq!(reasoning_tokens, Some(10));
-                    assert_eq!(context_tokens, Some(410));
+                    assert_eq!(context_tokens, Some(205));
                     assert_eq!(context_window, Some(200000));
                     assert_eq!(confidence, TokenConfidence::Exact);
                 } else {
