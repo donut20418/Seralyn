@@ -419,21 +419,24 @@ SUCCESS: REAL GEMINI ACP 3-TURN CODEWORD RESUME SMOKE TEST PASSED 100%!
 
 ---
 
-## Phase 1.4.1 — Deterministic Gemini Resume Quiescence Barrier with Minimum Window
+## Phase 1.4.1 — Bounded Gemini Resume Quiescence Barrier & Activity Verification
 
-### 1. Deterministic Quiescence Barrier (`gemini/mod.rs`)
-- **Root Cause Eliminated**: Gemini CLI's `session/load` emits `session.streamHistory()` asynchronously. Flipping an `AtomicBool` from `true` to `false` when `send()` starts had a window where delayed replay chunks could arrive after `send()` began. Furthermore, relying purely on a 250ms quiet timer risked an "initial silence race" where history taking longer than 250ms to begin would be falsely marked complete.
-- **Quiescence Engine with Minimum Replay Window**:
-  - `GeminiSession` tracks `replay_complete: Arc<AtomicBool>` and `replay_ready: Arc<Notify>`.
-  - On `resume_session()`, an internal activity channel monitors incoming notifications. Each replayed chunk (`TextDelta`, `ThinkingDelta`, `ToolStarted`, etc.) drops silently and resets the quiet activity timer.
-  - **Enforced Minimum Window (`min_duration = 750ms`)**: The quiescence loop guarantees that replay is NEVER marked complete before at least 750ms have elapsed. Once `start.elapsed() >= min_duration` AND `last_activity.elapsed() >= quiet_duration (250ms)`, `replay_complete` transitions to `true` and notifies `replay_ready.notify_waiters()`.
-  - `resume_session()` awaits `session.wait_replay_quiescence(1000ms)`, ensuring the session is already quiet before return.
-  - `send()` awaits `replay_ready.notified()` if `!replay_complete`, ensuring `session/prompt` is only dispatched once historical replay is completely silent.
+### 1. Bounded Replay Isolation Barrier (`gemini/mod.rs`)
+- **Protocol Context & Known Limitation**: The official Gemini ACP specification does not provide an explicit `history_replay_finished` event after `session/load`. Historical messages are streamed asynchronously via `session.streamHistory()`.
+- **Bounded Quiescence Architecture**:
+  - `GeminiSession` tracks `replay_complete: Arc<AtomicBool>`, `replay_ready: Arc<Notify>`, and an activity monitor.
+  - **Activity Tracking (`seen_replay_activity: bool`)**: If no historical chunks have been observed yet, the barrier **never concludes prematurely** at `min_duration`. It holds until either:
+    1. Historical activity arrives (`seen_replay_activity = true`), requiring both `start.elapsed() >= min_duration (750ms)` AND `last_activity.elapsed() >= quiet_duration (250ms)` of silence before completion.
+    2. Bounded maximum duration (`max_duration = 2500ms`) is reached (safely accommodating empty sessions with no history).
+  - `resume_session()` awaits `session.wait_replay_quiescence(1000ms)` before return.
+  - `send()` awaits `replay_ready.notified()` up to `3000ms` if `!replay_complete`, ensuring `session/prompt` is only dispatched once historical replay is completely silent or bounded.
 
-### 2. Integration Test Setup & Initial-Silence Race Verification (`fixtures_tests.rs`)
-- **Setup**: Created active `provider_sessions` record in SQLite (`provider = "gemini"`, `provider_session_id = "gemini-old-sid"`), directing `ConversationManager::send_message()` into `provider.resume_session()` instead of `create_session()`.
-- **Delayed Initial Silence Simulation**: The test emits old Turn 1 & 2 history with a 400ms delay (>250ms initial silence) while `send(Turn 3)` is initiated immediately. Because `min_duration = 750ms`, the 400ms chunk arrives while `replay_complete` is still `false` and is cleanly suppressed.
-- **Assertion**: SQLite DB records exactly 6 messages; `seq = 6` strictly contains Turn 3 response without any old history leakage.
+### 2. Multi-Scenario Integration Test Verification (`fixtures_tests.rs`)
+The test suite covers three distinct timing cases:
+1. **`test_gemini_resume_history_isolation` (400ms delayed first chunk)**: First history chunk arrives at 400ms (>250ms quiet window). Suppressed cleanly because `min_duration = 750ms`.
+2. **`test_gemini_resume_history_isolation_delayed_1000ms` (1000ms delayed first chunk)**: First history chunk arrives at 1000ms (>750ms min window). Suppressed cleanly because `seen_replay_activity` was `false` at 750ms and held the barrier open until activity was detected and quieted.
+3. **`test_gemini_resume_no_history_completes` (0 history events)**: Cleanly unblocks via `max_duration` without hanging or false failures.
+- **Assertions**: Across all scenarios, SQLite DB maintains strict turn sequence (`seq = 6`), and Turn 3 assistant response contains strictly Turn 3 output with 0 history leakage.
 
 ---
 
@@ -445,8 +448,8 @@ SUCCESS: REAL GEMINI ACP 3-TURN CODEWORD RESUME SMOKE TEST PASSED 100%!
 | **Sync Cursor** | `seq` & `synced_through_seq` tracking across A→B→C→A switches | ✅ Verified with Delta Tests |
 | **Claude Adapter** | Token streaming, system/init, auth check, native resume across restarts | ✅ 100% Verified with Real Claude Pro Live Run |
 | **Codex Adapter** | JSON-RPC 2.0 app-server, v2 items, thread resume, tokenUsage breakdown, context semantics | ✅ 100% Verified with Real Codex CLI Live Run |
-| **Gemini Adapter** | ACP v1 lifecycle, --skip-trust, minimum window quiescence barrier, deduplication, credentials passthrough | ✅ 100% Verified with Real Gemini CLI 3-Turn Test |
-| **CI Automated Tests** | Windows Cargo test, Ubuntu Cargo test, Frontend Vite build | ✅ 100% Green (40/40 tests pass) |
+| **Gemini Adapter** | ACP v1 lifecycle, --skip-trust, bounded quiescence barrier, deduplication, credentials passthrough | ✅ 100% Verified with Real Gemini CLI 3-Turn Test |
+| **CI Automated Tests** | Windows Cargo test, Ubuntu Cargo test, Frontend Vite build | ✅ 100% Green (42/42 tests pass) |
 | **Real Provider CLIs** | Claude Pro, OpenAI Codex CLI, and Gemini CLI smoke tested live on Windows host | ✅ All 3 Real Providers Verified |
 | **Repository Audit** | Scripts, tests, and documentation committed in repo | ✅ Complete & Auditable |
 

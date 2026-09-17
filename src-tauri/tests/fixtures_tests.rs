@@ -674,6 +674,8 @@ async fn test_gemini_resume_history_isolation() {
 
     struct MockGeminiProvider {
         resumed_count: Arc<std::sync::atomic::AtomicUsize>,
+        delay_ms: Option<u64>,
+        max_duration_ms: u64,
     }
 
     #[async_trait::async_trait]
@@ -698,15 +700,17 @@ async fn test_gemini_resume_history_isolation() {
             let conv_id_clone = config.conversation_id.clone();
             let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<()>(100);
 
-            // Quiescence task enforcing min_duration = 750ms matching production GeminiSession
             let rc = replay_complete.clone();
             let rr = replay_ready.clone();
+            let max_duration = Duration::from_millis(self.max_duration_ms);
+            let min_duration = Duration::from_millis(750.min(self.max_duration_ms));
+            let quiet_duration = Duration::from_millis(250.min(self.max_duration_ms / 2));
+
+            // Quiescence task enforcing seen_replay_activity, min_duration, and quiet_duration
             tokio::spawn(async move {
-                let min_duration = Duration::from_millis(750);
-                let quiet_duration = Duration::from_millis(250);
-                let max_duration = Duration::from_millis(2500);
                 let start = tokio::time::Instant::now();
                 let mut last_activity = start;
+                let mut seen_replay_activity = false;
 
                 loop {
                     if start.elapsed() >= max_duration {
@@ -718,10 +722,12 @@ async fn test_gemini_resume_history_isolation() {
                             if act.is_none() {
                                 break;
                             }
+                            seen_replay_activity = true;
                             last_activity = tokio::time::Instant::now();
                         }
-                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                            if start.elapsed() >= min_duration
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                            if seen_replay_activity
+                                && start.elapsed() >= min_duration
                                 && last_activity.elapsed() >= quiet_duration
                             {
                                 break;
@@ -734,21 +740,245 @@ async fn test_gemini_resume_history_isolation() {
                 rr.notify_waiters();
             });
 
-            // Delayed history generator: simulates first chunk delayed by 400ms (>250ms initial silence!)
+            // Delayed history generator (if delay_ms is configured)
+            if let Some(delay) = self.delay_ms {
+                let rc_filter = replay_complete.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+
+                    let history_text = "Turn 1 and 2 old history text";
+                    let event = NormalizedEvent::text_delta(ProviderKind::Gemini, conv_id_clone.clone(), history_text.to_string());
+
+                    if !rc_filter.load(Ordering::SeqCst) {
+                        let _ = activity_tx.try_send(());
+                    } else {
+                        // Leaked because barrier concluded too early!
+                        let _ = sender_clone.send(event).await;
+                    }
+                });
+            }
+
+            Ok(Box::new(FixedGeminiSession {
+                event_sender: config.event_sender,
+                conv_id: config.conversation_id,
+                native_sid: native_session_id.to_string(),
+                replay_complete,
+                replay_ready,
+            }))
+        }
+    }
+
+    async fn run_gemini_resume_scenario(delay_ms: Option<u64>, max_duration_ms: u64) {
+        let db = Arc::new(Database::new_in_memory().unwrap());
+        db.run_migrations().unwrap();
+
+        let resumed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut provider_map = std::collections::HashMap::new();
+        provider_map.insert(
+            ProviderKind::Gemini,
+            Arc::new(MockGeminiProvider {
+                resumed_count: resumed_count.clone(),
+                delay_ms,
+                max_duration_ms,
+            }) as Arc<dyn Provider>,
+        );
+
+        let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+        
+        // 1. Simulate pre-existing conversation in SQLite (Turns 1 & 2)
+        let conv = manager.create_conversation(Some("History Isolation Test")).unwrap();
+        messages::create_message(&db, &conv.id, None, "user", "Turn 1 Prompt", None, None, None, None).unwrap();
+        messages::create_message(&db, &conv.id, None, "assistant", "Turn 1 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap();
+        messages::create_message(&db, &conv.id, None, "user", "Turn 2 Prompt", None, None, None, None).unwrap();
+        messages::create_message(&db, &conv.id, None, "assistant", "Turn 2 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap();
+
+        // 2. Persist active provider session record with native session ID
+        provider_sessions::create_provider_session(
+            &db,
+            &conv.id,
+            "gemini",
+            Some("gemini-old-sid"),
+            Some("gemini-3.1-flash-lite"),
+        ).unwrap();
+
+        // 3. Trigger Turn 3 immediately without waiting
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
+        manager.send_message(&conv.id, "Turn 3 Prompt", ProviderKind::Gemini, tx).await.unwrap();
+
+        let mut turn3_result = String::new();
+        while let Some(ev) = rx.recv().await {
+            if let EventPayload::Text { content } = ev.payload {
+                turn3_result.push_str(&content);
+            }
+            if ev.event_type == EventType::SessionFinished {
+                break;
+            }
+        }
+        
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        assert_eq!(resumed_count.load(Ordering::SeqCst), 1, "Must have called resume_session exactly once");
+
+        let all_msgs = messages::get_messages(&db, &conv.id).unwrap();
+        assert_eq!(all_msgs.len(), 6, "Should have exactly 6 messages (3 user, 3 assistant)");
+        
+        assert_eq!(all_msgs[0].seq, 1);
+        assert_eq!(all_msgs[1].seq, 2);
+        assert_eq!(all_msgs[1].content, "Turn 1 Response");
+        assert_eq!(all_msgs[2].seq, 3);
+        assert_eq!(all_msgs[3].seq, 4);
+        assert_eq!(all_msgs[3].content, "Turn 2 Response");
+        
+        assert_eq!(all_msgs[4].role, "user");
+        assert_eq!(all_msgs[4].seq, 5);
+        assert_eq!(all_msgs[4].content, "Turn 3 Prompt");
+        
+        assert_eq!(all_msgs[5].role, "assistant");
+        assert_eq!(all_msgs[5].seq, 6);
+        
+        assert_eq!(all_msgs[5].content, turn3_result);
+        assert_eq!(all_msgs[5].content, "Turn 3 Response. Prompt was Turn 3 Prompt");
+        assert!(!all_msgs[5].content.contains("old history text"), "Failed deduplication: Turn 3 contains leaked history!");
+    }
+
+    // Scenario 1: First history chunk arrives at 400ms (>250ms quiet window) -> properly suppressed!
+    run_gemini_resume_scenario(Some(400), 2500).await;
+}
+
+#[tokio::test]
+async fn test_gemini_resume_history_isolation_delayed_1000ms() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
+    use seralyn_lib::app::db::{Database, messages, provider_sessions};
+
+    struct FixedGeminiSession {
+        event_sender: tokio::sync::mpsc::Sender<NormalizedEvent>,
+        conv_id: String,
+        native_sid: String,
+        replay_complete: Arc<AtomicBool>,
+        replay_ready: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for FixedGeminiSession {
+        async fn send(&self, msg: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+            if !self.replay_complete.load(Ordering::SeqCst) {
+                let notified = self.replay_ready.notified();
+                if !self.replay_complete.load(Ordering::SeqCst) {
+                    let _ = tokio::time::timeout(Duration::from_millis(3000), notified).await;
+                }
+            }
+
+            let sender = self.event_sender.clone();
+            let conv_id = self.conv_id.clone();
+            let response_text = format!("Turn 3 Response. Prompt was {}", msg.content);
+            
+            tokio::spawn(async move {
+                let delta = NormalizedEvent::text_delta(ProviderKind::Gemini, conv_id.clone(), response_text);
+                let _ = sender.send(delta).await;
+                
+                let finish = NormalizedEvent::session_finished(ProviderKind::Gemini, conv_id);
+                let _ = sender.send(finish).await;
+            });
+            Ok(())
+        }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        fn native_session_id(&self) -> Option<String> { Some(self.native_sid.clone()) }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: ProviderKind::Gemini,
+                native_session_id: Some(self.native_sid.clone()),
+                model: Some("gemini-3.1-flash-lite".to_string()),
+                created_at: String::new(),
+            }
+        }
+        fn is_active(&self) -> bool { true }
+    }
+
+    struct MockGeminiProvider1000 {
+        resumed_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockGeminiProvider1000 {
+        fn kind(&self) -> ProviderKind { ProviderKind::Gemini }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, _config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            panic!("Test must invoke resume_session");
+        }
+        async fn resume_session(&self, native_session_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            self.resumed_count.fetch_add(1, Ordering::SeqCst);
+            let replay_complete = Arc::new(AtomicBool::new(false));
+            let replay_ready = Arc::new(Notify::new());
+
+            let sender_clone = config.event_sender.clone();
+            let conv_id_clone = config.conversation_id.clone();
+            let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<()>(100);
+
+            let rc = replay_complete.clone();
+            let rr = replay_ready.clone();
+
+            // Quiescence task enforcing seen_replay_activity + min_duration (750ms) + quiet_duration (250ms)
+            tokio::spawn(async move {
+                let min_duration = Duration::from_millis(750);
+                let quiet_duration = Duration::from_millis(250);
+                let max_duration = Duration::from_millis(2500);
+                let start = tokio::time::Instant::now();
+                let mut last_activity = start;
+                let mut seen_replay_activity = false;
+
+                loop {
+                    if start.elapsed() >= max_duration {
+                        break;
+                    }
+
+                    tokio::select! {
+                        act = activity_rx.recv() => {
+                            if act.is_none() {
+                                break;
+                            }
+                            seen_replay_activity = true;
+                            last_activity = tokio::time::Instant::now();
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                            if seen_replay_activity
+                                && start.elapsed() >= min_duration
+                                && last_activity.elapsed() >= quiet_duration
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                rc.store(true, Ordering::SeqCst);
+                rr.notify_waiters();
+            });
+
+            // Delayed history generator: chunk arrives at 1000ms (>750ms min_duration!)
             let rc_filter = replay_complete.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                tokio::time::sleep(Duration::from_millis(1000)).await;
 
-                // Old history chunks from Turn 1 & 2 arrive at 400ms
                 let history_text = "Turn 1 and 2 old history text";
                 let event = NormalizedEvent::text_delta(ProviderKind::Gemini, conv_id_clone.clone(), history_text.to_string());
 
-                // The dispatcher suppresses TextDelta while replay_complete is false
                 if !rc_filter.load(Ordering::SeqCst) {
-                    // Correctly suppressed because start.elapsed() (400ms) < min_duration (750ms)!
                     let _ = activity_tx.try_send(());
                 } else {
-                    // If initial silence race existed, replay_complete would be prematurely true and leak!
+                    // If seen_replay_activity was missing, this would leak because 750ms elapsed before 1000ms!
                     let _ = sender_clone.send(event).await;
                 }
             });
@@ -770,20 +1000,16 @@ async fn test_gemini_resume_history_isolation() {
     let mut provider_map = std::collections::HashMap::new();
     provider_map.insert(
         ProviderKind::Gemini,
-        Arc::new(MockGeminiProvider { resumed_count: resumed_count.clone() }) as Arc<dyn Provider>,
+        Arc::new(MockGeminiProvider1000 { resumed_count: resumed_count.clone() }) as Arc<dyn Provider>,
     );
 
     let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
-    
-    // 1. Simulate pre-existing conversation in SQLite (Turns 1 & 2)
-    let conv = manager.create_conversation(Some("History Isolation Test")).unwrap();
-    messages::create_message(&db, &conv.id, None, "user", "Turn 1 Prompt", None, None, None, None).unwrap(); // seq 1
-    messages::create_message(&db, &conv.id, None, "assistant", "Turn 1 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap(); // seq 2
-    messages::create_message(&db, &conv.id, None, "user", "Turn 2 Prompt", None, None, None, None).unwrap(); // seq 3
-    messages::create_message(&db, &conv.id, None, "assistant", "Turn 2 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap(); // seq 4
+    let conv = manager.create_conversation(Some("History Isolation 1000ms Test")).unwrap();
+    messages::create_message(&db, &conv.id, None, "user", "Turn 1 Prompt", None, None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "assistant", "Turn 1 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap();
+    messages::create_message(&db, &conv.id, None, "user", "Turn 2 Prompt", None, None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "assistant", "Turn 2 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap();
 
-    // 2. CRITICAL: Persist active provider session record with native session ID!
-    // This forces ConversationManager to route into resume_session() instead of create_session().
     provider_sessions::create_provider_session(
         &db,
         &conv.id,
@@ -792,8 +1018,6 @@ async fn test_gemini_resume_history_isolation() {
         Some("gemini-3.1-flash-lite"),
     ).unwrap();
 
-    // 3. Trigger Turn 3 immediately without waiting.
-    // Delayed history will arrive at 100ms while send() is already active.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
     manager.send_message(&conv.id, "Turn 3 Prompt", ProviderKind::Gemini, tx).await.unwrap();
 
@@ -809,29 +1033,159 @@ async fn test_gemini_resume_history_isolation() {
     
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    // Verify resume_session was called exactly once
-    assert_eq!(resumed_count.load(Ordering::SeqCst), 1, "Must have called resume_session exactly once");
-
-    // Verify DB messages
+    assert_eq!(resumed_count.load(Ordering::SeqCst), 1);
     let all_msgs = messages::get_messages(&db, &conv.id).unwrap();
-    assert_eq!(all_msgs.len(), 6, "Should have exactly 6 messages (3 user, 3 assistant)");
-    
-    assert_eq!(all_msgs[0].seq, 1);
-    assert_eq!(all_msgs[1].seq, 2);
-    assert_eq!(all_msgs[1].content, "Turn 1 Response");
-    assert_eq!(all_msgs[2].seq, 3);
-    assert_eq!(all_msgs[3].seq, 4);
-    assert_eq!(all_msgs[3].content, "Turn 2 Response");
-    
-    assert_eq!(all_msgs[4].role, "user");
-    assert_eq!(all_msgs[4].seq, 5);
-    assert_eq!(all_msgs[4].content, "Turn 3 Prompt");
-    
-    assert_eq!(all_msgs[5].role, "assistant");
-    assert_eq!(all_msgs[5].seq, 6);
-    
-    // The critical assertion: the turn 3 assistant message must ONLY contain Turn 3 text, NOT "old history text"
+    assert_eq!(all_msgs.len(), 6);
     assert_eq!(all_msgs[5].content, turn3_result);
     assert_eq!(all_msgs[5].content, "Turn 3 Response. Prompt was Turn 3 Prompt");
-    assert!(!all_msgs[5].content.contains("old history text"), "Failed deduplication: Turn 3 contains leaked history!");
+    assert!(!all_msgs[5].content.contains("old history text"), "Failed deduplication: 1000ms delayed chunk leaked!");
+}
+
+#[tokio::test]
+async fn test_gemini_resume_no_history_completes() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+    use tokio::sync::Notify;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
+    use seralyn_lib::app::db::{Database, messages, provider_sessions};
+
+    struct FixedGeminiSession {
+        event_sender: tokio::sync::mpsc::Sender<NormalizedEvent>,
+        conv_id: String,
+        native_sid: String,
+        replay_complete: Arc<AtomicBool>,
+        replay_ready: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for FixedGeminiSession {
+        async fn send(&self, msg: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+            if !self.replay_complete.load(Ordering::SeqCst) {
+                let notified = self.replay_ready.notified();
+                if !self.replay_complete.load(Ordering::SeqCst) {
+                    let _ = tokio::time::timeout(Duration::from_millis(3000), notified).await;
+                }
+            }
+
+            let sender = self.event_sender.clone();
+            let conv_id = self.conv_id.clone();
+            let response_text = format!("Turn 3 Response. Prompt was {}", msg.content);
+            
+            tokio::spawn(async move {
+                let delta = NormalizedEvent::text_delta(ProviderKind::Gemini, conv_id.clone(), response_text);
+                let _ = sender.send(delta).await;
+                
+                let finish = NormalizedEvent::session_finished(ProviderKind::Gemini, conv_id);
+                let _ = sender.send(finish).await;
+            });
+            Ok(())
+        }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        fn native_session_id(&self) -> Option<String> { Some(self.native_sid.clone()) }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: ProviderKind::Gemini,
+                native_session_id: Some(self.native_sid.clone()),
+                model: Some("gemini-3.1-flash-lite".to_string()),
+                created_at: String::new(),
+            }
+        }
+        fn is_active(&self) -> bool { true }
+    }
+
+    struct MockGeminiProviderNoHistory {
+        resumed_count: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockGeminiProviderNoHistory {
+        fn kind(&self) -> ProviderKind { ProviderKind::Gemini }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, _config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            panic!("Test must invoke resume_session");
+        }
+        async fn resume_session(&self, native_session_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            self.resumed_count.fetch_add(1, Ordering::SeqCst);
+            let replay_complete = Arc::new(AtomicBool::new(false));
+            let replay_ready = Arc::new(Notify::new());
+
+            let rc = replay_complete.clone();
+            let rr = replay_ready.clone();
+
+            // Quiescence task with NO history activity: must complete via max_duration
+            tokio::spawn(async move {
+                let max_duration = Duration::from_millis(350);
+                let start = tokio::time::Instant::now();
+
+                while start.elapsed() < max_duration {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+
+                rc.store(true, Ordering::SeqCst);
+                rr.notify_waiters();
+            });
+
+            Ok(Box::new(FixedGeminiSession {
+                event_sender: config.event_sender,
+                conv_id: config.conversation_id,
+                native_sid: native_session_id.to_string(),
+                replay_complete,
+                replay_ready,
+            }))
+        }
+    }
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let resumed_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(
+        ProviderKind::Gemini,
+        Arc::new(MockGeminiProviderNoHistory { resumed_count: resumed_count.clone() }) as Arc<dyn Provider>,
+    );
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("No History Resume Test")).unwrap();
+    messages::create_message(&db, &conv.id, None, "user", "Turn 1 Prompt", None, None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "assistant", "Turn 1 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap();
+
+    provider_sessions::create_provider_session(
+        &db,
+        &conv.id,
+        "gemini",
+        Some("gemini-old-sid"),
+        Some("gemini-3.1-flash-lite"),
+    ).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
+    manager.send_message(&conv.id, "Turn 2 Prompt", ProviderKind::Gemini, tx).await.unwrap();
+
+    let mut turn2_result = String::new();
+    while let Some(ev) = rx.recv().await {
+        if let EventPayload::Text { content } = ev.payload {
+            turn2_result.push_str(&content);
+        }
+        if ev.event_type == EventType::SessionFinished {
+            break;
+        }
+    }
+    
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert_eq!(resumed_count.load(Ordering::SeqCst), 1);
+    let all_msgs = messages::get_messages(&db, &conv.id).unwrap();
+    assert_eq!(all_msgs.len(), 4);
+    assert_eq!(all_msgs[3].content, turn2_result);
+    assert_eq!(all_msgs[3].content, "Turn 3 Response. Prompt was Turn 2 Prompt");
 }

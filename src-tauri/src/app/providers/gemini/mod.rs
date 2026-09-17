@@ -334,6 +334,7 @@ impl GeminiSession {
                 let max_duration = Duration::from_millis(2500);
                 let start = tokio::time::Instant::now();
                 let mut last_activity = start;
+                let mut seen_replay_activity = false;
 
                 loop {
                     if start.elapsed() >= max_duration {
@@ -345,10 +346,12 @@ impl GeminiSession {
                             if act.is_none() {
                                 break;
                             }
+                            seen_replay_activity = true;
                             last_activity = tokio::time::Instant::now();
                         }
                         _ = tokio::time::sleep(Duration::from_millis(50)) => {
-                            if start.elapsed() >= min_duration
+                            if seen_replay_activity
+                                && start.elapsed() >= min_duration
                                 && last_activity.elapsed() >= quiet_duration
                             {
                                 break;
