@@ -157,52 +157,51 @@ pub fn codex_notification_to_normalized(
                 }
             }
         }
+        "thread/tokenUsage/updated" => {
+            if let Some(params) = &notification.params {
+                let usage_val = params.get("tokenUsage").or_else(|| params.get("usage"));
+                if let Some(u) = usage_val {
+                    let prompt_tokens = u
+                        .get("promptTokens")
+                        .or_else(|| u.get("prompt_tokens"))
+                        .or_else(|| u.get("input_tokens"))
+                        .and_then(|v| v.as_u64());
+                    let completion_tokens = u
+                        .get("completionTokens")
+                        .or_else(|| u.get("completion_tokens"))
+                        .or_else(|| u.get("output_tokens"))
+                        .and_then(|v| v.as_u64());
+                    let total_tokens = u
+                        .get("totalTokens")
+                        .or_else(|| u.get("total_tokens"))
+                        .and_then(|v| v.as_u64());
+                    let cache_tokens = u
+                        .get("cachedInputTokens")
+                        .or_else(|| u.get("cache_read_tokens"))
+                        .and_then(|v| v.as_u64());
+
+                    event.event_type = EventType::UsageUpdated;
+                    event.payload = EventPayload::Usage {
+                        input_tokens: prompt_tokens,
+                        output_tokens: completion_tokens,
+                        cache_read_tokens: cache_tokens,
+                        reasoning_tokens: None,
+                        context_tokens: total_tokens,
+                        context_window: None,
+                        confidence: TokenConfidence::Exact,
+                    };
+                    return Some(event);
+                }
+            }
+        }
         "turn/completed" => {
             event.event_type = EventType::SessionFinished;
             event.payload = EventPayload::Empty;
-
-            if let Some(params) = &notification.params {
-                if let Some(usage_val) = params.get("usage") {
-                    let prompt_tokens = usage_val.get("prompt_tokens").or_else(|| usage_val.get("input_tokens")).and_then(|v| v.as_u64());
-                    let completion_tokens = usage_val.get("completion_tokens").or_else(|| usage_val.get("output_tokens")).and_then(|v| v.as_u64());
-
-                    if prompt_tokens.is_some() || completion_tokens.is_some() {
-                        event.event_type = EventType::UsageUpdated;
-                        event.payload = EventPayload::Usage {
-                            input_tokens: prompt_tokens,
-                            output_tokens: completion_tokens,
-                            cache_read_tokens: None,
-                            reasoning_tokens: None,
-                            context_tokens: None,
-                            context_window: None,
-                            confidence: TokenConfidence::Exact,
-                        };
-                    }
-                }
-            }
             return Some(event);
         }
         "turn/finished" => {
             event.event_type = EventType::SessionFinished;
             event.payload = EventPayload::Empty;
-            
-            if let Some(params) = &notification.params {
-                if let Some(usage_val) = params.get("usage") {
-                    let prompt_tokens = usage_val.get("prompt_tokens").or_else(|| usage_val.get("input_tokens")).and_then(|v| v.as_u64());
-                    let completion_tokens = usage_val.get("completion_tokens").or_else(|| usage_val.get("output_tokens")).and_then(|v| v.as_u64());
-                    
-                    event.event_type = EventType::UsageUpdated;
-                    event.payload = EventPayload::Usage {
-                        input_tokens: prompt_tokens,
-                        output_tokens: completion_tokens,
-                        cache_read_tokens: None,
-                        reasoning_tokens: None,
-                        context_tokens: None,
-                        context_window: None,
-                        confidence: TokenConfidence::Exact,
-                    };
-                }
-            }
             return Some(event);
         }
         "approval/request" => {
@@ -322,4 +321,26 @@ mod tests {
             _ => panic!("expected server request"),
         }
     }
+
+    #[test]
+    fn test_parse_codex_token_usage_updated() {
+        let line = r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"th_123","tokenUsage":{"promptTokens":150,"completionTokens":45,"totalTokens":195,"cachedInputTokens":30}}}"#;
+        let msg = parse_codex_line(line).unwrap().unwrap();
+        match msg {
+            CodexMessage::Notification(not) => {
+                let event = codex_notification_to_normalized(&not, "c1", Some("th_123")).unwrap();
+                assert_eq!(event.event_type, EventType::UsageUpdated);
+                if let EventPayload::Usage { input_tokens, output_tokens, context_tokens, cache_read_tokens, .. } = event.payload {
+                    assert_eq!(input_tokens, Some(150));
+                    assert_eq!(output_tokens, Some(45));
+                    assert_eq!(context_tokens, Some(195));
+                    assert_eq!(cache_read_tokens, Some(30));
+                } else {
+                    panic!("expected usage payload");
+                }
+            }
+            _ => panic!("expected notification"),
+        }
+    }
 }
+

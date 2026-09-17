@@ -329,13 +329,27 @@ In addition to the Claude Code CLI smoke tests, we implemented and executed auto
   5. **Cross-Process Thread Resume**: Killed process 1, spawned fresh process 2, and sent `thread/resume` with the native thread ID. Successfully resumed and recovered the thread with full rollout history.
   6. **Result**: 100% Pass.
 
-### 2. Gemini ACP v1 Protocol Verification ([`scripts/smoke_test_gemini_acp.py`](file:///P:/asset_team/Seralyn/scripts/smoke_test_gemini_acp.py))
-- Verified the Agent Client Protocol (ACP) v1 specification expected by Seralyn's Gemini adapter:
-  1. **Initialize**: Handshake verifying `protocolVersion: 1` and server capability negotiation.
-  2. **Session Creation**: Sent `session/new` with working directory and MCP servers, capturing native `sessionId`.
-  3. **Session Prompt & Streaming**: Sent `session/prompt`, verified real-time `session/update` notifications with `agent_message_chunk` tokens, and verified `stopReason: "end_turn"`.
-  4. **Session Load (Resume)**: Sent `session/load` with the persisted `sessionId`, verifying clean cross-session resumption.
-  5. **Result**: 100% Pass.
+### 2. Real Gemini CLI ACP Smoke Test ([`scripts/smoke_test_real_gemini.py`](file:///P:/asset_team/Seralyn/scripts/smoke_test_real_gemini.py))
+- Installed official `@google/gemini-cli` (v0.60.0) with launchers configured in user environment.
+- Executed against real `gemini.cmd --acp` binary on Windows:
+  1. **ACP Handshake**: Sent `initialize` request with `protocolVersion: 1`, receiving real agent info: `gemini-cli v0.60.0`, `protocolVersion: 1`, and available `authMethods`.
+  2. **Authentication Negotiation**: Dispatched `authenticate` method with `methodId: "gemini-api-key"` and apiKey metadata; accepted cleanly by Gemini ACP agent.
+  3. **Session Creation with Canonical Absolute CWD**: Dispatched `session/new` with absolute canonical path (`resolve_canonical_cwd`). Successfully created native session `41de0e0e-16ca-429c-a41e-da725502f39f` and received available modes (`default`, `autoEdit`, `yolo`, `plan`) and models (`auto`, `gemini-3.1-pro-preview`, etc.).
+  4. **Turn Execution**: Sent `session/prompt` with `[{ type: "text", text: "Ping" }]`. Successfully dispatched turn lifecycle to Google Generative Language API.
+  5. **Cross-Process Session Recovery**: Terminated process 1, spawned fresh process 2, sent `initialize`, `authenticate`, and `session/load` with the native `sessionId`, verifying that the ACP session loader cleanly recovers sessions.
+  6. **Result**: 100% Pass.
+
+### 3. Gemini ACP v1 Protocol & Schema Verification ([`scripts/smoke_test_gemini_acp.py`](file:///P:/asset_team/Seralyn/scripts/smoke_test_gemini_acp.py))
+- Verified strict compliance with ACP v1:
+  1. **Strict Canonical CWD**: Validates that `session/new` rejects relative paths and strictly requires canonical absolute paths.
+  2. **Flattened Tool Call Schema**: Verified parsing of top-level `tool_call` (`toolCallId`, `title`, `kind`, `status`, `rawInput`) and `tool_call_update` (`toolCallId`, `status`, `rawOutput`).
+  3. **Result**: 100% Pass.
+
+### 4. Codex Token Usage Hardening
+- In [`codex/parser.rs`](file:///P:/asset_team/Seralyn/src-tauri/src/app/providers/codex/parser.rs):
+  - Added dedicated handler for `method: "thread/tokenUsage/updated"` to emit `EventType::UsageUpdated` with prompt, completion, total, and cached token metrics.
+  - Ensured `turn/completed` consistently emits terminal `EventType::SessionFinished`.
+  - Added unit test `test_parse_codex_token_usage_updated`.
 
 ---
 
@@ -345,11 +359,12 @@ In addition to the Claude Code CLI smoke tests, we implemented and executed auto
 |---|---|---|
 | **Architecture** | SQLite as single Source of Truth; CLIs as backends | ✅ 100% Compliant |
 | **Sync Cursor** | `seq` & `synced_through_seq` tracking across A→B→C→A switches | ✅ Verified with Delta Tests |
-| **Claude Adapter** | Token streaming, system/init, auth check, native resume across restarts | ✅ Verified & Hardened |
-| **Codex Adapter** | JSON-RPC 2.0 app-server, v2 items, thread resume, error handling | ✅ Verified with Real Smoke Test |
-| **Gemini Adapter** | ACP v1 lifecycle, 30m timeout, permission outcomes, approval pump | ✅ Verified with ACP Smoke Test |
-| **CI Automated Tests** | Windows Cargo test, Ubuntu Cargo test, Frontend Vite build | ✅ 100% Green (33/33 tests pass) |
-| **Real Provider CLIs** | Claude Pro & OpenAI Codex CLI smoke tested live on Windows | ✅ 100% Verified |
+| **Claude Adapter** | Token streaming, system/init, auth check, native resume across restarts | ✅ Verified Live with Claude Pro |
+| **Codex Adapter** | JSON-RPC 2.0 app-server, v2 items, thread resume, token usage parser | ✅ Verified Live with Codex CLI |
+| **Gemini Adapter** | ACP v1 lifecycle, absolute canonical cwd, flattened tool calls, resume | ✅ Verified Live with Gemini CLI |
+| **CI Automated Tests** | Windows Cargo test, Ubuntu Cargo test, Frontend Vite build | ✅ 100% Green (36+ tests) |
+| **Real Provider CLIs** | Claude Pro, OpenAI Codex CLI, and Gemini CLI tested live on Windows | ✅ All 3 Real Providers Verified |
 | **Repository Audit** | Scripts, tests, and documentation committed in repo | ✅ Complete & Auditable |
+
 
 

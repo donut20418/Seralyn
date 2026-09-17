@@ -61,9 +61,36 @@ pub fn gemini_notification_to_normalized(
                         }
                         "tool_call" => {
                             let tool_call = update.get("toolCall").or_else(|| update.get("tool"));
-                            let id = tool_call.and_then(|tc| tc.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let name = tool_call.and_then(|tc| tc.get("name")).and_then(|v| v.as_str()).unwrap_or("tool").to_string();
-                            let input = tool_call.and_then(|tc| tc.get("arguments").or_else(|| tc.get("input"))).cloned();
+                            let id = update
+                                .get("toolCallId")
+                                .or_else(|| update.get("id"))
+                                .or_else(|| tool_call.and_then(|tc| tc.get("toolCallId").or_else(|| tc.get("id"))))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            let name = update
+                                .get("title")
+                                .or_else(|| update.get("name"))
+                                .or_else(|| update.get("kind"))
+                                .or_else(|| tool_call.and_then(|tc| tc.get("title").or_else(|| tc.get("name")).or_else(|| tc.get("kind"))))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("tool")
+                                .to_string();
+
+                            let input = update
+                                .get("rawInput")
+                                .or_else(|| update.get("input"))
+                                .or_else(|| update.get("arguments"))
+                                .or_else(|| tool_call.and_then(|tc| tc.get("rawInput").or_else(|| tc.get("input")).or_else(|| tc.get("arguments"))))
+                                .cloned();
+
+                            let status = update
+                                .get("status")
+                                .or_else(|| tool_call.and_then(|tc| tc.get("status")))
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string)
+                                .or_else(|| Some("started".to_string()));
 
                             return Some(create_event(
                                 EventType::ToolStarted,
@@ -74,15 +101,33 @@ pub fn gemini_notification_to_normalized(
                                     tool_name: name,
                                     input,
                                     output: None,
-                                    status: Some("started".to_string()),
+                                    status,
                                 },
                             ));
                         }
                         "tool_call_update" => {
                             let tool_call = update.get("toolCallUpdate").or_else(|| update.get("toolCall"));
-                            let id = tool_call.and_then(|tc| tc.get("id")).and_then(|v| v.as_str()).unwrap_or("").to_string();
-                            let output = tool_call.and_then(|tc| tc.get("output").or_else(|| tc.get("result"))).cloned();
-                            let status = tool_call.and_then(|tc| tc.get("status")).and_then(|v| v.as_str()).map(ToString::to_string);
+                            let id = update
+                                .get("toolCallId")
+                                .or_else(|| update.get("id"))
+                                .or_else(|| tool_call.and_then(|tc| tc.get("toolCallId").or_else(|| tc.get("id"))))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+
+                            let output = update
+                                .get("rawOutput")
+                                .or_else(|| update.get("output"))
+                                .or_else(|| update.get("result"))
+                                .or_else(|| update.get("content"))
+                                .or_else(|| tool_call.and_then(|tc| tc.get("rawOutput").or_else(|| tc.get("output")).or_else(|| tc.get("result")).or_else(|| tc.get("content"))))
+                                .cloned();
+
+                            let status = update
+                                .get("status")
+                                .or_else(|| tool_call.and_then(|tc| tc.get("status")))
+                                .and_then(|v| v.as_str())
+                                .map(ToString::to_string);
 
                             return Some(create_event(
                                 EventType::ToolResult,
@@ -184,14 +229,16 @@ pub fn gemini_server_request_to_normalized(
         let params = request.params.as_ref();
         let tool_call = params.and_then(|p| p.get("toolCall"));
         let tool_name = tool_call
-            .and_then(|tc| tc.get("name"))
+            .and_then(|tc| tc.get("title").or_else(|| tc.get("name")).or_else(|| tc.get("kind")))
             .and_then(|v| v.as_str())
             .unwrap_or("run_cmd")
             .to_string();
 
-        let description = tool_call
-            .and_then(|tc| tc.get("arguments"))
-            .and_then(|args| args.get("command").or_else(|| args.get("description")))
+        let input = tool_call
+            .and_then(|tc| tc.get("rawInput").or_else(|| tc.get("arguments")).or_else(|| tc.get("input")));
+
+        let description = input
+            .and_then(|args| args.get("command").or_else(|| args.get("description")).or_else(|| args.get("title")))
             .and_then(|v| v.as_str())
             .unwrap_or(&tool_name)
             .to_string();
@@ -310,6 +357,65 @@ mod tests {
             assert_eq!(description, "git status");
         } else {
             panic!("expected approval payload");
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_flattened_tool_call() {
+        let json_str = r#"{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_123",
+                "update": {
+                    "sessionUpdate": "tool_call",
+                    "toolCallId": "call-42",
+                    "title": "Run tests",
+                    "kind": "execute",
+                    "status": "pending",
+                    "rawInput": { "command": "npm test" }
+                }
+            }
+        }"#;
+        let notif: AcpNotification = serde_json::from_str(json_str).unwrap();
+        let event = gemini_notification_to_normalized(&notif, "conv_1", Some("sess_123")).unwrap();
+        assert_eq!(event.event_type, EventType::ToolStarted);
+        if let EventPayload::Tool { tool_id, tool_name, input, status, .. } = event.payload {
+            assert_eq!(tool_id, "call-42");
+            assert_eq!(tool_name, "Run tests");
+            assert_eq!(status, Some("pending".to_string()));
+            let inp = input.expect("expected input");
+            assert_eq!(inp.get("command").unwrap(), "npm test");
+        } else {
+            panic!("expected tool payload");
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_flattened_tool_call_update() {
+        let json_str = r#"{
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {
+                "sessionId": "sess_123",
+                "update": {
+                    "sessionUpdate": "tool_call_update",
+                    "toolCallId": "call-42",
+                    "status": "completed",
+                    "rawOutput": { "exitCode": 0, "stdout": "All tests passed" }
+                }
+            }
+        }"#;
+        let notif: AcpNotification = serde_json::from_str(json_str).unwrap();
+        let event = gemini_notification_to_normalized(&notif, "conv_1", Some("sess_123")).unwrap();
+        assert_eq!(event.event_type, EventType::ToolResult);
+        if let EventPayload::Tool { tool_id, output, status, .. } = event.payload {
+            assert_eq!(tool_id, "call-42");
+            assert_eq!(status, Some("completed".to_string()));
+            let out = output.expect("expected output");
+            assert_eq!(out.get("exitCode").unwrap(), 0);
+        } else {
+            panic!("expected tool payload");
         }
     }
 }

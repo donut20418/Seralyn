@@ -58,6 +58,24 @@ impl Provider for GeminiProvider {
     }
 
     async fn check_authentication(&self) -> Result<AuthStatus> {
+        if std::env::var("GEMINI_API_KEY").is_ok()
+            || std::env::var("GOOGLE_GENAI_USE_VERTEXAI").is_ok()
+            || std::env::var("GOOGLE_GENAI_USE_GCA").is_ok()
+        {
+            return Ok(AuthStatus::Authenticated {
+                username: Some("Gemini API Key".to_string()),
+                email: None,
+            });
+        }
+        if let Some(home) = dirs::home_dir() {
+            let creds = home.join(".gemini").join("oauth_creds.json");
+            if creds.exists() {
+                return Ok(AuthStatus::Authenticated {
+                    username: Some("Google Account".to_string()),
+                    email: None,
+                });
+            }
+        }
         Ok(AuthStatus::Unknown)
     }
 
@@ -85,11 +103,7 @@ impl Provider for GeminiProvider {
             PermissionMode::FullAccess => "yolo",
         };
 
-        let cwd_str = config
-            .working_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
+        let cwd_str = resolve_canonical_cwd(config.working_dir.as_deref());
 
         let spawn_config = SpawnConfig {
             executable: "gemini".to_string(),
@@ -114,6 +128,19 @@ impl Provider for GeminiProvider {
                 "clientCapabilities": {}
             }),
         ).await?;
+
+        // Optional authenticate if API key is provided
+        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+            let _ = transport.request(
+                "authenticate",
+                json!({
+                    "methodId": "gemini-api-key",
+                    "_meta": {
+                        "api-key": key
+                    }
+                }),
+            ).await;
+        }
 
         // Step 2: session/new request -> await response to extract real sessionId
         let new_resp = transport.request(
@@ -156,11 +183,7 @@ impl Provider for GeminiProvider {
             PermissionMode::FullAccess => "yolo",
         };
 
-        let cwd_str = config
-            .working_dir
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| ".".to_string());
+        let cwd_str = resolve_canonical_cwd(config.working_dir.as_deref());
 
         let spawn_config = SpawnConfig {
             executable: "gemini".to_string(),
@@ -185,6 +208,19 @@ impl Provider for GeminiProvider {
                 "clientCapabilities": {}
             }),
         ).await?;
+
+        // Optional authenticate if API key is provided
+        if let Ok(key) = std::env::var("GEMINI_API_KEY") {
+            let _ = transport.request(
+                "authenticate",
+                json!({
+                    "methodId": "gemini-api-key",
+                    "_meta": {
+                        "api-key": key
+                    }
+                }),
+            ).await;
+        }
 
         // Step 2: session/load request -> await response
         let _ = transport.request(
@@ -462,5 +498,47 @@ impl ProviderSession for GeminiSession {
 
     fn is_active(&self) -> bool {
         self.transport.is_active()
+    }
+}
+
+pub fn resolve_canonical_cwd(working_dir: Option<&std::path::Path>) -> String {
+    let resolved = match working_dir {
+        Some(path) => {
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else if let Ok(current) = std::env::current_dir() {
+                current.join(path)
+            } else {
+                path.to_path_buf()
+            }
+        }
+        None => std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+    };
+
+    let canonical = std::fs::canonicalize(&resolved).unwrap_or(resolved);
+    let s = canonical.to_string_lossy().to_string();
+    if let Some(stripped) = s.strip_prefix(r"\\?\") {
+        stripped.to_string()
+    } else {
+        s
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn test_resolve_canonical_cwd() {
+        let cwd_none = resolve_canonical_cwd(None);
+        assert!(!cwd_none.is_empty());
+        assert!(!cwd_none.starts_with(r"\\?\"));
+        assert!(Path::new(&cwd_none).is_absolute());
+
+        let cwd_cur = resolve_canonical_cwd(Some(Path::new(".")));
+        assert!(!cwd_cur.is_empty());
+        assert!(!cwd_cur.starts_with(r"\\?\"));
+        assert!(Path::new(&cwd_cur).is_absolute());
     }
 }
