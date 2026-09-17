@@ -9,7 +9,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{json, Value};
-use tokio::sync::{mpsc, Mutex, RwLock};
+use tokio::sync::{mpsc, Mutex, Notify, RwLock};
 
 use crate::app::conversation::context::format_context_for_prompt;
 use crate::app::error::Result;
@@ -242,6 +242,7 @@ impl Provider for GeminiProvider {
         );
 
         session.start_dispatcher();
+        session.wait_replay_quiescence(Duration::from_millis(500)).await;
 
         Ok(Box::new(session))
     }
@@ -257,7 +258,9 @@ pub struct GeminiSession {
     notif_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcNotification>>>>,
     server_req_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcServerRequest>>>>,
     pending_permissions: Arc<Mutex<HashMap<String, Vec<Value>>>>,
-    ignore_history_replay: Arc<AtomicBool>,
+    replay_complete: Arc<AtomicBool>,
+    replay_ready: Arc<Notify>,
+    is_resume: bool,
 }
 
 impl GeminiSession {
@@ -281,8 +284,24 @@ impl GeminiSession {
             notif_rx: Arc::new(Mutex::new(Some(notif_rx))),
             server_req_rx: Arc::new(Mutex::new(Some(server_req_rx))),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
-            ignore_history_replay: Arc::new(AtomicBool::new(is_resume)),
+            replay_complete: Arc::new(AtomicBool::new(!is_resume)),
+            replay_ready: Arc::new(Notify::new()),
+            is_resume,
         }
+    }
+
+    pub async fn wait_replay_quiescence(&self, timeout: Duration) {
+        if !self.replay_complete.load(Ordering::SeqCst) {
+            let notified = self.replay_ready.notified();
+            if !self.replay_complete.load(Ordering::SeqCst) {
+                let _ = tokio::time::timeout(timeout, notified).await;
+            }
+        }
+    }
+
+    pub fn mark_replay_complete(&self) {
+        self.replay_complete.store(true, Ordering::SeqCst);
+        self.replay_ready.notify_waiters();
     }
 
     pub fn start_dispatcher(&self) {
@@ -299,7 +318,44 @@ impl GeminiSession {
         let conv_id = self.conversation_id.clone();
         let session_id_holder = self.session_id.clone();
         let pending_permissions = self.pending_permissions.clone();
-        let ignore_history_replay = self.ignore_history_replay.clone();
+        let replay_complete = self.replay_complete.clone();
+        let replay_ready = self.replay_ready.clone();
+        let is_resume = self.is_resume;
+
+        let (activity_tx, mut activity_rx) = mpsc::channel::<()>(100);
+
+        if is_resume {
+            let replay_complete_clone = replay_complete.clone();
+            let replay_ready_clone = replay_ready.clone();
+
+            tokio::spawn(async move {
+                let quiet_duration = Duration::from_millis(250);
+                let max_duration = Duration::from_millis(2000);
+                let start = tokio::time::Instant::now();
+
+                loop {
+                    if start.elapsed() >= max_duration {
+                        break;
+                    }
+
+                    tokio::select! {
+                        act = activity_rx.recv() => {
+                            if act.is_none() {
+                                break;
+                            }
+                            // Activity detected, continue loop to wait for full quiet window
+                        }
+                        _ = tokio::time::sleep(quiet_duration) => {
+                            // Replay notifications are quiet, replay phase finished
+                            break;
+                        }
+                    }
+                }
+
+                replay_complete_clone.store(true, Ordering::SeqCst);
+                replay_ready_clone.notify_waiters();
+            });
+        }
 
         tokio::spawn(async move {
             let mut notif_rx = match notif_rx_opt {
@@ -326,10 +382,17 @@ impl GeminiSession {
                             &conv_id,
                             current_sid.as_deref(),
                         ) {
-                            if ignore_history_replay.load(Ordering::SeqCst) {
-                                if event.event_type == crate::app::events::EventType::TextDelta || 
-                                   event.event_type == crate::app::events::EventType::ThinkingDelta {
-                                    continue;
+                            if !replay_complete.load(Ordering::SeqCst) {
+                                match event.event_type {
+                                    crate::app::events::EventType::TextDelta |
+                                    crate::app::events::EventType::ThinkingDelta |
+                                    crate::app::events::EventType::ToolStarted |
+                                    crate::app::events::EventType::ToolProgress |
+                                    crate::app::events::EventType::ToolResult => {
+                                        let _ = activity_tx.try_send(());
+                                        continue;
+                                    }
+                                    _ => {}
                                 }
                             }
                             let _ = event_sender.send(event).await;
@@ -383,7 +446,13 @@ impl ProviderSession for GeminiSession {
     async fn send(&self, message: ProviderMessage) -> Result<()> {
         let sid = self.session_id.read().await.clone().unwrap_or_default();
 
-        self.ignore_history_replay.store(false, Ordering::SeqCst);
+        // Resume replay barrier: ensure historical replay is complete before sending prompt
+        if !self.replay_complete.load(Ordering::SeqCst) {
+            let notified = self.replay_ready.notified();
+            if !self.replay_complete.load(Ordering::SeqCst) {
+                let _ = tokio::time::timeout(Duration::from_millis(2500), notified).await;
+            }
+        }
 
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
