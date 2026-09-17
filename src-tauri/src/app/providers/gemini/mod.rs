@@ -242,7 +242,7 @@ impl Provider for GeminiProvider {
         );
 
         session.start_dispatcher();
-        session.wait_replay_quiescence(Duration::from_millis(500)).await;
+        session.wait_replay_quiescence(Duration::from_millis(1000)).await;
 
         Ok(Box::new(session))
     }
@@ -329,9 +329,11 @@ impl GeminiSession {
             let replay_ready_clone = replay_ready.clone();
 
             tokio::spawn(async move {
+                let min_duration = Duration::from_millis(750);
                 let quiet_duration = Duration::from_millis(250);
-                let max_duration = Duration::from_millis(2000);
+                let max_duration = Duration::from_millis(2500);
                 let start = tokio::time::Instant::now();
+                let mut last_activity = start;
 
                 loop {
                     if start.elapsed() >= max_duration {
@@ -343,11 +345,14 @@ impl GeminiSession {
                             if act.is_none() {
                                 break;
                             }
-                            // Activity detected, continue loop to wait for full quiet window
+                            last_activity = tokio::time::Instant::now();
                         }
-                        _ = tokio::time::sleep(quiet_duration) => {
-                            // Replay notifications are quiet, replay phase finished
-                            break;
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                            if start.elapsed() >= min_duration
+                                && last_activity.elapsed() >= quiet_duration
+                            {
+                                break;
+                            }
                         }
                     }
                 }
@@ -450,7 +455,7 @@ impl ProviderSession for GeminiSession {
         if !self.replay_complete.load(Ordering::SeqCst) {
             let notified = self.replay_ready.notified();
             if !self.replay_complete.load(Ordering::SeqCst) {
-                let _ = tokio::time::timeout(Duration::from_millis(2500), notified).await;
+                let _ = tokio::time::timeout(Duration::from_millis(3000), notified).await;
             }
         }
 

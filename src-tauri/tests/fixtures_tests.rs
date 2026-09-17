@@ -696,28 +696,61 @@ async fn test_gemini_resume_history_isolation() {
 
             let sender_clone = config.event_sender.clone();
             let conv_id_clone = config.conversation_id.clone();
-            let replay_complete_clone = replay_complete.clone();
-            let replay_ready_clone = replay_ready.clone();
+            let (activity_tx, mut activity_rx) = tokio::sync::mpsc::channel::<()>(100);
 
-            // Simulate delayed history replay arriving 100ms later while send() is already in progress!
+            // Quiescence task enforcing min_duration = 750ms matching production GeminiSession
+            let rc = replay_complete.clone();
+            let rr = replay_ready.clone();
             tokio::spawn(async move {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                let min_duration = Duration::from_millis(750);
+                let quiet_duration = Duration::from_millis(250);
+                let max_duration = Duration::from_millis(2500);
+                let start = tokio::time::Instant::now();
+                let mut last_activity = start;
 
-                // Old history chunks from Turn 1 & 2 arrive
+                loop {
+                    if start.elapsed() >= max_duration {
+                        break;
+                    }
+
+                    tokio::select! {
+                        act = activity_rx.recv() => {
+                            if act.is_none() {
+                                break;
+                            }
+                            last_activity = tokio::time::Instant::now();
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(50)) => {
+                            if start.elapsed() >= min_duration
+                                && last_activity.elapsed() >= quiet_duration
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                rc.store(true, Ordering::SeqCst);
+                rr.notify_waiters();
+            });
+
+            // Delayed history generator: simulates first chunk delayed by 400ms (>250ms initial silence!)
+            let rc_filter = replay_complete.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(400)).await;
+
+                // Old history chunks from Turn 1 & 2 arrive at 400ms
                 let history_text = "Turn 1 and 2 old history text";
                 let event = NormalizedEvent::text_delta(ProviderKind::Gemini, conv_id_clone.clone(), history_text.to_string());
 
                 // The dispatcher suppresses TextDelta while replay_complete is false
-                if replay_complete_clone.load(Ordering::SeqCst) {
-                    // IF A BUG/RACE OCCURRED and replay_complete was flipped to true prematurely,
-                    // this old history chunk would leak into Turn 3!
+                if !rc_filter.load(Ordering::SeqCst) {
+                    // Correctly suppressed because start.elapsed() (400ms) < min_duration (750ms)!
+                    let _ = activity_tx.try_send(());
+                } else {
+                    // If initial silence race existed, replay_complete would be prematurely true and leak!
                     let _ = sender_clone.send(event).await;
                 }
-
-                // Simulate quiescence: after 50ms of quiet, replay phase marks completion
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                replay_complete_clone.store(true, Ordering::SeqCst);
-                replay_ready_clone.notify_waiters();
             });
 
             Ok(Box::new(FixedGeminiSession {

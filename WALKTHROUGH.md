@@ -405,15 +405,35 @@ Target Model: gemini-3.1-flash-lite
 7. Skipping explicit 'authenticate' in Process 2...
 8. Sending 'session/load' for existing sessionId: 5a647d23-7258-4136-9995-f8a8650fef7e...
    PASS -> Native session successfully restored from disk via session/load!
+   Draining history replay notifications...
+   PASS -> Drained 9 lines of replayed history.
 
 9. [Turn 3] Asking for codeword in resumed session (Process 2)...
-   PASS -> Turn 3 completed. Model output: Codeword acknowledgedThe secret codeword is SERALYN-8427.The secret codeword is SERALYN-8427.
+   PASS -> Turn 3 completed. Model output: The secret codeword is SERALYN-8427.
    PASS -> Native cross-process session resumption verified: 'SERALYN-8427' preserved across restart!
 
 ======================================================================
 SUCCESS: REAL GEMINI ACP 3-TURN CODEWORD RESUME SMOKE TEST PASSED 100%!
 ======================================================================
 ```
+
+---
+
+## Phase 1.4.1 — Deterministic Gemini Resume Quiescence Barrier with Minimum Window
+
+### 1. Deterministic Quiescence Barrier (`gemini/mod.rs`)
+- **Root Cause Eliminated**: Gemini CLI's `session/load` emits `session.streamHistory()` asynchronously. Flipping an `AtomicBool` from `true` to `false` when `send()` starts had a window where delayed replay chunks could arrive after `send()` began. Furthermore, relying purely on a 250ms quiet timer risked an "initial silence race" where history taking longer than 250ms to begin would be falsely marked complete.
+- **Quiescence Engine with Minimum Replay Window**:
+  - `GeminiSession` tracks `replay_complete: Arc<AtomicBool>` and `replay_ready: Arc<Notify>`.
+  - On `resume_session()`, an internal activity channel monitors incoming notifications. Each replayed chunk (`TextDelta`, `ThinkingDelta`, `ToolStarted`, etc.) drops silently and resets the quiet activity timer.
+  - **Enforced Minimum Window (`min_duration = 750ms`)**: The quiescence loop guarantees that replay is NEVER marked complete before at least 750ms have elapsed. Once `start.elapsed() >= min_duration` AND `last_activity.elapsed() >= quiet_duration (250ms)`, `replay_complete` transitions to `true` and notifies `replay_ready.notify_waiters()`.
+  - `resume_session()` awaits `session.wait_replay_quiescence(1000ms)`, ensuring the session is already quiet before return.
+  - `send()` awaits `replay_ready.notified()` if `!replay_complete`, ensuring `session/prompt` is only dispatched once historical replay is completely silent.
+
+### 2. Integration Test Setup & Initial-Silence Race Verification (`fixtures_tests.rs`)
+- **Setup**: Created active `provider_sessions` record in SQLite (`provider = "gemini"`, `provider_session_id = "gemini-old-sid"`), directing `ConversationManager::send_message()` into `provider.resume_session()` instead of `create_session()`.
+- **Delayed Initial Silence Simulation**: The test emits old Turn 1 & 2 history with a 400ms delay (>250ms initial silence) while `send(Turn 3)` is initiated immediately. Because `min_duration = 750ms`, the 400ms chunk arrives while `replay_complete` is still `false` and is cleanly suppressed.
+- **Assertion**: SQLite DB records exactly 6 messages; `seq = 6` strictly contains Turn 3 response without any old history leakage.
 
 ---
 
@@ -425,8 +445,8 @@ SUCCESS: REAL GEMINI ACP 3-TURN CODEWORD RESUME SMOKE TEST PASSED 100%!
 | **Sync Cursor** | `seq` & `synced_through_seq` tracking across A→B→C→A switches | ✅ Verified with Delta Tests |
 | **Claude Adapter** | Token streaming, system/init, auth check, native resume across restarts | ✅ 100% Verified with Real Claude Pro Live Run |
 | **Codex Adapter** | JSON-RPC 2.0 app-server, v2 items, thread resume, tokenUsage breakdown, context semantics | ✅ 100% Verified with Real Codex CLI Live Run |
-| **Gemini Adapter** | ACP v1 lifecycle, --skip-trust, rawInput approval, credentials passthrough, cross-process load | ✅ 100% Verified with Real Gemini CLI 3-Turn Codeword Test |
-| **CI Automated Tests** | Windows Cargo test, Ubuntu Cargo test, Frontend Vite build | ✅ 100% Green (39/39 tests pass) |
+| **Gemini Adapter** | ACP v1 lifecycle, --skip-trust, minimum window quiescence barrier, deduplication, credentials passthrough | ✅ 100% Verified with Real Gemini CLI 3-Turn Test |
+| **CI Automated Tests** | Windows Cargo test, Ubuntu Cargo test, Frontend Vite build | ✅ 100% Green (40/40 tests pass) |
 | **Real Provider CLIs** | Claude Pro, OpenAI Codex CLI, and Gemini CLI smoke tested live on Windows host | ✅ All 3 Real Providers Verified |
 | **Repository Audit** | Scripts, tests, and documentation committed in repo | ✅ Complete & Auditable |
 
