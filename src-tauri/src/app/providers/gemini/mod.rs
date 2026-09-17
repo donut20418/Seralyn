@@ -103,6 +103,7 @@ impl Provider for GeminiProvider {
             executable: "gemini".to_string(),
             args: vec![
                 "--acp".to_string(),
+                "--skip-trust".to_string(),
                 "--approval-mode".to_string(),
                 approval_mode.to_string(),
             ],
@@ -190,6 +191,7 @@ impl Provider for GeminiProvider {
             executable: "gemini".to_string(),
             args: vec![
                 "--acp".to_string(),
+                "--skip-trust".to_string(),
                 "--approval-mode".to_string(),
                 approval_mode.to_string(),
             ],

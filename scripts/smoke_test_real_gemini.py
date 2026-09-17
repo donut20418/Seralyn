@@ -13,6 +13,17 @@ print(f"Target CLI: {cmd}")
 env = os.environ.copy()
 api_key = env.get("GEMINI_API_KEY")
 
+# Check settings.json for user's configured auth method
+settings_path = os.path.expanduser("~/.gemini/settings.json")
+selected_method = "oauth-personal"
+if os.path.exists(settings_path):
+    try:
+        with open(settings_path, "r", encoding="utf-8") as f:
+            s = json.load(f)
+            selected_method = s.get("security", {}).get("auth", {}).get("selectedType", "oauth-personal")
+    except Exception:
+        pass
+
 if api_key:
     print("Authentication mode: Optional GEMINI_API_KEY override detected.")
     auth_params = {
@@ -22,10 +33,13 @@ if api_key:
         }
     }
 else:
-    print("Authentication mode: Defaulting to 'oauth-personal' (Log in with Google).")
+    print(f"Authentication mode: Using configured CLI method '{selected_method}'.")
     auth_params = {
-        "methodId": "oauth-personal"
+        "methodId": selected_method
     }
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 def read_until_response(proc, req_id, timeout_sec=30):
     t0 = time.time()
@@ -42,17 +56,14 @@ def read_until_response(proc, req_id, timeout_sec=30):
             continue
             
         line_str = line.strip()
-        if not line_str.startswith("{"):
+        idx = line_str.find("{")
+        if idx == -1:
             continue
             
         try:
-            data = json.loads(line_str)
+            data = json.loads(line_str[idx:])
         except json.JSONDecodeError:
             continue
-            
-        if data.get("id") == req_id:
-            resp = data
-            break
             
         # Collect streaming notifications
         if data.get("method") == "session/update":
@@ -67,6 +78,10 @@ def read_until_response(proc, req_id, timeout_sec=30):
                     accumulated_text.append(content)
             elif "content" in params and isinstance(params["content"], str):
                 accumulated_text.append(params["content"])
+                
+        if data.get("id") == req_id:
+            resp = data
+            break
                 
     return resp, "".join(accumulated_text), events
 
@@ -83,7 +98,7 @@ cwd = os.path.abspath(".")
 # ==========================================
 print("\n--- [Process 1] Initializing & Creating Session ---")
 p1 = subprocess.Popen(
-    [cmd, "--acp"],
+    [cmd, "--acp", "--skip-trust"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -187,7 +202,7 @@ time.sleep(1)
 # ==========================================
 print("\n--- [Process 2] Spawning new process to verify Cross-Process session/load ---")
 p2 = subprocess.Popen(
-    [cmd, "--acp"],
+    [cmd, "--acp", "--skip-trust"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
