@@ -161,23 +161,44 @@ pub fn codex_notification_to_normalized(
             if let Some(params) = &notification.params {
                 let usage_val = params.get("tokenUsage").or_else(|| params.get("usage"));
                 if let Some(u) = usage_val {
-                    let prompt_tokens = u
-                        .get("promptTokens")
-                        .or_else(|| u.get("prompt_tokens"))
-                        .or_else(|| u.get("input_tokens"))
+                    let last = u.get("last");
+                    let total = u.get("total");
+                    let model_context_window = u
+                        .get("modelContextWindow")
+                        .or_else(|| params.get("modelContextWindow"))
                         .and_then(|v| v.as_u64());
-                    let completion_tokens = u
-                        .get("completionTokens")
-                        .or_else(|| u.get("completion_tokens"))
-                        .or_else(|| u.get("output_tokens"))
+
+                    let source_last = last.unwrap_or(u);
+
+                    let prompt_tokens = source_last
+                        .get("inputTokens")
+                        .or_else(|| source_last.get("promptTokens"))
+                        .or_else(|| source_last.get("prompt_tokens"))
+                        .or_else(|| source_last.get("input_tokens"))
                         .and_then(|v| v.as_u64());
-                    let total_tokens = u
-                        .get("totalTokens")
-                        .or_else(|| u.get("total_tokens"))
+
+                    let completion_tokens = source_last
+                        .get("outputTokens")
+                        .or_else(|| source_last.get("completionTokens"))
+                        .or_else(|| source_last.get("completion_tokens"))
+                        .or_else(|| source_last.get("output_tokens"))
                         .and_then(|v| v.as_u64());
-                    let cache_tokens = u
+
+                    let cache_tokens = source_last
                         .get("cachedInputTokens")
-                        .or_else(|| u.get("cache_read_tokens"))
+                        .or_else(|| source_last.get("cache_read_tokens"))
+                        .and_then(|v| v.as_u64());
+
+                    let reasoning_tokens = source_last
+                        .get("reasoningOutputTokens")
+                        .or_else(|| source_last.get("reasoning_output_tokens"))
+                        .or_else(|| source_last.get("reasoning_tokens"))
+                        .and_then(|v| v.as_u64());
+
+                    let context_tokens = total
+                        .and_then(|t| t.get("totalTokens").or_else(|| t.get("total_tokens")))
+                        .or_else(|| u.get("totalTokens"))
+                        .or_else(|| u.get("total_tokens"))
                         .and_then(|v| v.as_u64());
 
                     event.event_type = EventType::UsageUpdated;
@@ -185,9 +206,9 @@ pub fn codex_notification_to_normalized(
                         input_tokens: prompt_tokens,
                         output_tokens: completion_tokens,
                         cache_read_tokens: cache_tokens,
-                        reasoning_tokens: None,
-                        context_tokens: total_tokens,
-                        context_window: None,
+                        reasoning_tokens,
+                        context_tokens,
+                        context_window: model_context_window,
                         confidence: TokenConfidence::Exact,
                     };
                     return Some(event);
@@ -324,6 +345,61 @@ mod tests {
 
     #[test]
     fn test_parse_codex_token_usage_updated() {
+        let line = r#"{
+            "jsonrpc": "2.0",
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "th_123",
+                "tokenUsage": {
+                    "last": {
+                        "inputTokens": 150,
+                        "cachedInputTokens": 30,
+                        "outputTokens": 45,
+                        "reasoningOutputTokens": 10,
+                        "totalTokens": 205
+                    },
+                    "total": {
+                        "inputTokens": 300,
+                        "cachedInputTokens": 60,
+                        "outputTokens": 90,
+                        "reasoningOutputTokens": 20,
+                        "totalTokens": 410
+                    },
+                    "modelContextWindow": 200000
+                }
+            }
+        }"#;
+        let msg = parse_codex_line(line).unwrap().unwrap();
+        match msg {
+            CodexMessage::Notification(not) => {
+                let event = codex_notification_to_normalized(&not, "c1", Some("th_123")).unwrap();
+                assert_eq!(event.event_type, EventType::UsageUpdated);
+                if let EventPayload::Usage {
+                    input_tokens,
+                    output_tokens,
+                    cache_read_tokens,
+                    reasoning_tokens,
+                    context_tokens,
+                    context_window,
+                    confidence,
+                } = event.payload {
+                    assert_eq!(input_tokens, Some(150));
+                    assert_eq!(output_tokens, Some(45));
+                    assert_eq!(cache_read_tokens, Some(30));
+                    assert_eq!(reasoning_tokens, Some(10));
+                    assert_eq!(context_tokens, Some(410));
+                    assert_eq!(context_window, Some(200000));
+                    assert_eq!(confidence, TokenConfidence::Exact);
+                } else {
+                    panic!("expected usage payload");
+                }
+            }
+            _ => panic!("expected notification"),
+        }
+    }
+
+    #[test]
+    fn test_parse_codex_token_usage_updated_flat_fallback() {
         let line = r#"{"jsonrpc":"2.0","method":"thread/tokenUsage/updated","params":{"threadId":"th_123","tokenUsage":{"promptTokens":150,"completionTokens":45,"totalTokens":195,"cachedInputTokens":30}}}"#;
         let msg = parse_codex_line(line).unwrap().unwrap();
         match msg {

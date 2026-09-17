@@ -257,7 +257,7 @@ pub fn gemini_server_request_to_normalized(
                 approval_id,
                 tool_name,
                 description,
-                input: tool_call.and_then(|tc| tc.get("arguments")).cloned(),
+                input: input.cloned(),
             },
         ));
     }
@@ -416,6 +416,37 @@ mod tests {
             assert_eq!(out.get("exitCode").unwrap(), 0);
         } else {
             panic!("expected tool payload");
+        }
+    }
+
+    #[test]
+    fn test_parse_gemini_server_request_approval_raw_input() {
+        let json_str = r#"{
+            "jsonrpc": "2.0",
+            "id": 99,
+            "method": "session/request_permission",
+            "params": {
+                "sessionId": "sess_123",
+                "toolCall": {
+                    "toolCallId": "call-99",
+                    "title": "Execute Command",
+                    "rawInput": {
+                        "command": "cargo test --workspace"
+                    }
+                }
+            }
+        }"#;
+        let req: AcpRequest = serde_json::from_str(json_str).unwrap();
+        let event = gemini_server_request_to_normalized(&req, "conv_1", Some("sess_123")).unwrap();
+        assert_eq!(event.event_type, EventType::ApprovalRequired);
+        if let EventPayload::Approval { approval_id, tool_name, description, input } = event.payload {
+            assert_eq!(approval_id, "99");
+            assert_eq!(tool_name, "Execute Command");
+            assert_eq!(description, "cargo test --workspace");
+            let inp = input.expect("expected rawInput in payload");
+            assert_eq!(inp.get("command").unwrap(), "cargo test --workspace");
+        } else {
+            panic!("expected approval payload");
         }
     }
 }
