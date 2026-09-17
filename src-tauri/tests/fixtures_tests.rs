@@ -614,3 +614,147 @@ async fn test_claude_full_lifecycle_with_restart_and_native_resume() {
     assert_eq!(msgs3[5].role, "assistant");
     assert_eq!(msgs3[5].seq, 6);
 }
+
+#[tokio::test]
+async fn test_gemini_resume_history_isolation() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
+    use seralyn_lib::app::db::messages;
+    use seralyn_lib::app::db::Database;
+
+    struct FixedGeminiSession {
+        event_sender: tokio::sync::mpsc::Sender<NormalizedEvent>,
+        conv_id: String,
+        native_sid: String,
+        ignore_history_replay: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for FixedGeminiSession {
+        async fn send(&self, msg: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+            // Turn off the history ignore flag before sending prompt, exactly like the real GeminiSession does
+            self.ignore_history_replay.store(false, Ordering::SeqCst);
+
+            let sender = self.event_sender.clone();
+            let conv_id = self.conv_id.clone();
+            let response_text = format!("Turn 3 Response. Codeword was {}", msg.content);
+            
+            tokio::spawn(async move {
+                let delta = NormalizedEvent::text_delta(ProviderKind::Gemini, conv_id.clone(), response_text);
+                let _ = sender.send(delta).await;
+                
+                let finish = NormalizedEvent::session_finished(ProviderKind::Gemini, conv_id);
+                let _ = sender.send(finish).await;
+            });
+            Ok(())
+        }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        fn native_session_id(&self) -> Option<String> { Some(self.native_sid.clone()) }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: ProviderKind::Gemini,
+                native_session_id: Some(self.native_sid.clone()),
+                model: Some("gemini-3.1-flash-lite".to_string()),
+                created_at: String::new(),
+            }
+        }
+        fn is_active(&self) -> bool { true }
+    }
+
+    struct MockGeminiProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for MockGeminiProvider {
+        fn kind(&self) -> ProviderKind { ProviderKind::Gemini }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, _config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            unimplemented!("Test focuses on resume_session")
+        }
+        async fn resume_session(&self, native_session_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            let ignore_flag = Arc::new(AtomicBool::new(true)); // initialized to true for resume
+            let ignore_clone = ignore_flag.clone();
+            let sender = config.event_sender.clone();
+            let conv_id = config.conversation_id.clone();
+            
+            // Spawn the "dispatcher" that receives streamHistory events
+            tokio::spawn(async move {
+                // Simulate receiving the streamHistory dump of Turn 1 and Turn 2 immediately after resume!
+                // Real Gemini CLI does this immediately without awaiting.
+                let history_text = "Turn 1 and 2 old history text";
+                let event = NormalizedEvent::text_delta(ProviderKind::Gemini, conv_id.clone(), history_text.to_string());
+                
+                // If the ignore flag is true, drop it (this simulates our fix). 
+                // If we didn't drop it, ConversationManager would record it!
+                if !ignore_clone.load(Ordering::SeqCst) {
+                    let _ = sender.send(event).await;
+                }
+            });
+
+            Ok(Box::new(FixedGeminiSession {
+                event_sender: config.event_sender,
+                conv_id: config.conversation_id,
+                native_sid: native_session_id.to_string(),
+                ignore_history_replay: ignore_flag,
+            }))
+        }
+    }
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Gemini, Arc::new(MockGeminiProvider) as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    
+    // Simulate pre-existing conversation in SQLite (Turns 1 & 2)
+    let conv = manager.create_conversation(Some("History Isolation Test")).unwrap();
+    messages::create_message(&db, &conv.id, None, "user", "Turn 1 Prompt", None, None, None, None).unwrap(); // seq 1
+    messages::create_message(&db, &conv.id, None, "assistant", "Turn 1 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap(); // seq 2
+    messages::create_message(&db, &conv.id, None, "user", "Turn 2 Prompt", None, None, None, None).unwrap(); // seq 3
+    messages::create_message(&db, &conv.id, None, "assistant", "Turn 2 Response", Some("gemini"), Some("gemini-3.1-flash-lite"), Some("gemini-old-sid"), None).unwrap(); // seq 4
+
+    // Trigger Turn 3 via ConversationManager, which calls resume_session
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<NormalizedEvent>(10);
+    
+    // Wait briefly before sending the prompt to ensure the "dispatcher" had time to try sending the bad history
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    manager.send_message(&conv.id, "Turn 3 Prompt", ProviderKind::Gemini, tx).await.unwrap();
+
+    let mut turn3_result = String::new();
+    while let Some(ev) = rx.recv().await {
+        if let EventPayload::Text { content } = ev.payload {
+            turn3_result.push_str(&content);
+        }
+        if ev.event_type == EventType::SessionFinished {
+            break;
+        }
+    }
+    
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Verify DB
+    let all_msgs = messages::get_messages(&db, &conv.id).unwrap();
+    assert_eq!(all_msgs.len(), 6, "Should have exactly 6 messages (3 user, 3 assistant)");
+    
+    assert_eq!(all_msgs[4].role, "user");
+    assert_eq!(all_msgs[4].seq, 5);
+    
+    assert_eq!(all_msgs[5].role, "assistant");
+    assert_eq!(all_msgs[5].seq, 6);
+    
+    // The critical assertion: the turn 3 assistant message must ONLY contain Turn 3 text, NOT "old history text"
+    assert_eq!(all_msgs[5].content, turn3_result);
+    assert!(!all_msgs[5].content.contains("old history text"), "Failed deduplication: Turn 3 contains leaked history!");
+}

@@ -39,18 +39,31 @@ else:
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 
-def read_until_response(proc, req_id, timeout_sec=30):
+import queue
+import threading
+
+def start_reader_thread(proc):
+    q = queue.Queue()
+    def reader():
+        while True:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            q.put(line)
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    return q
+
+def read_until_response(q, req_id, timeout_sec=30):
     t0 = time.time()
     resp = None
     accumulated_text = []
     events = []
     
     while time.time() - t0 < timeout_sec:
-        line = proc.stdout.readline()
-        if not line:
-            if proc.poll() is not None:
-                break
-            time.sleep(0.05)
+        try:
+            line = q.get(timeout=0.1)
+        except queue.Empty:
             continue
             
         line_str = line.strip()
@@ -83,6 +96,18 @@ def read_until_response(proc, req_id, timeout_sec=30):
                 
     return resp, "".join(accumulated_text), events
 
+def drain_queue(q, timeout_sec=2.0):
+    t0 = time.time()
+    drained_lines = 0
+    while time.time() - t0 < timeout_sec:
+        try:
+            _ = q.get(timeout=0.1)
+            drained_lines += 1
+            t0 = time.time() # reset timeout as long as we keep getting lines
+        except queue.Empty:
+            pass
+    return drained_lines
+
 def send_msg(proc, msg):
     raw = json.dumps(msg) + "\n"
     proc.stdin.write(raw)
@@ -107,6 +132,7 @@ p1 = subprocess.Popen(
     bufsize=1,
     env=env
 )
+q1 = start_reader_thread(p1)
 
 # 1. Initialize
 print("1. Sending 'initialize'...")
@@ -119,7 +145,7 @@ send_msg(p1, {
         "clientCapabilities": {}
     }
 })
-init_resp, _, _ = read_until_response(p1, 1, timeout_sec=10)
+init_resp, _, _ = read_until_response(q1, 1, timeout_sec=10)
 assert init_resp is not None, "Failed to get initialize response from Process 1"
 assert "error" not in init_resp, f"Initialize returned error: {init_resp.get('error')}"
 res = init_resp.get("result", {})
@@ -135,7 +161,7 @@ if auth_params:
         "method": "authenticate",
         "params": auth_params
     })
-    auth_resp, _, _ = read_until_response(p1, 2, timeout_sec=10)
+    auth_resp, _, _ = read_until_response(q1, 2, timeout_sec=10)
     assert auth_resp is not None, "Failed to get authenticate response from Process 1"
     assert "error" not in auth_resp, f"Authenticate returned error: {auth_resp.get('error')}"
     print("   PASS -> Authentication verified successfully by Gemini ACP.")
@@ -153,7 +179,7 @@ send_msg(p1, {
         "mcpServers": []
     }
 })
-new_resp, _, _ = read_until_response(p1, 3, timeout_sec=10)
+new_resp, _, _ = read_until_response(q1, 3, timeout_sec=10)
 assert new_resp is not None, "Failed to get session/new response from Process 1"
 assert "error" not in new_resp, f"session/new returned error: {new_resp.get('error')}"
 session_id = new_resp.get("result", {}).get("sessionId")
@@ -171,7 +197,7 @@ send_msg(p1, {
         "prompt": [{"type": "text", "text": f"Please remember this secret codeword: {CODEWORD}. Respond only with: 'Codeword acknowledged'."}]
     }
 })
-prompt_resp1, text1, _ = read_until_response(p1, 4, timeout_sec=40)
+prompt_resp1, text1, _ = read_until_response(q1, 4, timeout_sec=40)
 assert prompt_resp1 is not None, "Timed out waiting for Turn 1 prompt response"
 assert "error" not in prompt_resp1, f"Turn 1 prompt returned error: {prompt_resp1.get('error')}"
 print(f"   PASS -> Turn 1 completed. Model output: {text1.strip()[:100]}")
@@ -187,7 +213,7 @@ send_msg(p1, {
         "prompt": [{"type": "text", "text": "What is the secret codeword I asked you to remember?"}]
     }
 })
-prompt_resp2, text2, _ = read_until_response(p1, 5, timeout_sec=40)
+prompt_resp2, text2, _ = read_until_response(q1, 5, timeout_sec=40)
 assert prompt_resp2 is not None, "Timed out waiting for Turn 2 prompt response"
 assert "error" not in prompt_resp2, f"Turn 2 prompt returned error: {prompt_resp2.get('error')}"
 print(f"   PASS -> Turn 2 completed. Model output: {text2.strip()}")
@@ -223,6 +249,7 @@ p2 = subprocess.Popen(
     bufsize=1,
     env=env
 )
+q2 = start_reader_thread(p2)
 
 print("6. Sending 'initialize' to Process 2...")
 send_msg(p2, {
@@ -234,7 +261,7 @@ send_msg(p2, {
         "clientCapabilities": {}
     }
 })
-init_resp2, _, _ = read_until_response(p2, 1, timeout_sec=10)
+init_resp2, _, _ = read_until_response(q2, 1, timeout_sec=10)
 assert init_resp2 is not None and "error" not in init_resp2, f"P2 initialize failed: {init_resp2}"
 
 # 7. Authenticate Process 2 (optional override)
@@ -246,7 +273,7 @@ if auth_params:
         "method": "authenticate",
         "params": auth_params
     })
-    auth_resp2, _, _ = read_until_response(p2, 2, timeout_sec=10)
+    auth_resp2, _, _ = read_until_response(q2, 2, timeout_sec=10)
     assert auth_resp2 is not None and "error" not in auth_resp2, f"P2 authenticate failed: {auth_resp2}"
 else:
     print("7. Skipping explicit 'authenticate' in Process 2...")
@@ -262,10 +289,16 @@ send_msg(p2, {
         "mcpServers": []
     }
 })
-load_resp, _, _ = read_until_response(p2, 3, timeout_sec=15)
+load_resp, _, _ = read_until_response(q2, 3, timeout_sec=15)
 assert load_resp is not None, "Timed out waiting for session/load response"
 assert "error" not in load_resp, f"session/load returned error: {load_resp.get('error')}"
 print("   PASS -> Native session successfully restored from disk via session/load!")
+
+print("   Draining history replay notifications...")
+# Wait briefly to let Gemini flush history
+time.sleep(1.0)
+drained_lines = drain_queue(q2, timeout_sec=2.0)
+print(f"   PASS -> Drained {drained_lines} lines of replayed history.")
 
 print(f"\n9. [Turn 3] Asking for codeword in resumed session (Process 2)...")
 send_msg(p2, {
@@ -277,7 +310,7 @@ send_msg(p2, {
         "prompt": [{"type": "text", "text": "What was the secret codeword we established?"}]
     }
 })
-prompt_resp3, text3, _ = read_until_response(p2, 4, timeout_sec=40)
+prompt_resp3, text3, _ = read_until_response(q2, 4, timeout_sec=40)
 assert prompt_resp3 is not None, "Timed out waiting for Turn 3 prompt response"
 assert "error" not in prompt_resp3, f"Turn 3 prompt returned error: {prompt_resp3.get('error')}"
 print(f"   PASS -> Turn 3 completed. Model output: {text3.strip()}")

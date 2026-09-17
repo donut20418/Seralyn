@@ -2,6 +2,7 @@ pub mod parser;
 pub mod protocol;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -160,6 +161,7 @@ impl Provider for GeminiProvider {
             config.event_sender,
             notif_rx,
             server_req_rx,
+            false,
         );
 
         session.start_dispatcher();
@@ -236,6 +238,7 @@ impl Provider for GeminiProvider {
             config.event_sender,
             notif_rx,
             server_req_rx,
+            true,
         );
 
         session.start_dispatcher();
@@ -254,6 +257,7 @@ pub struct GeminiSession {
     notif_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcNotification>>>>,
     server_req_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcServerRequest>>>>,
     pending_permissions: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    ignore_history_replay: Arc<AtomicBool>,
 }
 
 impl GeminiSession {
@@ -265,6 +269,7 @@ impl GeminiSession {
         event_sender: mpsc::Sender<NormalizedEvent>,
         notif_rx: mpsc::Receiver<JsonRpcNotification>,
         server_req_rx: mpsc::Receiver<JsonRpcServerRequest>,
+        is_resume: bool,
     ) -> Self {
         Self {
             transport,
@@ -276,6 +281,7 @@ impl GeminiSession {
             notif_rx: Arc::new(Mutex::new(Some(notif_rx))),
             server_req_rx: Arc::new(Mutex::new(Some(server_req_rx))),
             pending_permissions: Arc::new(Mutex::new(HashMap::new())),
+            ignore_history_replay: Arc::new(AtomicBool::new(is_resume)),
         }
     }
 
@@ -293,6 +299,7 @@ impl GeminiSession {
         let conv_id = self.conversation_id.clone();
         let session_id_holder = self.session_id.clone();
         let pending_permissions = self.pending_permissions.clone();
+        let ignore_history_replay = self.ignore_history_replay.clone();
 
         tokio::spawn(async move {
             let mut notif_rx = match notif_rx_opt {
@@ -319,6 +326,12 @@ impl GeminiSession {
                             &conv_id,
                             current_sid.as_deref(),
                         ) {
+                            if ignore_history_replay.load(Ordering::SeqCst) {
+                                if event.event_type == crate::app::events::EventType::TextDelta || 
+                                   event.event_type == crate::app::events::EventType::ThinkingDelta {
+                                    continue;
+                                }
+                            }
                             let _ = event_sender.send(event).await;
                         }
                     }
@@ -369,6 +382,8 @@ impl GeminiSession {
 impl ProviderSession for GeminiSession {
     async fn send(&self, message: ProviderMessage) -> Result<()> {
         let sid = self.session_id.read().await.clone().unwrap_or_default();
+
+        self.ignore_history_replay.store(false, Ordering::SeqCst);
 
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
