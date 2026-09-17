@@ -62,18 +62,12 @@ impl Provider for GeminiProvider {
             || std::env::var("GOOGLE_GENAI_USE_VERTEXAI").is_ok()
             || std::env::var("GOOGLE_GENAI_USE_GCA").is_ok()
         {
-            return Ok(AuthStatus::Authenticated {
-                username: Some("Gemini API Key".to_string()),
-                email: None,
-            });
+            return Ok(AuthStatus::Authenticated);
         }
         if let Some(home) = dirs::home_dir() {
             let creds = home.join(".gemini").join("oauth_creds.json");
             if creds.exists() {
-                return Ok(AuthStatus::Authenticated {
-                    username: Some("Google Account".to_string()),
-                    email: None,
-                });
+                return Ok(AuthStatus::Authenticated);
             }
         }
         Ok(AuthStatus::Unknown)
