@@ -436,7 +436,7 @@ The test suite covers three distinct timing cases:
 1. **`test_gemini_resume_history_isolation` (400ms delayed first chunk)**: First history chunk arrives at 400ms (>250ms quiet window). Suppressed cleanly because `min_duration = 750ms`.
 2. **`test_gemini_resume_history_isolation_delayed_1000ms` (1000ms delayed first chunk)**: First history chunk arrives at 1000ms (>750ms min window). Suppressed cleanly because `seen_replay_activity` was `false` at 750ms and held the barrier open until activity was detected and quieted.
 3. **`test_gemini_resume_no_history_completes` (0 history events)**: Cleanly unblocks via `max_duration` without hanging or false failures.
-- **Assertions**: Across all scenarios, SQLite DB maintains strict turn sequence (`seq = 6`), and Turn 3 assistant response contains strictly Turn 3 output with 0 history leakage.
+- **Assertions**: Across all scenarios, the DB contains exactly the expected number/order of messages and no replay history leaks into the newly persisted assistant response.
 
 ---
 
