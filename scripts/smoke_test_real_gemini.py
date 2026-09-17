@@ -33,10 +33,8 @@ if api_key:
         }
     }
 else:
-    print(f"Authentication mode: Using configured CLI method '{selected_method}'.")
-    auth_params = {
-        "methodId": selected_method
-    }
+    print(f"Authentication mode: Using configured CLI credentials ('{selected_method}'). No explicit authenticate call needed.")
+    auth_params = None
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -93,12 +91,15 @@ def send_msg(proc, msg):
 CODEWORD = "SERALYN-8427"
 cwd = os.path.abspath(".")
 
+model = env.get("GEMINI_MODEL", "gemini-3.1-flash-lite")
+print(f"Target Model: {model}")
+
 # ==========================================
 # PROCESS 1: Session Creation & Turn 1 & 2
 # ==========================================
 print("\n--- [Process 1] Initializing & Creating Session ---")
 p1 = subprocess.Popen(
-    [cmd, "--acp", "--skip-trust"],
+    [cmd, "--acp", "--skip-trust", "-m", model],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -125,18 +126,21 @@ res = init_resp.get("result", {})
 agent_info = res.get("agentInfo", {})
 print(f"   PASS -> Agent: {agent_info.get('name')} v{agent_info.get('version')}, protocol: {res.get('protocolVersion')}")
 
-# 2. Authenticate
-print(f"2. Sending 'authenticate' ({auth_params['methodId']})...")
-send_msg(p1, {
-    "jsonrpc": "2.0",
-    "id": 2,
-    "method": "authenticate",
-    "params": auth_params
-})
-auth_resp, _, _ = read_until_response(p1, 2, timeout_sec=10)
-assert auth_resp is not None, "Failed to get authenticate response from Process 1"
-assert "error" not in auth_resp, f"Authenticate returned error: {auth_resp.get('error')}"
-print("   PASS -> Authentication verified successfully by Gemini ACP.")
+# 2. Authenticate (optional override)
+if auth_params:
+    print(f"2. Sending 'authenticate' ({auth_params['methodId']})...")
+    send_msg(p1, {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "authenticate",
+        "params": auth_params
+    })
+    auth_resp, _, _ = read_until_response(p1, 2, timeout_sec=10)
+    assert auth_resp is not None, "Failed to get authenticate response from Process 1"
+    assert "error" not in auth_resp, f"Authenticate returned error: {auth_resp.get('error')}"
+    print("   PASS -> Authentication verified successfully by Gemini ACP.")
+else:
+    print("2. Skipping explicit 'authenticate' (Gemini CLI will use configured credentials)...")
 
 # 3. Session New
 print("3. Sending 'session/new' with canonical cwd...")
@@ -193,16 +197,25 @@ print(f"   PASS -> Native memory verified in same session: '{CODEWORD}' found in
 # Terminate Process 1
 print("\n--- Terminating Process 1 (simulating process exit/crash) ---")
 p1.stdin.close()
-p1.terminate()
-p1.wait()
-time.sleep(1)
+try:
+    p1.wait(timeout=6)
+except subprocess.TimeoutExpired:
+    p1.terminate()
+    p1.wait()
+
+# Gemini CLI partitions session files by minute: session-YYYY-MM-DDTHH-mm-shortId.jsonl.
+# To prevent Process 2 startup initializer from colliding with Process 1's file in the same minute,
+# ensure Process 2 spawns across the minute boundary.
+p1_min = time.gmtime().tm_min
+while time.gmtime().tm_min == p1_min:
+    time.sleep(1)
 
 # ==========================================
 # PROCESS 2: Session Resumption & Turn 3
 # ==========================================
 print("\n--- [Process 2] Spawning new process to verify Cross-Process session/load ---")
 p2 = subprocess.Popen(
-    [cmd, "--acp", "--skip-trust"],
+    [cmd, "--acp", "--skip-trust", "-m", model],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,
@@ -224,15 +237,19 @@ send_msg(p2, {
 init_resp2, _, _ = read_until_response(p2, 1, timeout_sec=10)
 assert init_resp2 is not None and "error" not in init_resp2, f"P2 initialize failed: {init_resp2}"
 
-print(f"7. Sending 'authenticate' ({auth_params['methodId']}) to Process 2...")
-send_msg(p2, {
-    "jsonrpc": "2.0",
-    "id": 2,
-    "method": "authenticate",
-    "params": auth_params
-})
-auth_resp2, _, _ = read_until_response(p2, 2, timeout_sec=10)
-assert auth_resp2 is not None and "error" not in auth_resp2, f"P2 authenticate failed: {auth_resp2}"
+# 7. Authenticate Process 2 (optional override)
+if auth_params:
+    print(f"7. Sending 'authenticate' ({auth_params['methodId']}) to Process 2...")
+    send_msg(p2, {
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "authenticate",
+        "params": auth_params
+    })
+    auth_resp2, _, _ = read_until_response(p2, 2, timeout_sec=10)
+    assert auth_resp2 is not None and "error" not in auth_resp2, f"P2 authenticate failed: {auth_resp2}"
+else:
+    print("7. Skipping explicit 'authenticate' in Process 2...")
 
 print(f"8. Sending 'session/load' for existing sessionId: {session_id}...")
 send_msg(p2, {

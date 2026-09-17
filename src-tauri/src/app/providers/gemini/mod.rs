@@ -124,7 +124,7 @@ impl Provider for GeminiProvider {
             }),
         ).await?;
 
-        // Optional authenticate if API key is provided, else default to oauth-personal
+        // Optional authenticate if API key is explicitly provided in environment
         if let Ok(key) = std::env::var("GEMINI_API_KEY") {
             let _ = transport.request(
                 "authenticate",
@@ -133,13 +133,6 @@ impl Provider for GeminiProvider {
                     "_meta": {
                         "api-key": key
                     }
-                }),
-            ).await;
-        } else {
-            let _ = transport.request(
-                "authenticate",
-                json!({
-                    "methodId": "oauth-personal"
                 }),
             ).await;
         }
@@ -212,7 +205,7 @@ impl Provider for GeminiProvider {
             }),
         ).await?;
 
-        // Optional authenticate if API key is provided, else default to oauth-personal
+        // Optional authenticate if API key is explicitly provided in environment
         if let Ok(key) = std::env::var("GEMINI_API_KEY") {
             let _ = transport.request(
                 "authenticate",
@@ -221,13 +214,6 @@ impl Provider for GeminiProvider {
                     "_meta": {
                         "api-key": key
                     }
-                }),
-            ).await;
-        } else {
-            let _ = transport.request(
-                "authenticate",
-                json!({
-                    "methodId": "oauth-personal"
                 }),
             ).await;
         }
