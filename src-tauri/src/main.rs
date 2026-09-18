@@ -149,11 +149,24 @@ async fn update_conversation_title(
 #[tauri::command]
 async fn get_conversation_usage(
     conversation_id: String,
+    provider: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Option<UsageSnapshotRecord>, String> {
     state
         .conversation_manager
-        .get_conversation_usage(&conversation_id)
+        .get_conversation_usage(&conversation_id, provider.as_deref())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn delete_attachment(
+    conversation_id: String,
+    attachment_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .conversation_manager
+        .delete_attachment(&conversation_id, &attachment_id)
         .map_err(|e| e.to_string())
 }
 
@@ -229,7 +242,8 @@ fn main() {
             update_conversation_title,
             get_conversation_usage,
             interrupt_turn,
-            save_attachment
+            save_attachment,
+            delete_attachment
         ])
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {

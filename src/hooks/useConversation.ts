@@ -39,7 +39,7 @@ export function useConversation() {
     }
   }, []);
 
-  const selectConversation = useCallback(async (id: string) => {
+  const selectConversation = useCallback(async (id: string, provider?: ProviderKind) => {
     setIsLoading(true);
     setErrorMessage(null);
     try {
@@ -49,9 +49,9 @@ export function useConversation() {
       setMessages(messages);
       setProviderSessions(provider_sessions || []);
 
-      // Fetch latest usage snapshot
+      // Fetch latest usage snapshot scoped to provider
       try {
-        const usage = await api.getConversationUsage(id);
+        const usage = await api.getConversationUsage(id, provider);
         setCurrentUsage(usage);
       } catch (err) {
         console.warn('Could not fetch usage snapshot:', err);
@@ -63,6 +63,26 @@ export function useConversation() {
       setIsLoading(false);
     }
   }, []);
+
+  const fetchUsage = useCallback(async (convId?: string | null, provider?: ProviderKind) => {
+    const targetId = convId || currentConversationId;
+    if (!targetId) return;
+    try {
+      const usage = await api.getConversationUsage(targetId, provider);
+      setCurrentUsage(usage);
+    } catch (err) {
+      console.warn('Could not fetch usage snapshot:', err);
+    }
+  }, [currentConversationId]);
+
+  const deleteAttachment = useCallback(async (attachmentId: string) => {
+    if (!currentConversationId) return;
+    try {
+      await api.deleteAttachment(currentConversationId, attachmentId);
+    } catch (e) {
+      console.error('Failed to delete attachment:', e);
+    }
+  }, [currentConversationId]);
 
   const createNewConversation = useCallback(async (title?: string) => {
     try {
@@ -116,15 +136,6 @@ export function useConversation() {
     setPendingApproval(null);
     setErrorMessage(null);
 
-    // If attachments exist, format an attachment reference header in the content sent to the model
-    let formattedContent = content;
-    if (attachments.length > 0) {
-      const attachmentList = attachments
-        .map(a => `[Attached File: ${a.path} (${a.name}, ${(a.size / 1024).toFixed(1)} KB)]`)
-        .join('\n');
-      formattedContent = `${attachmentList}\n\n${content}`;
-    }
-
     // Optimistic UI for user message with strict seq assignment
     const lastSeq = messages.length > 0 ? messages[messages.length - 1].seq : 0;
     const tempUserMsg: Message = {
@@ -139,7 +150,7 @@ export function useConversation() {
     setMessages(prev => [...prev, tempUserMsg]);
 
     try {
-      await api.sendMessage(currentConversationId, formattedContent, provider, attachments);
+      await api.sendMessage(currentConversationId, content, provider, attachments);
     } catch (e) {
       console.error(e);
       setIsStreaming(false);
@@ -210,6 +221,24 @@ export function useConversation() {
               status: 'running',
             },
           ]);
+        }
+        break;
+
+      case 'ToolProgress':
+        if (event.payload.kind === 'Tool') {
+          const tool = event.payload;
+          setActiveTools(prev =>
+            prev.map(t =>
+              t.id === tool.tool_id
+                ? {
+                    ...t,
+                    output: tool.output !== undefined ? tool.output : t.output,
+                    progress: typeof tool.output === 'string' ? tool.output : (tool.status || 'Executing...'),
+                    status: 'running',
+                  }
+                : t
+            )
+          );
         }
         break;
 
@@ -297,6 +326,8 @@ export function useConversation() {
     renameConversation,
     sendMessage,
     uploadAttachment,
+    deleteAttachment,
+    fetchUsage,
     interrupt,
     respondToApproval,
     handleEvent,

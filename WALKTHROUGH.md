@@ -470,13 +470,16 @@ Phase 2 elevates Seralyn into a full-featured desktop experience on top of the P
 - Live pulsing brain/sparkle animation while the model streams reasoning tokens (`ThinkingDelta`).
 - Displays thought word count on turn completion, collapsible to minimize clutter.
 
-### 3. Live Tool Execution Visualization
+### 3. Live Tool Execution & Progress Visualization
 - **Component**: [`src/components/chat/ToolCard.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/ToolCard.tsx)
-- Interactive tool execution cards with status badges (Running spinner, Done checkmark, Error alert) and inspectable argument/result payloads.
+- Interactive tool execution cards with status badges (Running spinner, Done checkmark, Error alert).
+- Real-time `ToolProgress` event support displaying intermediate live execution output while running.
+- Inspectable argument/result payloads.
 
-### 4. Real-time Token & Context Usage Meter
+### 4. Real-time Token & Context Usage Meter (Provider-Scoped)
 - **Backend**: SQLite `usage_snapshots` table CRUD in [`src-tauri/src/app/db/usage_snapshots.rs`](file:///p:/asset_team/Seralyn/src-tauri/src/app/db/usage_snapshots.rs).
-- **Frontend**: [`src/components/chat/TokenMeter.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/TokenMeter.tsx) showing real-time Context Window progress bar (Green, Yellow, Orange, Red) and breakdown tooltip.
+- Scoped strictly by `provider` via join with `provider_sessions`: switching providers clears/updates context window to the active provider without displaying stale tokens from prior models.
+- **Frontend**: [`src/components/chat/TokenMeter.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/TokenMeter.tsx) showing real-time Context Window progress bar (Green <60%, Yellow 60-80%, Orange 80-90%, Red ≥90%) and breakdown tooltip.
 
 ### 5. Context Inspector & Session Resume Viewer
 - **Component**: [`src/components/chat/ContextInspector.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/ContextInspector.tsx)
@@ -485,24 +488,34 @@ Phase 2 elevates Seralyn into a full-featured desktop experience on top of the P
   2. **Sync Cursor**: Visualizes SQLite cursor state (`synced_through_seq` vs conversation `max_seq`).
   3. **Turn Tree**: Chronological message sequence `#seq`, roles, and timestamps.
 
-### 6. File Attachments System
-- Saved in `%LOCALAPPDATA%/Seralyn/attachments/{conversation_id}/`.
-- Chat input supports file selector, drag-and-drop, and chip preview.
+### 6. Hardened File Attachments System & Lifecycle
+- **Security Validation (P1)**:
+  - `conversation_id` verified as valid UUID format (`uuid::Uuid::parse_str`).
+  - Conversation existence verified in SQLite before saving files.
+  - Attachments root (`%LOCALAPPDATA%/Seralyn/attachments/`) canonicalized before joining IDs.
+  - Path traversal checks on both conversation directory and destination filepath (`starts_with` and `parent()` direct-child invariants).
+  - 25MB file size limit and filename sanitization (leaf extraction + character filtering).
+- **Disk Lifecycle & Cleanup**:
+  - `delete_attachment`: Removes draft files from disk when removed via composer chip.
+  - `delete_conversation`: Recursively purges the conversation's attachment directory upon deletion.
+  - Clean separation: SQLite `messages.content` retains pure user prompt text; attachment paths are formatted strictly inside `ProviderMessage.content` for subprocess execution.
 
 ### 7. Safe Mode Approval Dialog & Turn Interruption
 - [`ApprovalDialog.tsx`](file:///p:/asset_team/Seralyn/src/components/common/ApprovalDialog.tsx) for interactive tool execution authorization.
-- Context-sensitive Send/Stop button invoking `interrupt_turn`.
+- Context-sensitive Send/Stop button invoking `interrupt_turn` targeting the active `streamingProvider`.
 
 ### 8. Verification & Audit Table
 
 | Component | Implementation & Deliverables | Status |
 |---|---|---|
-| **Markdown & Syntax Highlighting** | `react-markdown` + `remark-gfm` + `prismjs` syntax highlighter with copy button | ✅ Built & Verified |
+| **Attachment Security (P1)** | UUID check + DB existence + root canonicalization + traversal defense + 25MB cap | ✅ Hardened with Automated Unit Tests |
+| **Tool Progress (P2.1)** | `ToolProgress` event pump + `ToolCard` live status badge and progress stream | ✅ Built & Verified |
+| **Provider-Scoped Meter (P2.2)** | `get_latest_usage_snapshot(..., provider)` + provider session join + isolation test | ✅ Built & Verified |
+| **Attachment Lifecycle (P2.3)** | Delete on conversation delete + draft remove on chip cancel + clean user message | ✅ Built & Verified |
+| **Markdown & Highlighting** | `react-markdown` + `remark-gfm` + `prismjs` syntax highlighter with copy button | ✅ Built & Verified |
 | **Thinking / Reasoning Drawer** | Collapsible `ThinkingAccordion` with live shimmer and SQLite metadata persistence | ✅ Built & Verified |
-| **Tool Execution Cards** | `ToolCard` tracking running/done/error states with argument/output inspector | ✅ Built & Verified |
-| **Token & Context Meter** | `TokenMeter` + `usage_snapshots.rs` (Green <60%, Yellow 60-80%, Orange 80-90%, Red ≥90%) | ✅ Built & Verified |
 | **Context Inspector Drawer** | `ContextInspector` with Native Sessions, Sync Cursor, and Turn Tree tabs | ✅ Built & Verified |
-| **File Attachments** | 25MB limit, path traversal defense, disk storage, and SQLite message metadata | ✅ Built & Verified |
-| **Safe Mode & Stop Control** | `ApprovalDialog` modal + provider-bound `interrupt_turn` with disabled provider selector during streaming | ✅ Built & Verified |
+| **Stop Control & Provider Lock** | Provider-bound `interrupt_turn` with disabled provider selector during streaming | ✅ Built & Verified |
 | **Provider Core Boundary** | Zero edits to `src-tauri/src/app/providers/{claude,codex,gemini}` (adapter core 100% frozen) | ✅ 100% Frozen & Preserved |
 | **Frontend Build** | `npm run build` (tsc + Vite production bundle, 2187 modules transformed) | ✅ 0 Errors (Exit code 0) |
+

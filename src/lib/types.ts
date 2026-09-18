@@ -75,6 +75,7 @@ export interface ToolCallState {
   tool_name: string;
   input?: any;
   output?: any;
+  progress?: string;
   status: 'running' | 'completed' | 'error';
 }
 

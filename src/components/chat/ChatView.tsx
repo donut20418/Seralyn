@@ -39,6 +39,7 @@ interface ChatViewProps {
   onSendMessage: (content: string, provider: ProviderKind, attachments: AttachmentInfo[]) => void;
   onInterrupt: () => void;
   onUploadAttachment: (file: File) => Promise<AttachmentInfo | null>;
+  onDeleteAttachment?: (id: string) => Promise<void> | void;
   onRespondToApproval: (approved: boolean) => void;
   onRenameConversation: (title: string) => void;
   onNewConversation: () => void;
@@ -64,6 +65,7 @@ export function ChatView({
   onSendMessage,
   onInterrupt,
   onUploadAttachment,
+  onDeleteAttachment,
   onRespondToApproval,
   onRenameConversation,
   onNewConversation,
@@ -176,6 +178,7 @@ export function ChatView({
           onSend={handleSend}
           onInterrupt={onInterrupt}
           onUploadAttachment={onUploadAttachment}
+          onDeleteAttachment={onDeleteAttachment}
           disabled={!conversationId && messages.length === 0}
           isStreaming={isStreaming}
           streamingProvider={streamingProvider}

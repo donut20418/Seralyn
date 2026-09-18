@@ -5,6 +5,7 @@ import { useConversation } from './hooks/useConversation';
 import { useProviders } from './hooks/useProviders';
 import { useEvents } from './hooks/useEvents';
 import { deleteConversation } from './lib/api';
+import type { ProviderKind } from './lib/types';
 
 export default function App() {
   const {
@@ -28,6 +29,8 @@ export default function App() {
     selectConversation,
     sendMessage,
     uploadAttachment,
+    deleteAttachment,
+    fetchUsage,
     interrupt,
     respondToApproval,
     handleEvent,
@@ -41,6 +44,17 @@ export default function App() {
     detectProviders();
     loadConversations();
   }, [detectProviders, loadConversations]);
+
+  const handleSelectProvider = (provider: ProviderKind) => {
+    setActiveProvider(provider);
+    if (currentConversationId) {
+      fetchUsage(currentConversationId, provider);
+    }
+  };
+
+  const handleSelectConversation = (id: string) => {
+    selectConversation(id, activeProvider);
+  };
 
   const handleDelete = async (id: string) => {
     try {
@@ -60,7 +74,7 @@ export default function App() {
       <Sidebar
         conversations={conversations}
         activeId={currentConversationId}
-        onSelect={selectConversation}
+        onSelect={handleSelectConversation}
         onNew={() => createNewConversation()}
         onDelete={handleDelete}
       />
@@ -81,10 +95,11 @@ export default function App() {
           onClearError={() => setErrorMessage(null)}
           providers={providers}
           activeProvider={activeProvider}
-          onSelectProvider={setActiveProvider}
+          onSelectProvider={handleSelectProvider}
           onSendMessage={sendMessage}
           onInterrupt={() => interrupt(streamingProvider || activeProvider)}
           onUploadAttachment={uploadAttachment}
+          onDeleteAttachment={deleteAttachment}
           onRespondToApproval={approved => respondToApproval(activeProvider, approved)}
           onRenameConversation={title => currentConversationId && renameConversation(currentConversationId, title)}
           onNewConversation={() => createNewConversation()}

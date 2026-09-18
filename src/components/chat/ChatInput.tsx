@@ -6,6 +6,7 @@ interface ChatInputProps {
   onSend: (content: string, attachments: AttachmentInfo[]) => void;
   onInterrupt: () => void;
   onUploadAttachment: (file: File) => Promise<AttachmentInfo | null>;
+  onDeleteAttachment?: (id: string) => Promise<void> | void;
   disabled: boolean;
   isStreaming: boolean;
   streamingProvider?: ProviderKind | null;
@@ -15,6 +16,7 @@ export function ChatInput({
   onSend,
   onInterrupt,
   onUploadAttachment,
+  onDeleteAttachment,
   disabled,
   isStreaming,
   streamingProvider,
@@ -77,8 +79,15 @@ export function ChatInput({
     processFiles(e.dataTransfer.files);
   };
 
-  const removeAttachment = (id: string) => {
+  const removeAttachment = async (id: string) => {
     setAttachments(prev => prev.filter(a => a.id !== id));
+    if (onDeleteAttachment) {
+      try {
+        await onDeleteAttachment(id);
+      } catch (err) {
+        console.warn('Failed to delete attachment from disk:', err);
+      }
+    }
   };
 
   return (

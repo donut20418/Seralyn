@@ -101,7 +101,19 @@ impl ConversationManager {
             let _ = entry.session.close().await;
         }
         
-        conversations::delete_conversation(&self.db, id)
+        let res = conversations::delete_conversation(&self.db, id)?;
+
+        if uuid::Uuid::parse_str(id).is_ok() {
+            let mut root_path = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+            root_path.push("Seralyn");
+            root_path.push("attachments");
+            let conv_dir = root_path.join(id);
+            if conv_dir.exists() {
+                let _ = std::fs::remove_dir_all(&conv_dir);
+            }
+        }
+
+        Ok(res)
     }
 
     pub async fn send_message(
@@ -363,8 +375,19 @@ impl ConversationManager {
             })
             .collect();
 
+        let provider_prompt = if !attachments.is_empty() {
+            let attachment_header = attachments
+                .iter()
+                .map(|a| format!("[Attached File: {} ({}, {:.1} KB)]", a.path, a.name, a.size as f64 / 1024.0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}\n\n{}", attachment_header, content)
+        } else {
+            content.to_string()
+        };
+
         let msg = ProviderMessage {
-            content: content.to_string(),
+            content: provider_prompt,
             context: context_delta,
             attachments: attachment_refs,
         };
@@ -410,8 +433,12 @@ impl ConversationManager {
         conversations::update_conversation_title(&self.db, id, title)
     }
 
-    pub fn get_conversation_usage(&self, conversation_id: &str) -> Result<Option<UsageSnapshotRecord>> {
-        usage_snapshots::get_latest_usage_snapshot(&self.db, conversation_id)
+    pub fn get_conversation_usage(
+        &self,
+        conversation_id: &str,
+        provider: Option<&str>,
+    ) -> Result<Option<UsageSnapshotRecord>> {
+        usage_snapshots::get_latest_usage_snapshot(&self.db, conversation_id, provider)
     }
 
     pub async fn interrupt_turn(
@@ -436,7 +463,14 @@ impl ConversationManager {
         file_data: &[u8],
         mime_type: Option<&str>,
     ) -> Result<AttachmentInfo> {
-        // 1. File size limit: 25 MB max
+        // 1. Validate conversation_id format (must be valid UUID)
+        uuid::Uuid::parse_str(conversation_id)
+            .map_err(|_| crate::app::error::AppError::InvalidInput("Invalid conversation id: must be a valid UUID".to_string()))?;
+
+        // 2. Validate that conversation exists in database
+        conversations::get_conversation(&self.db, conversation_id)?;
+
+        // 3. File size limit: 25 MB max
         const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
         if file_data.len() > MAX_ATTACHMENT_SIZE {
             return Err(crate::app::error::AppError::InvalidInput(format!(
@@ -445,7 +479,7 @@ impl ConversationManager {
             )));
         }
 
-        // 2. Filename sanitization: extract leaf and reject control / path separator characters
+        // 4. Filename sanitization: extract leaf and reject control / path separator characters
         let raw_leaf = std::path::Path::new(file_name)
             .file_name()
             .and_then(|n| n.to_str())
@@ -462,23 +496,33 @@ impl ConversationManager {
             sanitized.trim()
         };
 
+        // 5. Build and canonicalize attachments root directory first
+        let mut root_path = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        root_path.push("Seralyn");
+        root_path.push("attachments");
+        std::fs::create_dir_all(&root_path)?;
+        let canon_root = root_path.canonicalize()?;
+
+        let conv_dir = canon_root.join(conversation_id);
+        // Ensure conv_dir is strictly inside canon_root and is a direct child
+        if !conv_dir.starts_with(&canon_root) || conv_dir.parent() != Some(canon_root.as_path()) {
+            return Err(crate::app::error::AppError::InvalidInput(
+                "Path traversal attempt detected in conversation id".to_string(),
+            ));
+        }
+
+        std::fs::create_dir_all(&conv_dir)?;
+        let canon_conv_dir = conv_dir.canonicalize()?;
+
         let id = uuid::Uuid::new_v4().to_string();
-        let mut base_path = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        base_path.push("Seralyn");
-        base_path.push("attachments");
-        base_path.push(conversation_id);
-        std::fs::create_dir_all(&base_path)?;
-
         let dest_filename = format!("{}_{}", id, safe_name);
-        let dest_path = base_path.join(&dest_filename);
+        let dest_path = canon_conv_dir.join(&dest_filename);
 
-        // 3. Security: Path traversal check ensuring dest_path is strictly inside base_path
-        if let (Ok(canon_base), Ok(canon_parent)) = (base_path.canonicalize(), dest_path.parent().unwrap().canonicalize()) {
-            if canon_parent != canon_base {
-                return Err(crate::app::error::AppError::InvalidInput(
-                    "Path traversal attempt detected in attachment filename".to_string(),
-                ));
-            }
+        // Ensure dest_path is strictly inside canon_conv_dir
+        if dest_path.parent() != Some(canon_conv_dir.as_path()) || !dest_path.starts_with(&canon_conv_dir) {
+            return Err(crate::app::error::AppError::InvalidInput(
+                "Path traversal attempt detected in attachment filename".to_string(),
+            ));
         }
 
         std::fs::write(&dest_path, file_data)?;
@@ -494,6 +538,35 @@ impl ConversationManager {
         })
     }
 
+    pub fn delete_attachment(
+        &self,
+        conversation_id: &str,
+        attachment_id: &str,
+    ) -> Result<()> {
+        uuid::Uuid::parse_str(conversation_id)
+            .map_err(|_| crate::app::error::AppError::InvalidInput("Invalid conversation id".to_string()))?;
+        uuid::Uuid::parse_str(attachment_id)
+            .map_err(|_| crate::app::error::AppError::InvalidInput("Invalid attachment id".to_string()))?;
+
+        let mut root_path = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+        root_path.push("Seralyn");
+        root_path.push("attachments");
+        let conv_dir = root_path.join(conversation_id);
+
+        if conv_dir.exists() {
+            let canon_dir = conv_dir.canonicalize()?;
+            if let Ok(entries) = std::fs::read_dir(&canon_dir) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name().to_string_lossy().to_string();
+                    if file_name.starts_with(&format!("{}_", attachment_id)) {
+                        let _ = std::fs::remove_file(entry.path());
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub async fn close_all_sessions(&self) -> Result<()> {
         let sessions_to_close: Vec<Arc<dyn ProviderSession>> = {
             let mut sessions = self.active_sessions.lock().await;
@@ -503,5 +576,55 @@ impl ConversationManager {
             let _ = session.close().await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[tokio::test]
+    async fn test_save_attachment_security_and_lifecycle() {
+        let db = Arc::new(Database::new_in_memory().unwrap());
+        db.run_migrations().unwrap();
+        let provider_manager = Arc::new(crate::app::providers::ProviderManager::with_providers(HashMap::new()));
+        let manager = ConversationManager::new(db.clone(), provider_manager);
+
+        let conv = conversations::create_conversation(&db, Some("Attachment Security Test")).unwrap();
+
+        // 1. Path traversal in conversation_id -> REJECT
+        let err1 = manager.save_attachment("../../outside", "test.txt", b"content", None);
+        assert!(err1.is_err(), "Must reject traversal in conversation_id");
+
+        // 2. Non-existent conversation -> REJECT
+        let fake_id = uuid::Uuid::new_v4().to_string();
+        let err2 = manager.save_attachment(&fake_id, "test.txt", b"content", None);
+        assert!(err2.is_err(), "Must reject non-existent conversation");
+
+        // 3. File size limit > 25MB -> REJECT
+        let large_data = vec![0u8; 26 * 1024 * 1024];
+        let err3 = manager.save_attachment(&conv.id, "large.bin", &large_data, None);
+        assert!(err3.is_err(), "Must reject file larger than 25MB");
+
+        // 4. Traversal in filename -> leaf extracted & safe
+        let att_traversal = manager.save_attachment(&conv.id, "../../evil.txt", b"safe content", None).unwrap();
+        assert_eq!(att_traversal.name, "evil.txt");
+        assert!(std::path::Path::new(&att_traversal.path).exists());
+        // Clean up via delete_attachment
+        manager.delete_attachment(&conv.id, &att_traversal.id).unwrap();
+        assert!(!std::path::Path::new(&att_traversal.path).exists());
+
+        // 5. Valid attachment save, delete attachment, and delete conversation cleanup
+        let att = manager.save_attachment(&conv.id, "report.pdf", b"%PDF-1.4 test report", Some("application/pdf")).unwrap();
+        let att_path = std::path::PathBuf::from(&att.path);
+        assert!(att_path.exists());
+        let parent_dir = att_path.parent().unwrap().to_path_buf();
+        assert!(parent_dir.exists());
+
+        // Delete conversation cleans up the attachment directory from disk
+        manager.delete_conversation(&conv.id).await.unwrap();
+        assert!(!att_path.exists());
+        assert!(!parent_dir.exists());
     }
 }

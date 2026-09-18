@@ -58,6 +58,10 @@ export async function saveAttachment(conversationId: string, fileName: string, f
   return invoke('save_attachment', { conversationId, fileName, fileData, mimeType });
 }
 
-export async function getConversationUsage(conversationId: string): Promise<UsageSnapshot | null> {
-  return invoke('get_conversation_usage', { conversationId });
+export async function deleteAttachment(conversationId: string, attachmentId: string): Promise<void> {
+  return invoke('delete_attachment', { conversationId, attachmentId });
+}
+
+export async function getConversationUsage(conversationId: string, provider?: ProviderKind): Promise<UsageSnapshot | null> {
+  return invoke('get_conversation_usage', { conversationId, provider });
 }

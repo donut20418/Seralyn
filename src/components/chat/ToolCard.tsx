@@ -34,9 +34,9 @@ export function ToolCard({ tool }: ToolCardProps) {
         </div>
         <div className="tool-status">
           {tool.status === 'running' && (
-            <span className="status-badge running">
+            <span className="status-badge running" title={tool.progress}>
               <Loader2 size={13} className="spin" />
-              <span>Running</span>
+              <span>{tool.progress ? `Running: ${tool.progress}` : 'Running'}</span>
             </span>
           )}
           {tool.status === 'completed' && (
@@ -59,6 +59,12 @@ export function ToolCard({ tool }: ToolCardProps) {
 
       {expanded && (
         <div className="tool-details">
+          {tool.progress && tool.status === 'running' && (
+            <div className="tool-section">
+              <div className="tool-section-title">Live Progress:</div>
+              <pre className="tool-payload">{tool.progress}</pre>
+            </div>
+          )}
           {formattedInput && (
             <div className="tool-section">
               <div className="tool-section-title">Arguments:</div>
