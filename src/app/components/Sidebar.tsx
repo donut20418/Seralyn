@@ -37,6 +37,7 @@ interface Props {
   onToggleGroup: (id: string) => void;
   onCreateGroup: () => void;
   onOpenConnections: () => void;
+  userName?: string;
 }
 
 export function Sidebar({
@@ -53,6 +54,7 @@ export function Sidebar({
   onToggleGroup,
   onCreateGroup,
   onOpenConnections,
+  userName = "Workspace",
 }: Props) {
   const [query, setQuery] = useState("");
   const [menu, setMenu] = useState<MenuState | null>(null);
@@ -255,8 +257,8 @@ export function Sidebar({
       </div>
 
       <div className="sr-sidebar__foot">
-        <span className="sr-avatar">D</span>
-        <span style={{ fontSize: 12, color: "var(--sr-text-2)", flexGrow: 1 }}>dodoestar</span>
+        <span className="sr-avatar">{userName.charAt(0).toUpperCase()}</span>
+        <span style={{ fontSize: 12, color: "var(--sr-text-2)", flexGrow: 1 }}>{userName}</span>
         <button className="sr-icon-btn" style={{ width: 22, height: 22 }} aria-label="Providers and connections" onClick={onOpenConnections}>
           <Settings2 size={13} />
         </button>

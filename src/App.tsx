@@ -87,6 +87,7 @@ export default function App() {
     loadConversations,
     createNewConversation,
     renameConversation,
+    archiveConversation,
     selectConversation,
     sendMessage,
     uploadAttachment,
@@ -120,7 +121,7 @@ export default function App() {
   const [selection, setSelection] = useState<Selection>({
     provider: "claude",
     accountId: "claude-work",
-    modelId: "sonnet-5",
+    modelId: "claude-3-7-sonnet-latest",
     effort: "high",
   });
 
@@ -266,6 +267,15 @@ export default function App() {
 
   const handleRenameConversation = async (id: string, title: string) => {
     await renameConversation(id, title);
+  };
+
+  const handleArchiveConversation = async (id: string) => {
+    try {
+      await archiveConversation(id);
+    } catch (e) {
+      console.error("Archive conversation failed:", e);
+      setErrorMessage(String(e));
+    }
   };
 
   const handleDeleteConversation = async (id: string) => {
@@ -438,22 +448,34 @@ export default function App() {
   const uploadedAttachmentsRef = useRef<Map<string, AttachmentInfo>>(new Map());
 
   const handleSend = async (text: string, atts: AttachmentFile[]) => {
-    if (!currentConversationId) {
+    let targetConvId = currentConversationId;
+    if (!targetConvId) {
       const newConv = await createNewConversation();
       if (!newConv) return;
+      targetConvId = newConv.id;
     }
     const attInfos = atts
       .map((a) => uploadedAttachmentsRef.current.get(a.id))
       .filter((a): a is AttachmentInfo => a !== undefined);
-    await sendMessage(text, selection.provider, attInfos);
+    await sendMessage(
+      text,
+      selection.provider,
+      attInfos,
+      selection.modelId,
+      selection.accountId,
+      selection.effort ?? undefined,
+      targetConvId
+    );
   };
 
   const handleUploadFile = async (file: File): Promise<AttachmentFile> => {
-    if (!currentConversationId) {
+    let targetConvId = currentConversationId;
+    if (!targetConvId) {
       const newConv = await createNewConversation();
       if (!newConv) throw new Error("Could not create conversation");
+      targetConvId = newConv.id;
     }
-    const att = await uploadAttachment(file);
+    const att = await uploadAttachment(file, targetConvId);
     if (!att) throw new Error("Upload failed");
     uploadedAttachmentsRef.current.set(att.id, att);
     return {
@@ -486,6 +508,7 @@ export default function App() {
     output: currentUsage?.output_tokens ?? null,
     reasoning: currentUsage?.reasoning_tokens ?? null,
     cacheRead: currentUsage?.cache_read_tokens ?? null,
+    updatedAt: currentUsage?.created_at ?? null,
   };
 
   const accountUsage: AccountUsage[] = PROVIDER_ORDER.flatMap((pId) => {
@@ -556,7 +579,7 @@ export default function App() {
                 onRename={handleRenameConversation}
                 onTogglePin={togglePin}
                 onMoveToGroup={moveToGroup}
-                onArchive={handleDeleteConversation}
+                onArchive={handleArchiveConversation}
                 onDelete={handleDeleteConversation}
                 onToggleGroup={toggleGroup}
                 onCreateGroup={createGroup}
@@ -632,7 +655,7 @@ export default function App() {
               <span />
             </div>
             <div className="sr-browser" style={{ width: browserWidth }}>
-              <BrowserPanel url="localhost:5173/logs" onClose={() => setBrowserOpen(false)} />
+              <BrowserPanel url="http://localhost:5173" onClose={() => setBrowserOpen(false)} />
             </div>
           </>
         )}

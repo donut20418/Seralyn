@@ -1,8 +1,19 @@
 import { useState } from "react";
 import { Check, Copy, X } from "lucide-react";
 import { PROVIDER_ORDER, PROVIDERS } from "../data/providers";
-import { NATIVE_SESSIONS, SYNC_CURSORS } from "../data/mock";
 import type { Message, ProviderId, ProviderInfo } from "../types";
+
+const DEFAULT_NATIVE_SESSIONS: Record<ProviderId, string | null> = {
+  claude: null,
+  codex: null,
+  gemini: null,
+};
+
+const DEFAULT_SYNC_CURSORS: Record<ProviderId, { synced: number; current: number }> = {
+  claude: { synced: 0, current: 0 },
+  codex: { synced: 0, current: 0 },
+  gemini: { synced: 0, current: 0 },
+};
 
 function CopyRow({ label, value, color }: { label: string; value: string | null; color: string }) {
   const [copied, setCopied] = useState(false);
@@ -47,8 +58,8 @@ interface Props {
 export function Inspector({
   messages,
   onClose,
-  nativeSessions = NATIVE_SESSIONS,
-  syncCursors = SYNC_CURSORS,
+  nativeSessions = DEFAULT_NATIVE_SESSIONS,
+  syncCursors = DEFAULT_SYNC_CURSORS,
   providers = PROVIDERS,
 }: Props) {
   const maxSeq = messages.reduce((n, m) => Math.max(n, m.seq), 0);

@@ -122,6 +122,10 @@ impl ConversationManager {
         Ok(res)
     }
 
+    pub fn archive_conversation(&self, id: &str) -> Result<()> {
+        conversations::archive_conversation(&self.db, id)
+    }
+
     pub async fn send_message(
         &self,
         conversation_id: &str,
@@ -134,6 +138,9 @@ impl ConversationManager {
             content,
             provider_kind,
             vec![],
+            None,
+            None,
+            None,
             event_sender,
         )
         .await
@@ -145,6 +152,9 @@ impl ConversationManager {
         content: &str,
         provider_kind: ProviderKind,
         attachments: Vec<AttachmentInfo>,
+        model: Option<String>,
+        account: Option<String>,
+        effort: Option<String>,
         event_sender: mpsc::Sender<NormalizedEvent>,
     ) -> Result<()> {
         // 1. Save user message to DB with attachments in metadata -> returns user_msg with assigned sequence number
@@ -161,8 +171,7 @@ impl ConversationManager {
             "user",
             content,
             None,
-            None,
-            None,
+            model.as_deref(),
             None,
             user_metadata.as_deref(),
         )?;
@@ -194,22 +203,48 @@ impl ConversationManager {
             sessions.get(&session_key).cloned()
         };
 
-        let session: Arc<dyn ProviderSession> = if let Some(entry) = existing_entry {
+        let should_reuse_session = if let Some(ref entry) = existing_entry {
+            if let Some(ref req_model) = model {
+                if let Some(ref current_model) = entry.session.metadata().model {
+                    current_model == req_model
+                } else {
+                    true
+                }
+            } else {
+                true
+            }
+        } else {
+            false
+        };
+
+        let session: Arc<dyn ProviderSession> = if should_reuse_session {
+            let entry = existing_entry.unwrap();
             // Dynamic event routing: update active event sender to the new channel for this turn!
             let mut tx_guard = entry.event_tx.write().await;
             *tx_guard = Some(event_sender.clone());
             entry.session.clone()
         } else {
+            if let Some(entry) = existing_entry {
+                let _ = entry.session.close().await;
+            }
             // Creation/resumption happens OUTSIDE active_sessions lock!
             let (internal_tx, mut internal_rx) = mpsc::channel(100);
             
+            let mut env = HashMap::new();
+            if let Some(eff) = &effort {
+                env.insert("REASONING_EFFORT".to_string(), eff.clone());
+            }
+            if let Some(acc) = &account {
+                env.insert("PROVIDER_ACCOUNT".to_string(), acc.clone());
+            }
+
             let config = SessionConfig {
                 conversation_id: conversation_id.to_string(),
                 working_dir: None,
                 permission_mode: PermissionMode::Safe,
                 system_prompt: None,
-                model: None,
-                env: HashMap::new(),
+                model: model.clone(),
+                env,
                 event_sender: internal_tx,
             };
             
@@ -225,7 +260,7 @@ impl ConversationManager {
                                 conversation_id,
                                 &provider_str,
                                 sess.native_session_id().as_deref(),
-                                sess.metadata().model.as_deref(),
+                                model.as_deref().or(sess.metadata().model.as_deref()),
                             )?;
                             (sess, rec.id)
                         }
@@ -233,7 +268,14 @@ impl ConversationManager {
                 }
                 Some(record) => {
                     let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
-                    (sess, record.id.clone())
+                    let rec = provider_sessions::create_provider_session(
+                        &self.db,
+                        conversation_id,
+                        &provider_str,
+                        sess.native_session_id().as_deref(),
+                        model.as_deref().or(sess.metadata().model.as_deref()),
+                    )?;
+                    (sess, rec.id)
                 }
                 None => {
                     let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
@@ -242,7 +284,7 @@ impl ConversationManager {
                         conversation_id,
                         &provider_str,
                         sess.native_session_id().as_deref(),
-                        sess.metadata().model.as_deref(),
+                        model.as_deref().or(sess.metadata().model.as_deref()),
                     )?;
                     (sess, rec.id)
                 }

@@ -15,6 +15,18 @@ export function contextPercent(usage: ContextUsage): number | null {
   return Math.min(100, Math.round((usage.used / usage.window) * 100));
 }
 
+function formatUpdatedAgo(dateStr?: string | null): string {
+  if (!dateStr) return "recently";
+  const d = new Date(dateStr);
+  if (isNaN(d.getTime())) return "recently";
+  const diffSecs = Math.max(0, Math.floor((Date.now() - d.getTime()) / 1000));
+  if (diffSecs < 10) return "just now";
+  if (diffSecs < 60) return `${diffSecs}s ago`;
+  const diffMins = Math.floor(diffSecs / 60);
+  if (diffMins < 60) return `${diffMins}m ago`;
+  return `${Math.floor(diffMins / 60)}h ago`;
+}
+
 function Row({ label, value }: { label: string; value: number | null }) {
   return (
     <div className="sr-ctx__row">
@@ -135,7 +147,9 @@ export function ContextPopover({
             View detailed usage →
           </button>
           <span className="sr-spacer" />
-          <span style={{ fontSize: 10.5, color: "var(--sr-text-4)" }}>updated 40s ago</span>
+          <span style={{ fontSize: 10.5, color: "var(--sr-text-4)" }}>
+            updated {formatUpdatedAgo(usage.updatedAt)}
+          </span>
         </div>
       </div>
     </div>

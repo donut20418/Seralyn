@@ -60,12 +60,23 @@ async fn delete_conversation(id: String, state: State<'_, AppState>) -> Result<(
 }
 
 #[tauri::command]
+async fn archive_conversation(id: String, state: State<'_, AppState>) -> Result<(), String> {
+    state
+        .conversation_manager
+        .archive_conversation(&id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
 async fn send_message(
     app: AppHandle,
     conversation_id: String,
     content: String,
     provider: String,
     attachments: Option<Vec<AttachmentInfo>>,
+    model: Option<String>,
+    account: Option<String>,
+    effort: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let provider_kind = ProviderKind::from_str(&provider).map_err(|e| e.to_string())?;
@@ -88,6 +99,9 @@ async fn send_message(
             &content,
             provider_kind,
             attachments.unwrap_or_default(),
+            model,
+            account,
+            effort,
             tx,
         )
         .await
@@ -235,6 +249,7 @@ fn main() {
             list_conversations,
             get_conversation,
             delete_conversation,
+            archive_conversation,
             send_message,
             switch_provider,
             detect_providers,

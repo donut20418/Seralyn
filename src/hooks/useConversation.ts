@@ -110,12 +110,26 @@ export function useConversation() {
     }
   }, [currentConversationId, loadConversations]);
 
-  const uploadAttachment = useCallback(async (file: File): Promise<AttachmentInfo | null> => {
-    if (!currentConversationId) return null;
+  const archiveConversation = useCallback(async (id: string) => {
+    try {
+      await api.archiveConversation(id);
+      await loadConversations();
+      if (currentConversationId === id) {
+        await createNewConversation();
+      }
+    } catch (e) {
+      console.error(e);
+      setErrorMessage(String(e));
+    }
+  }, [currentConversationId, loadConversations, createNewConversation]);
+
+  const uploadAttachment = useCallback(async (file: File, conversationIdOverride?: string): Promise<AttachmentInfo | null> => {
+    const targetId = conversationIdOverride || currentConversationId;
+    if (!targetId) return null;
     try {
       const buffer = await file.arrayBuffer();
       const bytes = Array.from(new Uint8Array(buffer));
-      const info = await api.saveAttachment(currentConversationId, file.name, bytes, file.type);
+      const info = await api.saveAttachment(targetId, file.name, bytes, file.type);
       return info;
     } catch (e) {
       console.error('Failed to save attachment:', e);
@@ -127,9 +141,14 @@ export function useConversation() {
   const sendMessage = useCallback(async (
     content: string,
     provider: ProviderKind,
-    attachments: AttachmentInfo[] = []
+    attachments: AttachmentInfo[] = [],
+    model?: string,
+    account?: string,
+    effort?: string,
+    conversationIdOverride?: string
   ) => {
-    if (!currentConversationId) return;
+    const targetId = conversationIdOverride || currentConversationId;
+    if (!targetId) return;
     setIsStreaming(true);
     setStreamingProvider(provider);
     setStreamingContent('');
@@ -142,17 +161,18 @@ export function useConversation() {
     const lastSeq = messages.length > 0 ? messages[messages.length - 1].seq : 0;
     const tempUserMsg: Message = {
       id: Date.now().toString(),
-      conversation_id: currentConversationId,
+      conversation_id: targetId,
       seq: lastSeq + 1,
       role: 'user',
       content,
       created_at: new Date().toISOString(),
       attachments,
+      model,
     };
     setMessages(prev => [...prev, tempUserMsg]);
 
     try {
-      await api.sendMessage(currentConversationId, content, provider, attachments);
+      await api.sendMessage(targetId, content, provider, attachments, model, account, effort);
     } catch (e) {
       console.error(e);
       setIsStreaming(false);
@@ -326,6 +346,7 @@ export function useConversation() {
     selectConversation,
     createNewConversation,
     renameConversation,
+    archiveConversation,
     sendMessage,
     uploadAttachment,
     deleteAttachment,

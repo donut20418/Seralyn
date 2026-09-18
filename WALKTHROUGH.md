@@ -547,7 +547,58 @@ We integrated the complete developer workspace UI redesign from `C:\Users\md1002
 | **BrowserPanel** | `src/app/components/BrowserPanel.tsx` | Collapsible, resizable right-side preview/log panel. |
 
 ### 3. Verification & Build
-- `npm run build`: 1,912 modules transformed, built cleanly in 26.84s with 0 errors.
-- Working tree audit: All edits restricted to `src/` presentation and integration layer.
+- `npm run build`: 1,911 modules transformed, built cleanly with 0 errors.
+- Working tree audit: All edits restricted to `src/` presentation and integration layer, plus `src-tauri/src/main.rs` and `src-tauri/src/app/conversation/mod.rs`.
+- Provider Core: Zero edits to `src-tauri/src/app/providers/*` (100% frozen).
+
+---
+
+## Phase 2 External Audit Fixes & Complete Mock Elimination
+
+Following the external audit of commit `2bbc081`, all reported P1 items and mock presentation data were resolved and verified:
+
+### 1. Model / Account / Effort Wiring to CLI Backend
+- **Frontend Wiring**: `App.tsx` now passes `selection.modelId`, `selection.accountId`, and `selection.effort` via `useConversation.sendMessage` to `api.sendMessage`.
+- **Tauri IPC & Session Manager**:
+  - `send_message` Tauri command accepts `model: Option<String>`, `account: Option<String>`, and `effort: Option<String>`.
+  - `ConversationManager::send_message_with_attachments` injects `model` into `SessionConfig.model` and populates `REASONING_EFFORT` and `PROVIDER_ACCOUNT` inside `SessionConfig.env`.
+  - Records the selected `model` into SQLite `messages` table for turn provenance.
+  - Automatically recreates provider session if the user switches models for the same provider.
+
+### 2. Archive != Delete Separation
+- **Backend**: Added `archive_conversation` Tauri command routing to SQLite `conversations::archive_conversation(&self.db, id)`, setting `conversations.archived = 1` to hide from active list while preserving message history and attachment files.
+- **Frontend**: `Sidebar`'s `onArchive` now calls `handleArchiveConversation` (`api.archiveConversation`), reserving `deleteConversation` strictly for permanent removal.
+
+### 3. First Message & First Attachment Stale Closure Elimination
+- In `App.tsx`, `handleSend` and `handleUploadFile` capture `targetConvId`:
+  ```tsx
+  let targetConvId = currentConversationId;
+  if (!targetConvId) {
+    const newConv = await createNewConversation();
+    if (!newConv) return;
+    targetConvId = newConv.id;
+  }
+  ```
+- `targetConvId` is explicitly passed to `sendMessage(..., targetConvId)` and `uploadAttachment(file, targetConvId)`. This completely eliminates the React stale closure bug on first turn where `currentConversationId` was null in component scope.
+
+### 4. Interactive Web / Dev Preview Shell
+- Replaced the static fake "watchd" demo text in `BrowserPanel.tsx` with an interactive Web & Dev preview shell:
+  - Embeds real `<iframe>` previewing `http://localhost:5173` (or any custom URL).
+  - Full address bar with protocol auto-normalization and Enter-to-navigate.
+  - History stack with Back and Forward buttons.
+  - Iframe reload button and external browser launch (`window.open`).
+
+### 5. Elimination of Mock Presentation Data
+- **Canonical CLI Models**: Updated `PROVIDERS` in `src/app/data/providers.ts` to use real model IDs:
+  - Claude: `claude-3-7-sonnet-latest`, `claude-3-5-sonnet-latest`, `claude-3-5-haiku-latest`, `claude-3-opus-latest`.
+  - Codex: `o3-mini`, `o1`, `gpt-4o`, `gpt-4.5-preview`.
+  - Gemini: `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-2.0-flash`.
+- **Inspector Decoupling**: Removed all imports of `NATIVE_SESSIONS` and `SYNC_CURSORS` from `src/app/data/mock.ts`.
+- **Dynamic Context Timestamp**: `ContextPopover.tsx` dynamically displays relative time (`formatUpdatedAgo`) using `UsageSnapshot.created_at`.
+- **Dynamic User Identifier**: `Sidebar.tsx` footer displays dynamic `userName` and avatar initial rather than static mock text.
+
+### 6. Provider Core Frozen Boundary
+- Comparison against baseline confirms **zero lines changed** in `src-tauri/src/app/providers/{claude,codex,gemini}/*`.
+
 
 

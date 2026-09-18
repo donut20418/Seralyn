@@ -82,6 +82,7 @@ export interface ContextUsage {
   output: number | null;
   reasoning: number | null;
   cacheRead: number | null;
+  updatedAt?: string | null;
 }
 
 export interface ThinkingData {

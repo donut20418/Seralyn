@@ -25,6 +25,10 @@ export async function deleteConversation(id: string): Promise<void> {
   return invoke('delete_conversation', { id });
 }
 
+export async function archiveConversation(id: string): Promise<void> {
+  return invoke('archive_conversation', { id });
+}
+
 export async function updateConversationTitle(id: string, title: string): Promise<void> {
   return invoke('update_conversation_title', { id, title });
 }
@@ -33,9 +37,20 @@ export async function sendMessage(
   conversationId: string,
   content: string,
   provider: ProviderKind,
-  attachments?: AttachmentInfo[]
+  attachments?: AttachmentInfo[],
+  model?: string,
+  account?: string,
+  effort?: string
 ): Promise<void> {
-  return invoke('send_message', { conversationId, content, provider, attachments: attachments || [] });
+  return invoke('send_message', {
+    conversationId,
+    content,
+    provider,
+    attachments: attachments || [],
+    model: model || null,
+    account: account || null,
+    effort: effort || null,
+  });
 }
 
 export async function switchProvider(conversationId: string, provider: ProviderKind): Promise<void> {

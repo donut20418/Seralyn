@@ -160,7 +160,7 @@ export function ProviderSelector({
       </div>
 
       <div className="sr-pop__foot">
-        <span>Models as reported by each CLI</span>
+        <span>Configured models for CLI dispatch</span>
         <span className="sr-spacer" />
         <button style={{ color: "var(--sr-accent)", fontSize: 11 }} onClick={onManageProviders}>
           Manage providers

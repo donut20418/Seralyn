@@ -1,115 +1,171 @@
+import { useState, useEffect, type KeyboardEvent } from "react";
 import { ArrowLeft, ArrowRight, ExternalLink, Globe, Lock, Plus, RotateCw, X } from "lucide-react";
 
 interface Props {
-  url: string;
+  url?: string;
   onClose: () => void;
 }
 
-/**
- * Optional side panel: web pages, docs, localhost previews, URLs opened from a
- * response. It is never required for normal chat, and it is unrelated to a
- * provider's own web/search tooling.
- *
- * In the Tauri build the view below is replaced by a webview pointed at `url`.
- */
-export function BrowserPanel({ url, onClose }: Props) {
+function normalizeUrl(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return "http://localhost:5173";
+  if (/^https?:\/\//i.test(trimmed)) return trimmed;
+  return `http://${trimmed}`;
+}
+
+export function BrowserPanel({ url = "http://localhost:5173", onClose }: Props) {
+  const [history, setHistory] = useState<string[]>([normalizeUrl(url)]);
+  const [historyIndex, setHistoryIndex] = useState(0);
+  const [inputUrl, setInputUrl] = useState(normalizeUrl(url));
+  const [reloadKey, setReloadKey] = useState(0);
+
+  const currentUrl = history[historyIndex] || normalizeUrl(url);
+
+  useEffect(() => {
+    const normalized = normalizeUrl(url);
+    setHistory([normalized]);
+    setHistoryIndex(0);
+    setInputUrl(normalized);
+  }, [url]);
+
+  const navigateTo = (newUrl: string) => {
+    const normalized = normalizeUrl(newUrl);
+    const newHistory = history.slice(0, historyIndex + 1);
+    newHistory.push(normalized);
+    setHistory(newHistory);
+    setHistoryIndex(newHistory.length - 1);
+    setInputUrl(normalized);
+  };
+
+  const handleBack = () => {
+    if (historyIndex > 0) {
+      const nextIdx = historyIndex - 1;
+      setHistoryIndex(nextIdx);
+      setInputUrl(history[nextIdx]);
+    }
+  };
+
+  const handleForward = () => {
+    if (historyIndex < history.length - 1) {
+      const nextIdx = historyIndex + 1;
+      setHistoryIndex(nextIdx);
+      setInputUrl(history[nextIdx]);
+    }
+  };
+
+  const handleReload = () => {
+    setReloadKey((k) => k + 1);
+  };
+
+  const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === "Enter") {
+      navigateTo(inputUrl);
+    }
+  };
+
+  const handleOpenExternal = () => {
+    if (currentUrl) {
+      window.open(currentUrl, "_blank", "noopener,noreferrer");
+    }
+  };
+
   return (
-    <div className="sr-browser" style={{ width: "100%" }}>
+    <div className="sr-browser" style={{ width: "100%", height: "100%" }}>
       <div className="sr-browser__tabs">
         <span className="sr-browser__tab sr-browser__tab--on">
           <span className="sr-dot" style={{ width: 5, height: 5, background: "var(--sr-ok)" }} />
-          Rebuild log
+          Web Preview
         </span>
-        <span className="sr-browser__tab">docs.rs / notify</span>
         <span className="sr-spacer" />
-        <button className="sr-icon-btn" style={{ width: 22, height: 22 }} aria-label="New tab">
+        <button
+          className="sr-icon-btn"
+          style={{ width: 22, height: 22 }}
+          aria-label="New preview tab"
+          onClick={() => navigateTo("http://localhost:5173")}
+        >
           <Plus size={13} />
         </button>
       </div>
 
       <div className="sr-browser__bar">
-        <button className="sr-icon-btn" style={{ width: 24, height: 24 }} aria-label="Back">
+        <button
+          className="sr-icon-btn"
+          style={{ width: 24, height: 24 }}
+          aria-label="Back"
+          disabled={historyIndex === 0}
+          onClick={handleBack}
+        >
           <ArrowLeft size={14} />
         </button>
-        <button className="sr-icon-btn" style={{ width: 24, height: 24 }} aria-label="Forward" disabled>
+        <button
+          className="sr-icon-btn"
+          style={{ width: 24, height: 24 }}
+          aria-label="Forward"
+          disabled={historyIndex >= history.length - 1}
+          onClick={handleForward}
+        >
           <ArrowRight size={14} />
         </button>
-        <button className="sr-icon-btn" style={{ width: 24, height: 24 }} aria-label="Reload">
+        <button
+          className="sr-icon-btn"
+          style={{ width: 24, height: 24 }}
+          aria-label="Reload"
+          onClick={handleReload}
+        >
           <RotateCw size={14} />
         </button>
         <div className="sr-browser__url">
           <Lock size={11} color="var(--sr-ok)" />
-          <span>{url}</span>
+          <input
+            type="text"
+            value={inputUrl}
+            onChange={(e) => setInputUrl(e.target.value)}
+            onKeyDown={handleKeyDown}
+            style={{
+              flex: 1,
+              background: "transparent",
+              border: "none",
+              outline: "none",
+              color: "inherit",
+              fontFamily: "inherit",
+              fontSize: "inherit",
+            }}
+            placeholder="http://localhost:5173"
+            aria-label="Browser URL"
+          />
         </div>
-        <button className="sr-icon-btn" style={{ width: 24, height: 24 }} aria-label="Open in system browser">
+        <button
+          className="sr-icon-btn"
+          style={{ width: 24, height: 24 }}
+          aria-label="Open in system browser"
+          onClick={handleOpenExternal}
+        >
           <ExternalLink size={13} />
         </button>
-        <button className="sr-icon-btn" style={{ width: 24, height: 24 }} aria-label="Close browser panel" onClick={onClose}>
+        <button
+          className="sr-icon-btn"
+          style={{ width: 24, height: 24 }}
+          aria-label="Close browser panel"
+          onClick={onClose}
+        >
           <X size={14} />
         </button>
       </div>
 
-      <div className="sr-browser__view">
-        <div className="sr-browser__frame sr-scroll">
-          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 4 }}>
-            <span style={{ fontSize: 16, fontWeight: 600, letterSpacing: "-0.01em" }}>watchd</span>
-            <span
-              style={{
-                display: "flex",
-                alignItems: "center",
-                height: 19,
-                padding: "0 7px",
-                borderRadius: 4,
-                background: "rgba(92,201,141,0.12)",
-                fontSize: 10.5,
-                color: "var(--sr-ok)",
-              }}
-            >
-              live
-            </span>
-          </div>
-          <p style={{ margin: "0 0 16px", fontSize: 12, lineHeight: 1.7, color: "var(--sr-text-2)" }}>
-            Rebuild log streaming from the dev server on port 5173.
-          </p>
-
-          <div className="sr-stats">
-            <div className="sr-stat">
-              <div className="sr-stat__k">Rebuilds</div>
-              <div className="sr-stat__v">14</div>
-            </div>
-            <div className="sr-stat">
-              <div className="sr-stat__k">Cancelled</div>
-              <div className="sr-stat__v" style={{ color: "var(--sr-warn)" }}>
-                3
-              </div>
-            </div>
-            <div className="sr-stat">
-              <div className="sr-stat__k">Median</div>
-              <div className="sr-stat__v">0.94s</div>
-            </div>
-          </div>
-
-          <div className="sr-log">
-            <div>
-              <span className="sr-log__t">14:22:04</span> <span style={{ color: "var(--sr-ok)" }}>ready</span> dev server in 214 ms
-            </div>
-            <div>
-              <span className="sr-log__t">14:22:41</span> <span style={{ color: "var(--sr-text-3)" }}>event</span> Modify(Data) src/watcher.rs
-            </div>
-            <div>
-              <span className="sr-log__t">14:22:41</span> <span style={{ color: "var(--sr-text-3)" }}>event</span> Modify(Data) src/watcher.rs
-            </div>
-            <div>
-              <span className="sr-log__t">14:22:41</span> <span style={{ color: "var(--sr-warn)" }}>batch</span> 2 events → 1 rebuild
-            </div>
-            <div>
-              <span className="sr-log__t">14:22:41</span> <span style={{ color: "var(--sr-warn)" }}>cancel</span> previous build at 14 ms
-            </div>
-            <div>
-              <span className="sr-log__t">14:22:42</span> <span style={{ color: "var(--sr-ok)" }}>built</span> watchd in 0.94 s
-            </div>
-          </div>
-        </div>
+      <div className="sr-browser__view" style={{ padding: 8, display: "flex", flex: 1, minHeight: 0 }}>
+        <iframe
+          key={`${currentUrl}-${reloadKey}`}
+          src={currentUrl}
+          title="Web Preview"
+          sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+          style={{
+            width: "100%",
+            height: "100%",
+            border: "1px solid var(--sr-border)",
+            borderRadius: "var(--sr-radius-md)",
+            background: "#ffffff",
+          }}
+        />
       </div>
     </div>
   );
