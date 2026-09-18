@@ -284,13 +284,13 @@ impl ConversationManager {
                             &db_clone,
                             &conv_id,
                             Some(&ps_id),
-                            input_tokens.map(|v| *v as i64),
-                            output_tokens.map(|v| *v as i64),
-                            cache_read_tokens.map(|v| *v as i64),
+                            input_tokens.map(|v| v as i64),
+                            output_tokens.map(|v| v as i64),
+                            cache_read_tokens.map(|v| v as i64),
                             None,
-                            reasoning_tokens.map(|v| *v as i64),
-                            context_tokens.map(|v| *v as i64),
-                            context_window.map(|v| *v as i64),
+                            reasoning_tokens.map(|v| v as i64),
+                            context_tokens.map(|v| v as i64),
+                            context_window.map(|v| v as i64),
                             conf_str,
                         );
                     }
@@ -467,7 +467,7 @@ impl ConversationManager {
         base_path.push("Seralyn");
         base_path.push("attachments");
         base_path.push(conversation_id);
-        std::fs::create_dir_all(&base_path).map_err(crate::app::error::AppError::Io)?;
+        std::fs::create_dir_all(&base_path)?;
 
         let dest_filename = format!("{}_{}", id, safe_name);
         let dest_path = base_path.join(&dest_filename);
@@ -481,7 +481,7 @@ impl ConversationManager {
             }
         }
 
-        std::fs::write(&dest_path, file_data).map_err(crate::app::error::AppError::Io)?;
+        std::fs::write(&dest_path, file_data)?;
 
         let mime = mime_type.unwrap_or("application/octet-stream").to_string();
 
