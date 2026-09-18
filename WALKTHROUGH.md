@@ -473,12 +473,14 @@ Phase 2 elevates Seralyn into a full-featured desktop experience on top of the P
 ### 3. Live Tool Execution & Progress Visualization
 - **Component**: [`src/components/chat/ToolCard.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/ToolCard.tsx)
 - Interactive tool execution cards with status badges (Running spinner, Done checkmark, Error alert).
-- Real-time `ToolProgress` event support displaying intermediate live execution output while running.
+- **ToolProgress Support**: Full UI & event handling support in `useConversation.ts` and `ToolCard.tsx` for `ToolProgress` events displaying live intermediate progress text.
+- **Provider Core Boundary**: CLI Provider Adapters are intentionally kept 100% frozen in Phase 2; they currently emit `ToolStarted` and `ToolResult`, while the UI is fully ready to display intermediate progress whenever upstream adapters produce it.
 - Inspectable argument/result payloads.
 
 ### 4. Real-time Token & Context Usage Meter (Provider-Scoped)
 - **Backend**: SQLite `usage_snapshots` table CRUD in [`src-tauri/src/app/db/usage_snapshots.rs`](file:///p:/asset_team/Seralyn/src-tauri/src/app/db/usage_snapshots.rs).
 - Scoped strictly by `provider` via join with `provider_sessions`: switching providers clears/updates context window to the active provider without displaying stale tokens from prior models.
+- On `SessionFinished` and `Error` events, `selectConversation` is explicitly invoked with `event.provider`, eliminating any stale usage rollback.
 - **Frontend**: [`src/components/chat/TokenMeter.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/TokenMeter.tsx) showing real-time Context Window progress bar (Green <60%, Yellow 60-80%, Orange 80-90%, Red ≥90%) and breakdown tooltip.
 
 ### 5. Context Inspector & Session Resume Viewer
@@ -489,15 +491,16 @@ Phase 2 elevates Seralyn into a full-featured desktop experience on top of the P
   3. **Turn Tree**: Chronological message sequence `#seq`, roles, and timestamps.
 
 ### 6. Hardened File Attachments System & Lifecycle
-- **Security Validation (P1)**:
+- **Security Validation (P1 & Symlink/Junction Hardening)**:
   - `conversation_id` verified as valid UUID format (`uuid::Uuid::parse_str`).
   - Conversation existence verified in SQLite before saving files.
   - Attachments root (`%LOCALAPPDATA%/Seralyn/attachments/`) canonicalized before joining IDs.
   - Path traversal checks on both conversation directory and destination filepath (`starts_with` and `parent()` direct-child invariants).
+  - Symlink / Windows NTFS junction defense: resolved canonical paths are re-verified to guarantee they strictly reside inside `canon_root` across `save_attachment`, `delete_attachment`, and `delete_conversation`.
   - 25MB file size limit and filename sanitization (leaf extraction + character filtering).
 - **Disk Lifecycle & Cleanup**:
   - `delete_attachment`: Removes draft files from disk when removed via composer chip.
-  - `delete_conversation`: Recursively purges the conversation's attachment directory upon deletion.
+  - `delete_conversation`: Recursively purges the conversation's attachment directory upon deletion with junction protection.
   - Clean separation: SQLite `messages.content` retains pure user prompt text; attachment paths are formatted strictly inside `ProviderMessage.content` for subprocess execution.
 
 ### 7. Safe Mode Approval Dialog & Turn Interruption
@@ -508,9 +511,9 @@ Phase 2 elevates Seralyn into a full-featured desktop experience on top of the P
 
 | Component | Implementation & Deliverables | Status |
 |---|---|---|
-| **Attachment Security (P1)** | UUID check + DB existence + root canonicalization + traversal defense + 25MB cap | ✅ Hardened with Automated Unit Tests |
-| **Tool Progress (P2.1)** | `ToolProgress` event pump + `ToolCard` live status badge and progress stream | ✅ Built & Verified |
-| **Provider-Scoped Meter (P2.2)** | `get_latest_usage_snapshot(..., provider)` + provider session join + isolation test | ✅ Built & Verified |
+| **Attachment Security (P1)** | UUID check + DB existence + root canonicalization + traversal & symlink/junction defense + 25MB cap | ✅ Hardened with Automated Unit Tests |
+| **Tool Progress UI (P2.1)** | `ToolProgress` event pump + `ToolCard` live status badge and progress display | ✅ Built & UI Ready (Adapters frozen) |
+| **Provider-Scoped Meter (P2.2)** | `get_latest_usage_snapshot(..., provider)` + provider session join + scoped turn finish | ✅ Built & Verified |
 | **Attachment Lifecycle (P2.3)** | Delete on conversation delete + draft remove on chip cancel + clean user message | ✅ Built & Verified |
 | **Markdown & Highlighting** | `react-markdown` + `remark-gfm` + `prismjs` syntax highlighter with copy button | ✅ Built & Verified |
 | **Thinking / Reasoning Drawer** | Collapsible `ThinkingAccordion` with live shimmer and SQLite metadata persistence | ✅ Built & Verified |

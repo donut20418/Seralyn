@@ -107,9 +107,15 @@ impl ConversationManager {
             let mut root_path = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
             root_path.push("Seralyn");
             root_path.push("attachments");
-            let conv_dir = root_path.join(id);
-            if conv_dir.exists() {
-                let _ = std::fs::remove_dir_all(&conv_dir);
+            if let Ok(canon_root) = root_path.canonicalize() {
+                let conv_dir = canon_root.join(id);
+                if conv_dir.exists() {
+                    if let Ok(canon_conv_dir) = conv_dir.canonicalize() {
+                        if canon_conv_dir.starts_with(&canon_root) && canon_conv_dir.parent() == Some(canon_root.as_path()) {
+                            let _ = std::fs::remove_dir_all(&canon_conv_dir);
+                        }
+                    }
+                }
             }
         }
 
@@ -514,6 +520,13 @@ impl ConversationManager {
         std::fs::create_dir_all(&conv_dir)?;
         let canon_conv_dir = conv_dir.canonicalize()?;
 
+        // Verify resolved path against symlink / junction escapes
+        if !canon_conv_dir.starts_with(&canon_root) || canon_conv_dir.parent() != Some(canon_root.as_path()) {
+            return Err(crate::app::error::AppError::InvalidInput(
+                "Junction/symlink traversal attempt detected in conversation directory".to_string(),
+            ));
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
         let dest_filename = format!("{}_{}", id, safe_name);
         let dest_path = canon_conv_dir.join(&dest_filename);
@@ -551,10 +564,19 @@ impl ConversationManager {
         let mut root_path = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
         root_path.push("Seralyn");
         root_path.push("attachments");
-        let conv_dir = root_path.join(conversation_id);
+        if !root_path.exists() {
+            return Ok(());
+        }
+        let canon_root = root_path.canonicalize()?;
+        let conv_dir = canon_root.join(conversation_id);
 
         if conv_dir.exists() {
             let canon_dir = conv_dir.canonicalize()?;
+            if !canon_dir.starts_with(&canon_root) || canon_dir.parent() != Some(canon_root.as_path()) {
+                return Err(crate::app::error::AppError::InvalidInput(
+                    "Junction/symlink traversal detected in attachment deletion".to_string(),
+                ));
+            }
             if let Ok(entries) = std::fs::read_dir(&canon_dir) {
                 for entry in entries.flatten() {
                     let file_name = entry.file_name().to_string_lossy().to_string();

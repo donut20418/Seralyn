@@ -289,13 +289,13 @@ export function useConversation() {
         if (event.payload.kind === 'Error') {
           setErrorMessage(event.payload.message);
         }
-        selectConversation(currentConversationId);
+        selectConversation(currentConversationId, event.provider);
         loadConversations();
         break;
 
       case 'SessionFinished':
         setIsStreaming(false);
-        selectConversation(currentConversationId);
+        selectConversation(currentConversationId, event.provider);
         loadConversations();
         setStreamingContent('');
         setStreamingThinking('');
