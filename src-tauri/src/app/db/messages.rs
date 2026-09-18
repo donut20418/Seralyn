@@ -33,6 +33,33 @@ pub fn create_message(
     provider_session_id: Option<&str>,
     token_estimate: Option<i64>,
 ) -> Result<Message> {
+    create_message_with_metadata(
+        db,
+        conversation_id,
+        parent_id,
+        role,
+        content,
+        provider,
+        model,
+        provider_session_id,
+        token_estimate,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn create_message_with_metadata(
+    db: &Database,
+    conversation_id: &str,
+    parent_id: Option<&str>,
+    role: &str,
+    content: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+    provider_session_id: Option<&str>,
+    token_estimate: Option<i64>,
+    metadata_json: Option<&str>,
+) -> Result<Message> {
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
 
@@ -46,9 +73,9 @@ pub fn create_message(
 
     conn.execute(
         "INSERT INTO messages (
-            id, conversation_id, seq, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        params![id, conversation_id, next_seq, parent_id, role, content, provider, model, provider_session_id, now, token_estimate],
+            id, conversation_id, seq, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![id, conversation_id, next_seq, parent_id, role, content, provider, model, provider_session_id, now, token_estimate, metadata_json],
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
     conn.execute(
@@ -68,7 +95,7 @@ pub fn create_message(
         provider_session_id: provider_session_id.map(|s| s.to_string()),
         created_at: now,
         token_estimate,
-        metadata_json: None,
+        metadata_json: metadata_json.map(|s| s.to_string()),
     })
 }
 
@@ -216,5 +243,25 @@ mod tests {
         assert_eq!(recent.len(), 1);
         assert_eq!(recent[0].content, "hi");
         assert_eq!(recent[0].seq, 2);
+
+        // Test metadata persistence (thinking and attachments)
+        let meta_json = r#"{"thinking":"Step 1: Analyzed problem\nStep 2: Found solution"}"#;
+        let msg3 = create_message_with_metadata(
+            &db,
+            &conv.id,
+            None,
+            "assistant",
+            "Here is the solution",
+            Some("claude"),
+            Some("claude-opus-5"),
+            None,
+            Some(50),
+            Some(meta_json),
+        ).unwrap();
+        assert_eq!(msg3.seq, 3);
+        assert_eq!(msg3.metadata_json.as_deref(), Some(meta_json));
+
+        let fetched3 = get_message(&db, &msg3.id).unwrap();
+        assert_eq!(fetched3.metadata_json.as_deref(), Some(meta_json));
     }
 }

@@ -453,5 +453,56 @@ The test suite covers three distinct timing cases:
 | **Real Provider CLIs** | Claude Pro, OpenAI Codex CLI, and Gemini CLI smoke tested live on Windows host | ✅ All 3 Real Providers Verified |
 | **Repository Audit** | Scripts, tests, and documentation committed in repo | ✅ Complete & Auditable |
 
+---
 
+## Phase 2 — UI & Product Experience (Complete)
 
+Phase 2 elevates Seralyn into a full-featured desktop experience on top of the Phase 1 multi-provider core engine:
+
+### 1. Rich Markdown & Syntax Highlighting
+- **Component**: [`src/components/chat/MarkdownRenderer.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/MarkdownRenderer.tsx)
+- Integrated `react-markdown` and `remark-gfm` with full GFM support (tables, lists, blockquotes).
+- Integrated `prismjs` syntax highlighting for Rust, TypeScript, JavaScript, Python, Bash, JSON, SQL, and CSS.
+- Terminal-styled code blocks with language badge and one-click "Copy" button with visual feedback.
+
+### 2. Collapsible Thinking & Reasoning Blocks
+- **Component**: [`src/components/chat/ThinkingAccordion.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/ThinkingAccordion.tsx)
+- Live pulsing brain/sparkle animation while the model streams reasoning tokens (`ThinkingDelta`).
+- Displays thought word count on turn completion, collapsible to minimize clutter.
+
+### 3. Live Tool Execution Visualization
+- **Component**: [`src/components/chat/ToolCard.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/ToolCard.tsx)
+- Interactive tool execution cards with status badges (Running spinner, Done checkmark, Error alert) and inspectable argument/result payloads.
+
+### 4. Real-time Token & Context Usage Meter
+- **Backend**: SQLite `usage_snapshots` table CRUD in [`src-tauri/src/app/db/usage_snapshots.rs`](file:///p:/asset_team/Seralyn/src-tauri/src/app/db/usage_snapshots.rs).
+- **Frontend**: [`src/components/chat/TokenMeter.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/TokenMeter.tsx) showing real-time Context Window progress bar (Green, Yellow, Orange, Red) and breakdown tooltip.
+
+### 5. Context Inspector & Session Resume Viewer
+- **Component**: [`src/components/chat/ContextInspector.tsx`](file:///p:/asset_team/Seralyn/src/components/chat/ContextInspector.tsx)
+- Slide-over drawer with 3 tabs:
+  1. **Native Sessions**: Lists CLI sessions (`claude`, `codex`, `gemini`), native IDs with copy button, model, and status.
+  2. **Sync Cursor**: Visualizes SQLite cursor state (`synced_through_seq` vs conversation `max_seq`).
+  3. **Turn Tree**: Chronological message sequence `#seq`, roles, and timestamps.
+
+### 6. File Attachments System
+- Saved in `%LOCALAPPDATA%/Seralyn/attachments/{conversation_id}/`.
+- Chat input supports file selector, drag-and-drop, and chip preview.
+
+### 7. Safe Mode Approval Dialog & Turn Interruption
+- [`ApprovalDialog.tsx`](file:///p:/asset_team/Seralyn/src/components/common/ApprovalDialog.tsx) for interactive tool execution authorization.
+- Context-sensitive Send/Stop button invoking `interrupt_turn`.
+
+### 8. Verification & Audit Table
+
+| Component | Implementation & Deliverables | Status |
+|---|---|---|
+| **Markdown & Syntax Highlighting** | `react-markdown` + `remark-gfm` + `prismjs` syntax highlighter with copy button | ✅ Built & Verified |
+| **Thinking / Reasoning Drawer** | Collapsible `ThinkingAccordion` with live shimmer and SQLite metadata persistence | ✅ Built & Verified |
+| **Tool Execution Cards** | `ToolCard` tracking running/done/error states with argument/output inspector | ✅ Built & Verified |
+| **Token & Context Meter** | `TokenMeter` + `usage_snapshots.rs` (Green <60%, Yellow 60-80%, Orange 80-90%, Red ≥90%) | ✅ Built & Verified |
+| **Context Inspector Drawer** | `ContextInspector` with Native Sessions, Sync Cursor, and Turn Tree tabs | ✅ Built & Verified |
+| **File Attachments** | 25MB limit, path traversal defense, disk storage, and SQLite message metadata | ✅ Built & Verified |
+| **Safe Mode & Stop Control** | `ApprovalDialog` modal + provider-bound `interrupt_turn` with disabled provider selector during streaming | ✅ Built & Verified |
+| **Provider Core Boundary** | Zero edits to `src-tauri/src/app/providers/{claude,codex,gemini}` (adapter core 100% frozen) | ✅ 100% Frozen & Preserved |
+| **Frontend Build** | `npm run build` (tsc + Vite production bundle, 2187 modules transformed) | ✅ 0 Errors (Exit code 0) |

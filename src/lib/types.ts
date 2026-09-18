@@ -47,6 +47,44 @@ export type EventPayload =
   | { kind: 'FileChange'; path: string; change_type: string }
   | { kind: 'Empty' };
 
+export interface AttachmentInfo {
+  id: string;
+  name: string;
+  path: string;
+  size: number;
+  mime_type: string;
+}
+
+export interface UsageSnapshot {
+  id?: string;
+  conversation_id: string;
+  provider_session_id?: string;
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_tokens?: number;
+  cache_write_tokens?: number;
+  reasoning_tokens?: number;
+  context_tokens?: number;
+  context_window?: number;
+  confidence: TokenConfidence | string;
+  created_at?: string;
+}
+
+export interface ToolCallState {
+  id: string;
+  tool_name: string;
+  input?: any;
+  output?: any;
+  status: 'running' | 'completed' | 'error';
+}
+
+export interface PendingApproval {
+  approval_id: string;
+  tool_name: string;
+  description: string;
+  input?: any;
+}
+
 export interface Conversation {
   id: string;
   title?: string;
@@ -72,12 +110,15 @@ export interface Message {
   parent_id?: string;
   role: 'user' | 'assistant' | 'system' | 'tool';
   content: string;
+  seq: number;
   provider?: string;
   model?: string;
   provider_session_id?: string;
   created_at: string;
   token_estimate?: number;
   metadata_json?: string;
+  attachments?: AttachmentInfo[];
+  thinking?: string;
 }
 
 export interface ProviderSessionRecord {
@@ -85,6 +126,7 @@ export interface ProviderSessionRecord {
   conversation_id: string;
   provider: string;
   provider_session_id?: string;
+  synced_through_seq: number;
   model?: string;
   created_at: string;
   last_used_at?: string;

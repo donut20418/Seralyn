@@ -6,6 +6,7 @@ use crate::app::error::{AppError, Result};
 pub mod conversations;
 pub mod messages;
 pub mod provider_sessions;
+pub mod usage_snapshots;
 
 const MIGRATION_001: &str = include_str!("../../../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../../../migrations/002_sync_cursor.sql");

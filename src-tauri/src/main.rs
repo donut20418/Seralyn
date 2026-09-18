@@ -1,7 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use seralyn_lib::app::conversation::{
-    Conversation, ConversationManager, ConversationSummary, ConversationWithMessages,
+    AttachmentInfo, Conversation, ConversationManager, ConversationSummary,
+    ConversationWithMessages, UsageSnapshotRecord,
 };
 use seralyn_lib::app::db::Database;
 use seralyn_lib::app::events::ProviderKind;
@@ -64,6 +65,7 @@ async fn send_message(
     conversation_id: String,
     content: String,
     provider: String,
+    attachments: Option<Vec<AttachmentInfo>>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let provider_kind = ProviderKind::from_str(&provider).map_err(|e| e.to_string())?;
@@ -81,7 +83,13 @@ async fn send_message(
 
     state
         .conversation_manager
-        .send_message(&conversation_id, &content, provider_kind, tx)
+        .send_message_with_attachments(
+            &conversation_id,
+            &content,
+            provider_kind,
+            attachments.unwrap_or_default(),
+            tx,
+        )
         .await
         .map_err(|e| e.to_string())?;
 
@@ -126,6 +134,57 @@ async fn respond_to_approval(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn update_conversation_title(
+    id: String,
+    title: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    state
+        .conversation_manager
+        .update_conversation_title(&id, &title)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn get_conversation_usage(
+    conversation_id: String,
+    state: State<'_, AppState>,
+) -> Result<Option<UsageSnapshotRecord>, String> {
+    state
+        .conversation_manager
+        .get_conversation_usage(&conversation_id)
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn interrupt_turn(
+    conversation_id: String,
+    provider: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let provider_kind = ProviderKind::from_str(&provider).map_err(|e| e.to_string())?;
+    state
+        .conversation_manager
+        .interrupt_turn(&conversation_id, provider_kind)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn save_attachment(
+    conversation_id: String,
+    file_name: String,
+    file_data: Vec<u8>,
+    mime_type: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<AttachmentInfo, String> {
+    state
+        .conversation_manager
+        .save_attachment(&conversation_id, &file_name, &file_data, mime_type.as_deref())
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -166,7 +225,11 @@ fn main() {
             send_message,
             switch_provider,
             detect_providers,
-            respond_to_approval
+            respond_to_approval,
+            update_conversation_title,
+            get_conversation_usage,
+            interrupt_turn,
+            save_attachment
         ])
         .on_window_event(move |_window, event| {
             if let tauri::WindowEvent::CloseRequested { .. } = event {
