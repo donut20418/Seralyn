@@ -1,3 +1,6 @@
+@import './fonts.css';
+@import './seralyn.css';
+
 :root {
   --bg-dark: #0f111a;
   --bg-darker: #090a10;

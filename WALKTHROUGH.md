@@ -522,3 +522,32 @@ Phase 2 elevates Seralyn into a full-featured desktop experience on top of the P
 | **Provider Core Boundary** | Zero edits to `src-tauri/src/app/providers/{claude,codex,gemini}` (adapter core 100% frozen) | ✅ 100% Frozen & Preserved |
 | **Frontend Build** | `npm run build` (tsc + Vite production bundle, 2187 modules transformed) | ✅ 0 Errors (Exit code 0) |
 
+---
+
+## Phase 2 Final — Claude Workspace UI Redesign Integration
+
+We integrated the complete developer workspace UI redesign from `C:\Users\md10024\Downloads\Seralyn_new` into the production codebase at `P:\asset_team\Seralyn`.
+
+### 1. Key Highlights & Architectural Guardrails
+- **Provider Core 100% Frozen:** Zero edits to `src-tauri/src/app/providers/{claude,codex,gemini}`.
+- **SQLite Canonical Source of Truth:** All conversation data, turns, messages, provider sessions, attachments, and usage snapshots live in SQLite and are served via existing Tauri commands.
+- **No Mock Data in Production:** All mock data exports (`mock.ts`) are bypassed in favor of live bindings to `useConversation`, `useProviders`, and `api.ts`.
+- **Custom Design Tokens & Layout:** Full dark-first graphite theme (`--sr-bg`, `--sr-rail`, `--sr-accent: #4cc2d0`, provider tints `--sr-claude`, `--sr-codex`, `--sr-gemini`), IBM Plex Sans / Mono and Sora typography, with draggable sidebar and browser drawers.
+
+### 2. Component Wiring Summary
+| Component | Presentation File | Live Backend Binding |
+|---|---|---|
+| **TitleBar** | `src/app/components/TitleBar.tsx` | Bound to `useProviders.detectProviders` displaying live connection dots (`connected`, `signin-required`, `not-installed`, `error`). |
+| **Sidebar** | `src/app/components/Sidebar.tsx` | Bound to `useConversation` for live conversation list, Pinned chats, Groups (`Work`, `Personal`), Recents, inline renaming, and deletion. |
+| **ChatHeader** | `src/app/components/ChatHeader.tsx` | Bound to active conversation title, streaming state (`Claude generating` pulse badge), Inspector toggle, and Browser toggle. |
+| **Conversation** | `src/app/components/Conversation.tsx` | Renders SQLite turns, collapsible thinking with word count, expandable tool cards, Markdown, and inline Approval cards with live decision callbacks (`respondToApproval`). |
+| **Composer** | `src/app/components/Composer.tsx` | Drag & Drop file attachment bound to backend SQLite attachment engine (`uploadAttachment`), model selector, effort menu, context donut meter, context popover with live token usage from `UsageSnapshot`, send and stop controls. |
+| **Context Popover** | `src/app/components/ContextPopover.tsx` | Directly displays active session tokens (`used`, `window`, `remaining`, `input`, `output`, `reasoning`, `cacheRead`) from `currentUsage: UsageSnapshot`. |
+| **Inspector** | `src/app/components/Inspector.tsx` | Displays live native session IDs from SQLite `provider_sessions` (Claude, Codex, Gemini) and real-time turn sync cursors (`synced #X of #Y`). |
+| **BrowserPanel** | `src/app/components/BrowserPanel.tsx` | Collapsible, resizable right-side preview/log panel. |
+
+### 3. Verification & Build
+- `npm run build`: 1,912 modules transformed, built cleanly in 26.84s with 0 errors.
+- Working tree audit: All edits restricted to `src/` presentation and integration layer.
+
+

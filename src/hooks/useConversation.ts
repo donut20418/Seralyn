@@ -89,9 +89,11 @@ export function useConversation() {
       const conv = await api.createConversation(title);
       await loadConversations();
       await selectConversation(conv.id);
+      return conv;
     } catch (e) {
       console.error(e);
       setErrorMessage(String(e));
+      return null;
     }
   }, [loadConversations, selectConversation]);
 
