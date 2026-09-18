@@ -511,7 +511,7 @@ Phase 2 elevates Seralyn into a full-featured desktop experience on top of the P
 
 | Component | Implementation & Deliverables | Status |
 |---|---|---|
-| **Attachment Security (P1)** | UUID check + DB existence + root canonicalization + traversal & symlink/junction defense + 25MB cap | ✅ Hardened with Automated Unit Tests |
+| **Attachment Security (P1)** | UUID check + DB existence + root canonicalization + traversal & symlink/junction defense + 25MB cap | ✅ Hardened (Path traversal, size limit & lifecycle covered by automated unit tests) |
 | **Tool Progress UI (P2.1)** | `ToolProgress` event pump + `ToolCard` live status badge and progress display | ✅ Built & UI Ready (Adapters frozen) |
 | **Provider-Scoped Meter (P2.2)** | `get_latest_usage_snapshot(..., provider)` + provider session join + scoped turn finish | ✅ Built & Verified |
 | **Attachment Lifecycle (P2.3)** | Delete on conversation delete + draft remove on chip cancel + clean user message | ✅ Built & Verified |
