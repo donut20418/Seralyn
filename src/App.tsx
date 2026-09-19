@@ -30,7 +30,7 @@ import { useConversation } from "./hooks/useConversation";
 import { useProviders } from "./hooks/useProviders";
 import { useEvents } from "./hooks/useEvents";
 import { deleteConversation } from "./lib/api";
-import type { AttachmentInfo } from "./lib/types";
+import type { AttachmentInfo, ProviderSessionRecord } from "./lib/types";
 
 const SIDEBAR_MIN = 200;
 const SIDEBAR_MAX = 420;
@@ -151,7 +151,7 @@ export default function App() {
         effort: reconcileEffort(provider, prev.effort, providers),
       }));
       if (currentConversationId) {
-        fetchUsage(currentConversationId, provider, accountId);
+        fetchUsage(currentConversationId, provider, accountId, modelId);
       }
     },
     [setActiveProvider, providers, currentConversationId, fetchUsage],
@@ -259,7 +259,7 @@ export default function App() {
   }));
 
   const handleSelectConversation = (id: string) => {
-    selectConversation(id, selection.provider, selection.accountId);
+    selectConversation(id, selection.provider, selection.accountId, selection.modelId);
   };
 
   const handleNewChat = useCallback(async () => {
@@ -528,25 +528,47 @@ export default function App() {
   });
 
   const maxSeq = messages.reduce((n, m) => Math.max(n, m.seq), 0);
+  const getSessionAccount = (s: ProviderSessionRecord): string => {
+    if (!s.metadata_json) return "default";
+    try {
+      const parsed = JSON.parse(s.metadata_json);
+      return parsed.account || "default";
+    } catch {
+      return "default";
+    }
+  };
+
+  const findSession = (pId: ProviderId) => {
+    return (
+      providerSessions.find(
+        (s) =>
+          s.provider === pId &&
+          getSessionAccount(s) === selection.accountId &&
+          (!s.model || s.model === selection.modelId),
+      ) ??
+      providerSessions.find(
+        (s) => s.provider === pId && getSessionAccount(s) === selection.accountId,
+      ) ??
+      providerSessions.find((s) => s.provider === pId)
+    );
+  };
+
   const nativeSessions: Record<ProviderId, string | null> = {
-    claude: providerSessions.find((s) => s.provider === "claude")?.provider_session_id ?? null,
-    codex: providerSessions.find((s) => s.provider === "codex")?.provider_session_id ?? null,
-    gemini: providerSessions.find((s) => s.provider === "gemini")?.provider_session_id ?? null,
+    claude: findSession("claude")?.provider_session_id ?? null,
+    codex: findSession("codex")?.provider_session_id ?? null,
+    gemini: findSession("gemini")?.provider_session_id ?? null,
   };
   const syncCursors: Record<ProviderId, { synced: number; current: number }> = {
     claude: {
-      synced:
-        providerSessions.find((s) => s.provider === "claude")?.synced_through_seq ?? 0,
+      synced: findSession("claude")?.synced_through_seq ?? 0,
       current: maxSeq,
     },
     codex: {
-      synced:
-        providerSessions.find((s) => s.provider === "codex")?.synced_through_seq ?? 0,
+      synced: findSession("codex")?.synced_through_seq ?? 0,
       current: maxSeq,
     },
     gemini: {
-      synced:
-        providerSessions.find((s) => s.provider === "gemini")?.synced_through_seq ?? 0,
+      synced: findSession("gemini")?.synced_through_seq ?? 0,
       current: maxSeq,
     },
   };

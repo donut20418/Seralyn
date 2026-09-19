@@ -82,6 +82,7 @@ pub fn get_latest_usage_snapshot(
     conversation_id: &str,
     provider: Option<&str>,
     account: Option<&str>,
+    model: Option<&str>,
 ) -> Result<Option<UsageSnapshotRecord>> {
     if let Some(prov) = provider {
         let target_account = account.unwrap_or("default");
@@ -90,7 +91,7 @@ pub fn get_latest_usage_snapshot(
             "SELECT u.id, u.conversation_id, u.provider_session_id,
                     u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
                     u.reasoning_tokens, u.context_tokens, u.context_window,
-                    u.confidence, u.created_at, ps.metadata_json
+                    u.confidence, u.created_at, ps.metadata_json, ps.model
              FROM usage_snapshots u
              JOIN provider_sessions ps ON u.provider_session_id = ps.id
              WHERE u.conversation_id = ?1 AND ps.provider = ?2
@@ -99,6 +100,7 @@ pub fn get_latest_usage_snapshot(
 
         let rows = stmt.query_map(params![conversation_id, prov], |row| {
             let meta: Option<String> = row.get(12)?;
+            let rec_model: Option<String> = row.get(13)?;
             let rec = UsageSnapshotRecord {
                 id: row.get(0)?,
                 conversation_id: row.get(1)?,
@@ -113,23 +115,32 @@ pub fn get_latest_usage_snapshot(
                 confidence: row.get(10)?,
                 created_at: row.get(11)?,
             };
-            Ok((rec, meta))
+            Ok((rec, meta, rec_model))
         }).map_err(|e| AppError::Database(e.to_string()))?;
 
         for r in rows {
-            let (rec, meta_opt) = r.map_err(|e| AppError::Database(e.to_string()))?;
-            if let Some(ref meta) = meta_opt {
+            let (rec, meta_opt, rec_model_opt) = r.map_err(|e| AppError::Database(e.to_string()))?;
+            let account_matches = if let Some(ref meta) = meta_opt {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(meta) {
-                    if let Some(acc) = val.get("account").and_then(|v| v.as_str()) {
-                        if acc == target_account {
-                            return Ok(Some(rec));
-                        }
-                    }
+                    val.get("account").and_then(|v| v.as_str()) == Some(target_account)
+                } else {
+                    false
                 }
-            } else if target_account == "default" {
-                // Legacy session without metadata_json belongs to default
-                return Ok(Some(rec));
+            } else {
+                target_account == "default"
+            };
+
+            if !account_matches {
+                continue;
             }
+
+            if let Some(target_m) = model {
+                if rec_model_opt.as_deref() != Some(target_m) {
+                    continue;
+                }
+            }
+
+            return Ok(Some(rec));
         }
         return Ok(None);
     }
@@ -241,7 +252,7 @@ mod tests {
         assert_eq!(record.input_tokens, Some(120));
         assert_eq!(record.context_window, Some(200000));
 
-        let latest = get_latest_usage_snapshot(&db, &conv.id, None, None).unwrap().unwrap();
+        let latest = get_latest_usage_snapshot(&db, &conv.id, None, None, None).unwrap().unwrap();
         assert_eq!(latest.id, record.id);
         assert_eq!(latest.context_tokens, Some(165));
     }
@@ -286,21 +297,21 @@ mod tests {
         ).unwrap();
 
         // 3. Query Claude: must return Claude's snapshot (600 tokens)
-        let claude_res = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), None).unwrap().unwrap();
+        let claude_res = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), None, None).unwrap().unwrap();
         assert_eq!(claude_res.id, claude_snapshot.id);
         assert_eq!(claude_res.context_tokens, Some(600));
 
         // 4. Query Gemini: must return Gemini's snapshot (1500 tokens)
-        let gemini_res = get_latest_usage_snapshot(&db, &conv.id, Some("gemini"), None).unwrap().unwrap();
+        let gemini_res = get_latest_usage_snapshot(&db, &conv.id, Some("gemini"), None, None).unwrap().unwrap();
         assert_eq!(gemini_res.id, gemini_snapshot.id);
         assert_eq!(gemini_res.context_tokens, Some(1500));
 
         // 5. Query Codex: hasn't run yet in this conversation -> must return None, NOT Claude or Gemini's usage!
-        let codex_res = get_latest_usage_snapshot(&db, &conv.id, Some("codex"), None).unwrap();
+        let codex_res = get_latest_usage_snapshot(&db, &conv.id, Some("codex"), None, None).unwrap();
         assert!(codex_res.is_none());
 
         // 6. Query None: returns latest across conversation (Gemini)
-        let latest_any = get_latest_usage_snapshot(&db, &conv.id, None, None).unwrap().unwrap();
+        let latest_any = get_latest_usage_snapshot(&db, &conv.id, None, None, None).unwrap().unwrap();
         assert_eq!(latest_any.id, gemini_snapshot.id);
     }
 
@@ -362,13 +373,21 @@ mod tests {
         ).unwrap();
 
         // Exact query by account "work" returns Opus snapshot (400K)
-        let work_query = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), Some("work")).unwrap().unwrap();
+        let work_query = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), Some("work"), None).unwrap().unwrap();
         assert_eq!(work_query.id, work_snapshot.id);
         assert_eq!(work_query.context_tokens, Some(400_000));
         assert_eq!(work_query.context_window, Some(1_000_000));
 
-        // Exact query by account "personal" returns Haiku snapshot (120K)
-        let personal_query = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), Some("personal")).unwrap().unwrap();
+        // Exact query by account "work" and model "opus" returns Opus snapshot
+        let work_opus_query = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), Some("work"), Some("opus")).unwrap().unwrap();
+        assert_eq!(work_opus_query.id, work_snapshot.id);
+
+        // Exact query by account "work" and model "haiku" returns None (Haiku was personal)
+        let work_haiku_query = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), Some("work"), Some("haiku")).unwrap();
+        assert!(work_haiku_query.is_none());
+
+        // Exact query by account "personal" and model "haiku" returns Haiku snapshot (120K)
+        let personal_query = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), Some("personal"), Some("haiku")).unwrap().unwrap();
         assert_eq!(personal_query.id, personal_snapshot.id);
         assert_eq!(personal_query.context_tokens, Some(120_000));
         assert_eq!(personal_query.context_window, Some(200_000));

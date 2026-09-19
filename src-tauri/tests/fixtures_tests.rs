@@ -1528,6 +1528,8 @@ fn test_adaptive_context_no_compaction_when_within_budget() {
         current_turn.seq,
         ProviderKind::Claude,
         Some("opus"),
+        0,
+        "",
     ).unwrap();
 
     assert!(!result.compacted, "Within 916K budget, no compaction must occur");
@@ -1573,6 +1575,8 @@ fn test_adaptive_context_compaction_when_exceeding_budget() {
         current_turn.seq,
         ProviderKind::Claude,
         Some("haiku"),
+        0,
+        "",
     ).unwrap();
 
     assert!(result.compacted, "Exceeding 150K budget must trigger compaction");
@@ -1583,7 +1587,7 @@ fn test_adaptive_context_compaction_when_exceeding_budget() {
     assert_eq!(result.messages[0].role, "assistant");
     assert_eq!(result.messages[0].provider.as_deref(), Some("handoff-manager"));
     assert!(result.messages[0].content.contains("[Context Hand-off:"));
-    assert!(result.messages[0].content.contains("### Summary of Previous Context"));
+    assert!(result.messages[0].content.contains("### Condensed Prior Context:"));
 
     // Assert that recent turns are preserved in raw fidelity
     let last_raw_msg = result.messages.last().unwrap();
@@ -1613,6 +1617,8 @@ fn test_canonical_db_fidelity_unmodified_by_compaction() {
         current.seq,
         ProviderKind::Claude,
         Some("haiku"),
+        0,
+        "",
     ).unwrap();
 
     // Query SQLite messages table directly: verify canonical records are 100% intact!
@@ -1654,6 +1660,8 @@ fn test_switch_back_to_larger_session_resumes_without_compaction_pollution() {
         current_turn.seq,
         ProviderKind::Claude,
         Some("opus"),
+        0,
+        "",
     ).unwrap();
 
     // Assert: Opus ONLY receives turns 5 and 6 (the delta since its sync cursor)
@@ -1664,6 +1672,230 @@ fn test_switch_back_to_larger_session_resumes_without_compaction_pollution() {
 
     // ZERO pollution: Opus does NOT receive Haiku's compacted summary!
     assert!(!opus_res.messages.iter().any(|m| m.content.contains("Context Hand-off")));
+}
+
+#[test]
+fn test_adaptive_context_thai_unicode_safety() {
+    use seralyn_lib::app::conversation::context::build_adaptive_context;
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Thai Unicode Safety Test")).unwrap();
+
+    let thai_turn_1 = "ช่วยแก้ Maya tool ตรงนี้หน่อยครับ มีปัญหาเรื่อง unicode UTF-8 encoding และคำสั่ง python ใน Maya ที่ยาวมาก";
+    let thai_turn_2 = "ได้เลยครับ สำหรับ Maya python script นั้นเราจำเป็นต้องกำหนด encoding utf-8 ให้ถูกต้อง และตรวจสอบ character boundary ให้แม่นยำเพื่อไม่ให้เกิด panic ในขณะที่มีการตัดคำภาษาไทยครับ";
+
+    // Repeat to create a long string with multibyte characters (Thai characters are 3 bytes each)
+    let thai_long = format!("{} {}", thai_turn_1, thai_turn_2).repeat(150);
+
+    for i in 1..=6 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(
+            &db,
+            &conv.id,
+            None,
+            role,
+            &format!("รอบที่ {i}: {thai_long}"),
+            if role == "assistant" { Some("claude") } else { None },
+            None,
+            None,
+            None,
+        ).unwrap();
+    }
+    let current_turn = messages::create_message(&db, &conv.id, None, "user", "ข้อความภาษาไทยรอบปัจจุบัน", None, None, None, None).unwrap();
+
+    // Call build_adaptive_context targeting Haiku (which forces compaction and character-safe slicing)
+    let result = build_adaptive_context(
+        &db,
+        &conv.id,
+        0,
+        current_turn.seq,
+        ProviderKind::Claude,
+        Some("haiku"),
+        0,
+        "ข้อความภาษาไทยรอบปัจจุบัน",
+    );
+
+    assert!(result.is_ok(), "Adaptive context MUST not panic on Thai multibyte UTF-8 characters: {:?}", result.err());
+    let res = result.unwrap();
+    assert!(res.compacted, "Should trigger compaction");
+    assert!(res.working_tokens <= res.input_budget, "Working tokens must fit within input budget");
+    // Verify Thai text in summary does not contain broken UTF-8
+    let summary = &res.messages[0].content;
+    assert!(summary.contains("รอบที่ 1:"), "Summary must contain turns");
+    assert!(std::str::from_utf8(summary.as_bytes()).is_ok(), "Must be valid UTF-8");
+}
+
+#[test]
+fn test_adaptive_context_hard_budget_guarantee_single_large_message() {
+    use seralyn_lib::app::conversation::context::build_adaptive_context;
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Hard Budget Single Large Message Test")).unwrap();
+
+    // Single message containing ~180K tokens (approx 720K characters)
+    let huge_content = "X".repeat(720_000);
+    messages::create_message(&db, &conv.id, None, "user", &huge_content, None, None, None, None).unwrap();
+    let current_turn = messages::create_message(&db, &conv.id, None, "user", "Next turn", None, None, None, None).unwrap();
+
+    // Budget for Haiku is 150K tokens. A single message of 180K tokens alone exceeds the budget!
+    let result = build_adaptive_context(
+        &db,
+        &conv.id,
+        0,
+        current_turn.seq,
+        ProviderKind::Claude,
+        Some("haiku"),
+        0,
+        "Next turn",
+    ).unwrap();
+
+    // Hard budget guarantee must hold:
+    assert!(
+        result.working_tokens <= result.input_budget,
+        "Working tokens ({}) MUST be <= input_budget ({}) even for single huge turn",
+        result.working_tokens,
+        result.input_budget
+    );
+}
+
+#[test]
+fn test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle() {
+    use seralyn_lib::app::conversation::context::build_adaptive_context;
+    use seralyn_lib::app::db::provider_sessions::{create_provider_session_with_metadata, get_active_session_for_account_model, update_synced_seq};
+    use seralyn_lib::app::db::usage_snapshots::{save_usage_snapshot, get_latest_usage_snapshot};
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Full Lifecycle Opus-Haiku Switch")).unwrap();
+
+    // 1. Initial Opus 5 session (1M window) runs on account "work", processes turns 1..=500
+    for i in 1..=500 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(
+            &db,
+            &conv.id,
+            None,
+            role,
+            &format!("Turn {i}: content data chunk for large conversation testing"),
+            if role == "assistant" { Some("claude") } else { None },
+            None,
+            None,
+            None,
+        ).unwrap();
+    }
+
+    let opus_session = create_provider_session_with_metadata(
+        &db,
+        &conv.id,
+        "claude",
+        Some("opus-session-123"),
+        Some("opus"),
+        Some(r#"{"account":"work"}"#),
+    ).unwrap();
+    update_synced_seq(&db, &opus_session.id, 500).unwrap();
+
+    // Opus has recorded native usage snapshot of 400K tokens
+    save_usage_snapshot(&db, &conv.id, Some(&opus_session.id), Some(400_000), Some(10_000), None, None, None, Some(410_000), Some(1_000_000), "Exact").unwrap();
+
+    // Verify Opus session lookup by (account, model)
+    let found_opus = get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("opus")).unwrap().unwrap();
+    assert_eq!(found_opus.synced_through_seq, 500);
+    assert_eq!(found_opus.provider_session_id.as_deref(), Some("opus-session-123"));
+
+    // 2. User switches to Haiku 4.5 on account "work"
+    // Haiku session does not exist yet for (work, haiku)
+    let haiku_session_opt = get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("haiku")).unwrap();
+    assert!(haiku_session_opt.is_none(), "Haiku must not have an active session yet");
+
+    // Haiku starts at cursor 0 and has 0 native tokens
+    let haiku_active_cursor = 0;
+    let haiku_context = build_adaptive_context(
+        &db,
+        &conv.id,
+        haiku_active_cursor,
+        500,
+        ProviderKind::Claude,
+        Some("haiku"),
+        0,
+        "Current prompt for Haiku",
+    ).unwrap();
+
+    // Haiku receives compacted history fitting within its 150K budget
+    assert!(haiku_context.working_tokens <= haiku_context.input_budget);
+    assert!(haiku_context.compacted);
+    assert!(haiku_context.messages[0].content.contains("[Context Hand-off:"));
+
+    // Haiku creates its own native session and syncs through turn 500
+    let haiku_session = create_provider_session_with_metadata(
+        &db,
+        &conv.id,
+        "claude",
+        Some("haiku-session-456"),
+        Some("haiku"),
+        Some(r#"{"account":"work"}"#),
+    ).unwrap();
+    update_synced_seq(&db, &haiku_session.id, 500).unwrap();
+
+    // Haiku executes turns 501..=504
+    for i in 501..=504 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(
+            &db,
+            &conv.id,
+            None,
+            role,
+            &format!("Turn {i}: haiku specific turn"),
+            if role == "assistant" { Some("claude") } else { None },
+            None,
+            None,
+            None,
+        ).unwrap();
+    }
+    update_synced_seq(&db, &haiku_session.id, 504).unwrap();
+
+    // 3. User sends turn 505 and switches BACK to Opus 5 on account "work"
+    let turn_505 = messages::create_message(&db, &conv.id, None, "user", "Back to Opus prompt", None, None, None, None).unwrap();
+
+    // Look up active session for (work, opus) -> found Opus session!
+    let resumed_opus = get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("opus")).unwrap().unwrap();
+    assert_eq!(resumed_opus.provider_session_id.as_deref(), Some("opus-session-123"));
+    assert_eq!(resumed_opus.synced_through_seq, 500, "Opus sync cursor remained at 500!");
+
+    // Query usage snapshot for Opus:
+    let opus_usage = get_latest_usage_snapshot(&db, &conv.id, Some("claude"), Some("work"), Some("opus")).unwrap().unwrap();
+    let opus_existing_tokens = opus_usage.context_tokens.unwrap_or(0);
+    assert_eq!(opus_existing_tokens, 410_000);
+
+    // Build context for Opus: after_seq = 500, existing_native_tokens = 410_000
+    let opus_resumed_context = build_adaptive_context(
+        &db,
+        &conv.id,
+        resumed_opus.synced_through_seq,
+        turn_505.seq,
+        ProviderKind::Claude,
+        Some("opus"),
+        opus_existing_tokens,
+        "Back to Opus prompt",
+    ).unwrap();
+
+    // Verification:
+    // a) Opus ONLY receives delta messages since seq 500 (turns 501, 502, 503, 504)
+    assert_eq!(opus_resumed_context.messages.len(), 4);
+    assert_eq!(opus_resumed_context.messages[0].content, "Turn 501: haiku specific turn");
+    assert_eq!(opus_resumed_context.messages[3].content, "Turn 504: haiku specific turn");
+
+    // b) Zero compaction pollution: No handoff message
+    assert!(!opus_resumed_context.compacted);
+    assert!(!opus_resumed_context.messages.iter().any(|m| m.content.contains("Context Hand-off")));
+
+    // c) Available budget dynamically accounts for existing native tokens (1M - 84K reserve - 410K native - prompt)
+    assert!(opus_resumed_context.input_budget < 600_000, "Input budget must be reduced by 410K native context");
+    assert!(opus_resumed_context.working_tokens <= opus_resumed_context.input_budget);
 }
 
 

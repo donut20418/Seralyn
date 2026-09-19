@@ -39,8 +39,8 @@ pub struct ConversationWithMessages {
     pub provider_sessions: Vec<ProviderSessionRecord>,
 }
 
-/// Key for tracking active provider sessions per conversation, provider, and profile/account
-type SessionKey = (String, ProviderKind, String);
+/// Key for tracking active provider sessions per conversation, provider, profile/account, and model
+type SessionKey = (String, ProviderKind, String, String);
 
 #[derive(Clone)]
 pub struct ActiveSessionEntry {
@@ -91,7 +91,7 @@ impl ConversationManager {
             let mut sessions = self.active_sessions.lock().await;
             let keys: Vec<SessionKey> = sessions
                 .keys()
-                .filter(|(c_id, _, _)| c_id == id)
+                .filter(|(c_id, _, _, _)| c_id == id)
                 .cloned()
                 .collect();
             keys.into_iter().filter_map(|k| sessions.remove(&k)).collect()
@@ -193,10 +193,17 @@ impl ConversationManager {
         let provider_str = provider_kind.to_string();
         
         let profile_id = account.clone().unwrap_or_else(|| "default".to_string());
-        let session_key = (conversation_id.to_string(), provider_kind.clone(), profile_id.clone());
+        let model_id = model.clone().unwrap_or_else(|| "default".to_string());
+        let session_key = (conversation_id.to_string(), provider_kind.clone(), profile_id.clone(), model_id.clone());
         
-        // 2. Lookup existing provider session record in SQLite to determine sync cursor
-        let existing_record = provider_sessions::get_active_session_for_account(&self.db, conversation_id, &provider_str, Some(&profile_id))?;
+        // 2. Lookup existing provider session record in SQLite for this exact (account, model) to determine sync cursor
+        let existing_record = provider_sessions::get_active_session_for_account_model(
+            &self.db,
+            conversation_id,
+            &provider_str,
+            Some(&profile_id),
+            model.as_deref(),
+        )?;
         let synced_through_seq = existing_record.as_ref().map(|r| r.synced_through_seq).unwrap_or(0);
 
         // 3. Get existing session or create outside active_sessions lock
@@ -205,19 +212,7 @@ impl ConversationManager {
             sessions.get(&session_key).cloned()
         };
 
-        let should_reuse_session = if let Some(ref entry) = existing_entry {
-            if let Some(ref req_model) = model {
-                if let Some(ref curr_model) = entry.session.metadata().model {
-                    curr_model == req_model
-                } else {
-                    true
-                }
-            } else {
-                true
-            }
-        } else {
-            false
-        };
+        let should_reuse_session = existing_entry.is_some();
 
         let session: Arc<dyn ProviderSession> = if should_reuse_session {
             let entry = existing_entry.unwrap();
@@ -423,27 +418,7 @@ impl ConversationManager {
             }
         };
 
-        // 4. Calculate adaptive context delta between sync cursor and current message,
-        // enforcing target model's context window budget and applying compaction if delta exceeds budget
-        let adaptive_ctx = build_adaptive_context(
-            &self.db,
-            conversation_id,
-            synced_through_seq,
-            user_msg.seq,
-            provider_kind,
-            model.as_deref(),
-        )?;
-
-        // 5. Create ProviderMessage with content + adaptive context delta + attachments
-        let attachment_refs: Vec<crate::app::providers::AttachmentRef> = attachments
-            .iter()
-            .map(|a| crate::app::providers::AttachmentRef {
-                id: a.id.clone(),
-                path: std::path::PathBuf::from(&a.path),
-                mime_type: a.mime_type.clone(),
-            })
-            .collect();
-
+        // 4. Create provider_prompt with attachment header and user message content
         let provider_prompt = if !attachments.is_empty() {
             let attachment_header = attachments
                 .iter()
@@ -454,6 +429,40 @@ impl ConversationManager {
         } else {
             content.to_string()
         };
+
+        // 5. Query existing native tokens for this session from SQLite usage snapshots
+        let existing_native_tokens = if let Some(ref rec) = existing_record {
+            usage_snapshots::get_latest_usage_snapshot_for_session(&self.db, conversation_id, &rec.id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.context_tokens)
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        // 6. Calculate adaptive context delta between sync cursor and current message,
+        // factoring in existing native session context tokens and current prompt tokens
+        let adaptive_ctx = build_adaptive_context(
+            &self.db,
+            conversation_id,
+            synced_through_seq,
+            user_msg.seq,
+            provider_kind,
+            model.as_deref(),
+            existing_native_tokens,
+            &provider_prompt,
+        )?;
+
+        // 7. Create ProviderMessage with content + adaptive context delta + attachments
+        let attachment_refs: Vec<crate::app::providers::AttachmentRef> = attachments
+            .iter()
+            .map(|a| crate::app::providers::AttachmentRef {
+                id: a.id.clone(),
+                path: std::path::PathBuf::from(&a.path),
+                mime_type: a.mime_type.clone(),
+            })
+            .collect();
 
         let msg = ProviderMessage {
             content: provider_prompt,
@@ -488,25 +497,12 @@ impl ConversationManager {
         let profile_id = account.unwrap_or("default");
         let session = {
             let sessions = self.active_sessions.lock().await;
-            sessions
-                .get(&(conversation_id.to_string(), provider, profile_id.to_string()))
-                .map(|e| e.session.clone())
-                .or_else(|| {
-                    if account.is_none() {
-                        let matches: Vec<_> = sessions
-                            .iter()
-                            .filter(|((cid, p, _), _)| cid == conversation_id && *p == provider)
-                            .map(|(_, e)| e.session.clone())
-                            .collect();
-                        if matches.len() == 1 {
-                            matches.into_iter().next()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
+            let matches: Vec<_> = sessions
+                .iter()
+                .filter(|((cid, p, acc, _), _)| cid == conversation_id && *p == provider && (account.is_none() || acc == profile_id))
+                .map(|(_, e)| e.session.clone())
+                .collect();
+            matches.into_iter().next()
         };
         if let Some(session) = session {
             session.respond_to_approval(approval_id, approved).await?;
@@ -527,8 +523,9 @@ impl ConversationManager {
         conversation_id: &str,
         provider: Option<&str>,
         account: Option<&str>,
+        model: Option<&str>,
     ) -> Result<Option<UsageSnapshotRecord>> {
-        usage_snapshots::get_latest_usage_snapshot(&self.db, conversation_id, provider, account)
+        usage_snapshots::get_latest_usage_snapshot(&self.db, conversation_id, provider, account, model)
     }
 
     pub async fn interrupt_turn(
@@ -538,29 +535,15 @@ impl ConversationManager {
         account: Option<&str>,
     ) -> Result<()> {
         let profile_id = account.unwrap_or("default");
-        let session = {
+        let sessions_to_interrupt: Vec<Arc<dyn ProviderSession>> = {
             let sessions = self.active_sessions.lock().await;
             sessions
-                .get(&(conversation_id.to_string(), provider, profile_id.to_string()))
-                .map(|e| e.session.clone())
-                .or_else(|| {
-                    if account.is_none() {
-                        let matches: Vec<_> = sessions
-                            .iter()
-                            .filter(|((cid, p, _), _)| cid == conversation_id && *p == provider)
-                            .map(|(_, e)| e.session.clone())
-                            .collect();
-                        if matches.len() == 1 {
-                            matches.into_iter().next()
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                })
+                .iter()
+                .filter(|((cid, p, acc, _), _)| cid == conversation_id && *p == provider && (account.is_none() || acc == profile_id))
+                .map(|(_, e)| e.session.clone())
+                .collect()
         };
-        if let Some(session) = session {
+        for session in sessions_to_interrupt {
             let _ = session.interrupt().await;
         }
         Ok(())

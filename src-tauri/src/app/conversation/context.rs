@@ -113,6 +113,30 @@ pub fn calculate_input_budget(context_window: u64) -> u64 {
     context_window.saturating_sub(total_reserve)
 }
 
+pub fn calculate_available_input_budget(
+    context_window: u64,
+    existing_native_tokens: u64,
+    current_prompt_tokens: u64,
+) -> u64 {
+    let base_budget = calculate_input_budget(context_window);
+    base_budget
+        .saturating_sub(existing_native_tokens)
+        .saturating_sub(current_prompt_tokens)
+}
+
+pub fn safe_truncate_chars(s: &str, max_chars: usize) -> String {
+    s.chars().take(max_chars).collect()
+}
+
+pub fn safe_suffix_chars(s: &str, max_chars: usize) -> String {
+    let total_chars = s.chars().count();
+    if total_chars <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().skip(total_chars - max_chars).collect()
+    }
+}
+
 pub fn compact_older_messages(older: &[ContextMessage]) -> String {
     let mut summary = String::new();
     for (i, msg) in older.iter().enumerate() {
@@ -124,9 +148,10 @@ pub fn compact_older_messages(older: &[ContextMessage]) -> String {
         };
 
         let trimmed = msg.content.trim();
-        let condensed = if trimmed.len() > 600 {
-            let prefix = &trimmed[..300];
-            let suffix = &trimmed[trimmed.len() - 250..];
+        let char_count = trimmed.chars().count();
+        let condensed = if char_count > 600 {
+            let prefix = safe_truncate_chars(trimmed, 300);
+            let suffix = safe_suffix_chars(trimmed, 250);
             format!("{} ... [truncated for handoff] ... {}", prefix.trim(), suffix.trim())
         } else {
             trimmed.to_string()
@@ -144,11 +169,14 @@ pub fn build_adaptive_context(
     before_seq: i64,
     provider: ProviderKind,
     model: Option<&str>,
+    existing_native_tokens: u64,
+    current_prompt: &str,
 ) -> Result<AdaptiveContextResult> {
     let raw_delta = build_context_delta(db, conversation_id, after_seq, before_seq)?;
     let context_window = resolve_model_context_window(provider, model);
-    let input_budget = calculate_input_budget(context_window);
     let tm = TokenManager::new();
+    let current_prompt_tokens = TokenManager::estimate_tokens(current_prompt);
+    let input_budget = calculate_available_input_budget(context_window, existing_native_tokens, current_prompt_tokens).max(500);
     let canonical_tokens = estimate_context_tokens(&raw_delta, &tm);
 
     if canonical_tokens <= input_budget {
@@ -163,17 +191,30 @@ pub fn build_adaptive_context(
     }
 
     // Compaction required:
-    // Allocate up to ~60% of input budget to recent raw messages
+    // Allocate up to ~60% of available input budget to recent raw messages
     let recent_quota = (input_budget * 6) / 10;
     let mut recent_messages = Vec::new();
     let mut recent_tokens: u64 = 0;
     let mut split_idx = raw_delta.len();
 
     for (idx, msg) in raw_delta.iter().enumerate().rev() {
-        let msg_tokens = TokenManager::estimate_tokens(&msg.content);
-        if recent_tokens + msg_tokens <= recent_quota || recent_messages.is_empty() {
+        let mut msg_content = msg.content.clone();
+        let mut msg_tokens = TokenManager::estimate_tokens(&msg_content);
+
+        // Edge case protection: if a single message exceeds recent_quota, safely truncate its content
+        if msg_tokens > recent_quota && recent_messages.is_empty() {
+            let max_chars = (recent_quota as usize) * 4;
+            msg_content = safe_truncate_chars(&msg_content, max_chars);
+            msg_tokens = TokenManager::estimate_tokens(&msg_content);
+        }
+
+        if recent_tokens + msg_tokens <= recent_quota {
             recent_tokens += msg_tokens;
-            recent_messages.push(msg.clone());
+            recent_messages.push(ContextMessage {
+                role: msg.role.clone(),
+                content: msg_content,
+                provider: msg.provider.clone(),
+            });
             split_idx = idx;
         } else {
             break;
@@ -187,7 +228,7 @@ pub fn build_adaptive_context(
 
     let model_name = model.unwrap_or("target model");
     let handoff_content = format!(
-        "[Context Hand-off: Prior ~{} tokens compacted from canonical history to fit {} input budget ({} tokens)]\n\n### Summary of Previous Context & Key Decisions:\n{}\n[End of Compacted Summary — Following messages are recent raw turns]",
+        "[Context Hand-off: Prior ~{} tokens compacted from canonical history to fit {} input budget ({} tokens)]\n\n### Condensed Prior Context:\n{}\n[End of Compacted Summary — Following messages are recent raw turns]",
         older_tokens, model_name, input_budget, summary_digest
     );
 
@@ -199,7 +240,20 @@ pub fn build_adaptive_context(
     });
     result_messages.extend(recent_messages);
 
-    let working_tokens = estimate_context_tokens(&result_messages, &tm);
+    let mut working_tokens = estimate_context_tokens(&result_messages, &tm);
+
+    // Hard budget guarantee: shrink recent messages if summary + recent still exceeds input_budget
+    while working_tokens > input_budget && result_messages.len() > 1 {
+        result_messages.remove(1);
+        working_tokens = estimate_context_tokens(&result_messages, &tm);
+    }
+
+    // If summary header alone exceeds budget, truncate it to fit
+    if working_tokens > input_budget && !result_messages.is_empty() {
+        let max_summary_chars = (input_budget as usize) * 4;
+        result_messages[0].content = safe_truncate_chars(&result_messages[0].content, max_summary_chars);
+        working_tokens = estimate_context_tokens(&result_messages, &tm);
+    }
 
     Ok(AdaptiveContextResult {
         messages: result_messages,

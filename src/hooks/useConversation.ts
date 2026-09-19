@@ -40,7 +40,7 @@ export function useConversation() {
     }
   }, []);
 
-  const selectConversation = useCallback(async (id: string, provider?: ProviderKind, account?: string) => {
+  const selectConversation = useCallback(async (id: string, provider?: ProviderKind, account?: string, model?: string) => {
     setIsLoading(true);
     setErrorMessage(null);
     try {
@@ -50,9 +50,9 @@ export function useConversation() {
       setMessages(messages);
       setProviderSessions(provider_sessions || []);
 
-      // Fetch latest usage snapshot scoped to provider and account
+      // Fetch latest usage snapshot scoped to provider, account, and model
       try {
-        const usage = await api.getConversationUsage(id, provider, account);
+        const usage = await api.getConversationUsage(id, provider, account, model);
         setCurrentUsage(usage);
       } catch (err) {
         console.warn('Could not fetch usage snapshot:', err);
@@ -65,11 +65,11 @@ export function useConversation() {
     }
   }, []);
 
-  const fetchUsage = useCallback(async (convId?: string | null, provider?: ProviderKind, account?: string) => {
+  const fetchUsage = useCallback(async (convId?: string | null, provider?: ProviderKind, account?: string, model?: string) => {
     const targetId = convId || currentConversationId;
     if (!targetId) return;
     try {
-      const usage = await api.getConversationUsage(targetId, provider, account);
+      const usage = await api.getConversationUsage(targetId, provider, account, model);
       setCurrentUsage(usage);
     } catch (err) {
       console.warn('Could not fetch usage snapshot:', err);
@@ -338,7 +338,7 @@ export function useConversation() {
         setActiveTools([]);
         break;
     }
-  }, [currentConversationId, selectConversation, loadConversations]);
+  }, [currentConversationId, selectConversation, loadConversations, streamingAccount]);
 
   return {
     currentConversationId,

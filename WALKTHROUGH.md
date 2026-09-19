@@ -755,3 +755,41 @@ Following the external audit of commit `5120b61`, Phase 2.4 delivers the full **
   4. `test_canonical_db_fidelity_unmodified_by_compaction`: Asserts SQLite messages and token estimates remain identical and unmutated before and after compaction.
   5. `test_switch_back_to_larger_session_resumes_without_compaction_pollution`: Verifies that returning to a large-window session fetches incremental canonical delta without compacted summary artifacts.
 
+---
+
+## Phase 2.5 — Model-Specific Session Identity, Dynamic Context Budgeting, and UTF-8 Safe Compaction
+
+Following external audit on commit `331cbec`, Phase 2.5 closes all remaining gaps in model switching, cross-model sync cursors, dynamic budget accounting, and multi-byte / Thai UTF-8 character boundary safety.
+
+### 1. Model-Specific Session Identity & True Cross-Model Sync Cursors (`provider_sessions.rs`, `conversation/mod.rs`)
+- **4-Tuple Active Session Identity**: `active_sessions` is now keyed by `(conversation_id, provider, account, model)` instead of `(conversation_id, provider, account)`.
+- **Database Function**: Added `get_active_session_for_account_model(db, conversation_id, provider, account, model)` in `provider_sessions.rs`.
+- **True Cross-Model Sync Cursors**:
+  - Opus 5 (1M) and Haiku 4.5 (200K) under the same account (e.g. `work`) maintain independent native sessions and sync cursors in SQLite.
+  - When switching from Opus 5 (cursor 500) to Haiku 4.5, Haiku starts at `after_seq = 0`, sees the full canonical history, and receives a compacted handoff fitting its 150K budget.
+  - When switching back to Opus 5, Opus finds its existing native session with cursor 500, querying only incremental turns (> 500) with zero compaction pollution.
+- **Unit Test**: Added `test_active_session_for_account_model_isolation` in `provider_sessions.rs`.
+
+### 2. Dynamic Available Budget Accounting for Existing Native Context & Prompts (`context.rs`, `conversation/mod.rs`)
+- **`calculate_available_input_budget(context_window, existing_native_tokens, current_prompt_tokens)`**:
+  - `available_budget = calculate_input_budget(context_window).saturating_sub(existing_native_tokens).saturating_sub(current_prompt_tokens).max(500)`.
+- **Native Context Awareness**: In `send_message_with_attachments`, Seralyn queries the session's recorded token footprint (`usage_snapshots::get_latest_usage_snapshot_for_session`) and passes `existing_native_tokens` into `build_adaptive_context`.
+- **Attachment Header Budgeting**: Seralyn formats `provider_prompt` (including attachment headers) before calculating context delta, ensuring attachment metadata is factored into the budget calculation.
+
+### 3. UTF-8 / Thai-Safe Compaction & Hard Budget Guarantee (`context.rs`)
+- **Character Boundary Slicing**: Implemented `safe_truncate_chars` and `safe_suffix_chars` using Unicode scalar iterator `.chars()`, replacing byte indexing (`&s[..300]`) which panicked on Thai and multibyte characters.
+- **Single Huge Turn Protection**: If a single turn exceeds the recent quota, it is safely truncated using character boundary slicing rather than overflowing the budget.
+- **Iterative Shrinking Loop**: An iterative loop guarantees `working_tokens <= input_budget`, trimming recent messages and truncating the handoff header if needed.
+- **Standardized Handoff Wording**: Uses deterministic format: `"[Context Hand-off: Prior ~{} tokens compacted from canonical history to fit {} input budget ({} tokens)]\n\n### Condensed Prior Context:\n{}\n[End of Compacted Summary — Following messages are recent raw turns]"`.
+
+### 4. Context Meter Model Scoping & Stale Closure Fix (`usage_snapshots.rs`, `main.rs`, `api.ts`, `useConversation.ts`, `App.tsx`)
+- **Model-Scoped Snapshots**: Added `model: Option<&str>` filtering to `get_latest_usage_snapshot` in `usage_snapshots.rs`, `main.rs`, and `api.ts`.
+- **UI State Fix**: Added `streamingAccount` to `handleEvent` dependency array in `useConversation.ts` to prevent stale closure during account switches.
+- **Active Model Fetching**: `selectModel` and `handleSelectConversation` in `App.tsx` pass `modelId` to `fetchUsage` and `selectConversation`.
+- **Inspector Sync Cursors**: In `App.tsx`, `nativeSessions` and `syncCursors` resolution matches against the current active account and model.
+
+### 5. Automated Verification Tests (`fixtures_tests.rs`)
+1. `test_adaptive_context_thai_unicode_safety`: Proves no panics on Thai strings and validates UTF-8 integrity under compaction.
+2. `test_adaptive_context_hard_budget_guarantee_single_large_message`: Tests a single 180K token message against a 150K budget, guaranteeing `working_tokens <= input_budget`.
+3. `test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle`: Tests full cross-model handoff lifecycle (Opus cursor 500 -> Haiku cursor 0 with handoff -> Opus resume cursor 500 with zero compaction pollution and dynamic native budget deduction).
+

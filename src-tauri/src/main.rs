@@ -166,11 +166,12 @@ async fn get_conversation_usage(
     conversation_id: String,
     provider: Option<String>,
     account: Option<String>,
+    model: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Option<UsageSnapshotRecord>, String> {
     state
         .conversation_manager
-        .get_conversation_usage(&conversation_id, provider.as_deref(), account.as_deref())
+        .get_conversation_usage(&conversation_id, provider.as_deref(), account.as_deref(), model.as_deref())
         .map_err(|e| e.to_string())
 }
 
