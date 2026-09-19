@@ -91,7 +91,7 @@ impl ConversationManager {
             let mut sessions = self.active_sessions.lock().await;
             let keys: Vec<SessionKey> = sessions
                 .keys()
-                .filter(|(c_id, _)| c_id == id)
+                .filter(|(c_id, _, _)| c_id == id)
                 .cloned()
                 .collect();
             keys.into_iter().filter_map(|k| sessions.remove(&k)).collect()

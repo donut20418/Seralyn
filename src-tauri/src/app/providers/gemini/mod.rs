@@ -497,6 +497,7 @@ impl ProviderSession for GeminiSession {
         }
 
         // Cross-provider context injection:
+        let prompt_text = format_context_for_prompt(&message.context, &message.content);
         let mut prompt_params = json!({
             "sessionId": sid,
             "prompt": [
