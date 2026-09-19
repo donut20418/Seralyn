@@ -95,6 +95,7 @@ export default function App() {
     fetchUsage,
     interrupt,
     respondToApproval,
+    streamingAccount,
     handleEvent,
   } = useConversation();
 
@@ -618,7 +619,11 @@ export default function App() {
             messages={presentationMessages}
             generating={isStreaming}
             onRespondApproval={(approved) =>
-              respondToApproval(streamingProvider || activeProvider, approved)
+              respondToApproval(
+                streamingProvider || activeProvider,
+                approved,
+                streamingAccount || selection.accountId
+              )
             }
           />
 
@@ -632,7 +637,12 @@ export default function App() {
             accountUsage={accountUsage}
             generating={isStreaming}
             onSend={handleSend}
-            onStop={() => interrupt(streamingProvider || activeProvider)}
+            onStop={() =>
+              interrupt(
+                streamingProvider || activeProvider,
+                streamingAccount || selection.accountId
+              )
+            }
             webOpen={browserOpen}
             onToggleWeb={() => setBrowserOpen((o) => !o)}
             onManageProviders={() => setInspectorOpen(true)}

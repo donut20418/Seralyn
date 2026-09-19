@@ -16,7 +16,7 @@ use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::json_rpc::{JsonRpcNotification, JsonRpcServerRequest, JsonRpcTransport};
 use crate::app::process::{detect_executable, spawn, SpawnConfig};
 use crate::app::providers::{
-    AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
+    resolve_profile_dir, AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
     ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
 use parser::{codex_notification_to_normalized, codex_server_request_to_normalized};
@@ -80,8 +80,8 @@ impl Provider for CodexProvider {
 
     async fn create_session(&self, config: SessionConfig) -> Result<Box<dyn ProviderSession>> {
         let mut env = config.env.clone();
-        if let Some(acc) = &config.account {
-            env.insert("CODEX_PROFILE".to_string(), acc.clone());
+        if let Some(profile_dir) = resolve_profile_dir(ProviderKind::Codex, config.account.as_deref()) {
+            env.insert("CODEX_HOME".to_string(), profile_dir.to_string_lossy().to_string());
         }
 
         let spawn_config = SpawnConfig {
@@ -126,7 +126,7 @@ impl Provider for CodexProvider {
             start_params["model"] = json!(model);
         }
         if let Some(effort) = config.effort.as_ref().filter(|e| !e.is_empty()) {
-            start_params["reasoningEffort"] = json!(effort);
+            start_params["effort"] = json!(effort);
         }
 
         // 4. thread/start request -> await response containing threadId
@@ -161,11 +161,16 @@ impl Provider for CodexProvider {
         native_session_id: &str,
         config: SessionConfig,
     ) -> Result<Box<dyn ProviderSession>> {
+        let mut env = config.env.clone();
+        if let Some(profile_dir) = resolve_profile_dir(ProviderKind::Codex, config.account.as_deref()) {
+            env.insert("CODEX_HOME".to_string(), profile_dir.to_string_lossy().to_string());
+        }
+
         let spawn_config = SpawnConfig {
             executable: "codex".to_string(),
             args: vec!["app-server".to_string(), "--listen".to_string(), "stdio://".to_string()],
             working_dir: config.working_dir.clone(),
-            env: config.env.clone(),
+            env,
             startup_timeout: Duration::from_secs(10),
         };
 
@@ -354,7 +359,7 @@ impl ProviderSession for CodexSession {
             turn_params["model"] = json!(m);
         }
         if let Some(e) = &self.effort {
-            turn_params["reasoningEffort"] = json!(e);
+            turn_params["effort"] = json!(e);
         }
 
         let turn_resp = self.transport.request("turn/start", turn_params).await?;

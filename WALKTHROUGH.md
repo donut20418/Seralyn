@@ -641,5 +641,40 @@ Following external audit feedback on commit `87d8e2a`, the provider adapters wer
 ### 6. Accurate Model Catalog Definition
 - The catalog is defined as: **"Static configured model/profile catalog + live CLI installation/auth/capability status"**. Model and account menus are populated from validated configurations, with live CLI health checks indicating availability and credentials.
 
+---
+
+## Phase 2.2 — CLI Profile Isolation, Codex/Claude Effort Alignment, and Exact Account Routing
+
+Following the Phase 2.1 external audit, we resolved the remaining protocol, multi-account auth isolation, and routing items:
+
+### 1. Codex App-Server Schema Alignment (`codex/mod.rs`)
+- **Fix**: Replaced incorrect `"reasoningEffort"` parameter with native `"effort"` in both `thread/start` and `turn/start` (`TurnStartParams` schema: `effort?: ReasoningEffort`).
+
+### 2. Exact Account Routing for Stop & Approvals (`conversation/mod.rs`, `main.rs`, `api.ts`, `useConversation.ts`)
+- **Fix**: Replaced broad provider-wide iteration with exact-account targeting:
+  - `interrupt_turn(conversation_id, provider, account)`: Dispatches interrupt signal specifically to `(conversation_id, provider, profile_id)`.
+  - `respond_to_approval(conversation_id, provider, account, approval_id, approved)`: Routes approval response directly to the active session corresponding to that profile.
+  - Eliminates crosstalk where interrupting one profile (e.g. Work) mistakenly interrupted other active sessions (e.g. Personal).
+
+### 3. Claude Code Native `--effort` Flag (`claude/mod.rs`)
+- **Fix**: Replaced artificial token math and `--max-thinking-tokens` mapping with native Claude Code top-level flag `--effort <level>`.
+
+### 4. CLI Multi-Account State Isolation (`providers/mod.rs`, `claude/`, `codex/`, `gemini/`)
+- Implemented `resolve_profile_dir(provider, account)` isolating state directories for named profiles under `%LOCALAPPDATA%/Seralyn/profiles/<provider>/<account>`:
+  - **Claude**: Injects `CLAUDE_CONFIG_DIR` pointing to dedicated profile directory. Removed non-standard `--profile` flag.
+  - **Codex**: Injects `CODEX_HOME` pointing to dedicated profile directory. Removed non-standard `CODEX_PROFILE`.
+  - **Gemini**: Injects `GEMINI_CLI_HOME` pointing to dedicated profile directory. Removed non-standard `--account` flag.
+  - Default accounts (`account = None` or `"default"`) fall back to user's standard CLI state for seamless out-of-the-box operation.
+
+### 5. Gemini ACP Payload Schema Cleanliness (`gemini/mod.rs`)
+- Removed non-standard `"model"` parameter from ACP JSON-RPC requests (`session/new`, `session/load`, `session/prompt`), relying cleanly on `--model <model>` process startup argument.
+
+### 6. Scoped `last_used_at` DB Update (`conversation/mod.rs`)
+- Used `provider_sessions::get_active_session_for_account` to ensure `last_used_at` updates the exact active account record in SQLite.
+
+### 7. Automated Contract & Isolation Tests (`fixtures_tests.rs`)
+- `test_multi_account_same_provider_isolation_and_exact_routing`: Proves 2 distinct accounts on the same provider run in parallel, interrupt and approval route to the exact target account, and SQLite maintains isolated records.
+- `test_adapter_profile_isolation_and_native_effort_contracts`: Asserts `resolve_profile_dir` behavior, Codex `"effort"` schema, and Gemini ACP payload cleanliness.
+
 
 

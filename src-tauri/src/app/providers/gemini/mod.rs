@@ -17,7 +17,7 @@ use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::json_rpc::{JsonRpcNotification, JsonRpcServerRequest, JsonRpcTransport};
 use crate::app::process::{detect_executable, spawn, SpawnConfig};
 use crate::app::providers::{
-    AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
+    resolve_profile_dir, AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
     ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
 use parser::{gemini_notification_to_normalized, gemini_server_request_to_normalized};
@@ -113,11 +113,8 @@ impl Provider for GeminiProvider {
         }
 
         let mut env = config.env.clone();
-        if let Some(acc) = &config.account {
-            args.push("--account".to_string());
-            args.push(acc.clone());
-            env.insert("GEMINI_ACCOUNT".to_string(), acc.clone());
-            env.insert("GOOGLE_ACCOUNT".to_string(), acc.clone());
+        if let Some(profile_dir) = resolve_profile_dir(ProviderKind::Gemini, config.account.as_deref()) {
+            env.insert("GEMINI_CLI_HOME".to_string(), profile_dir.to_string_lossy().to_string());
         }
 
         let spawn_config = SpawnConfig {
@@ -154,15 +151,13 @@ impl Provider for GeminiProvider {
         }
 
         // Step 2: session/new request -> await response to extract real sessionId
-        let mut new_params = json!({
-            "cwd": cwd_str,
-            "mcpServers": []
-        });
-        if let Some(m) = &config.model {
-            new_params["model"] = json!(m);
-        }
-
-        let new_resp = transport.request("session/new", new_params).await?;
+        let new_resp = transport.request(
+            "session/new",
+            json!({
+                "cwd": cwd_str,
+                "mcpServers": []
+            }),
+        ).await?;
 
         let session_id = new_resp
             .get("sessionId")
@@ -212,11 +207,8 @@ impl Provider for GeminiProvider {
         }
 
         let mut env = config.env.clone();
-        if let Some(acc) = &config.account {
-            args.push("--account".to_string());
-            args.push(acc.clone());
-            env.insert("GEMINI_ACCOUNT".to_string(), acc.clone());
-            env.insert("GOOGLE_ACCOUNT".to_string(), acc.clone());
+        if let Some(profile_dir) = resolve_profile_dir(ProviderKind::Gemini, config.account.as_deref()) {
+            env.insert("GEMINI_CLI_HOME".to_string(), profile_dir.to_string_lossy().to_string());
         }
 
         let spawn_config = SpawnConfig {
@@ -253,16 +245,14 @@ impl Provider for GeminiProvider {
         }
 
         // Step 2: session/load request -> await response
-        let mut load_params = json!({
-            "sessionId": native_session_id,
-            "cwd": cwd_str,
-            "mcpServers": []
-        });
-        if let Some(m) = &config.model {
-            load_params["model"] = json!(m);
-        }
-
-        let _ = transport.request("session/load", load_params).await?;
+        let _ = transport.request(
+            "session/load",
+            json!({
+                "sessionId": native_session_id,
+                "cwd": cwd_str,
+                "mcpServers": []
+            }),
+        ).await?;
 
         let session = GeminiSession::new(
             transport,
@@ -498,7 +488,7 @@ impl ProviderSession for GeminiSession {
 
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
-        let mut prompt_params = json!({
+        let prompt_params = json!({
             "sessionId": sid,
             "prompt": [
                 {
@@ -507,9 +497,6 @@ impl ProviderSession for GeminiSession {
                 }
             ]
         });
-        if let Some(m) = &self.model {
-            prompt_params["model"] = json!(m);
-        }
 
         let _ = self.transport.request_with_timeout(
             "session/prompt",

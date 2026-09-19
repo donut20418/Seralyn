@@ -61,12 +61,32 @@ export async function detectProviders(): Promise<ProviderStatus[]> {
   return invoke('detect_providers');
 }
 
-export async function respondToApproval(conversationId: string, provider: ProviderKind, approvalId: string, approved: boolean): Promise<void> {
-  return invoke('respond_to_approval', { conversationId, provider, approvalId, approved });
+export async function respondToApproval(
+  conversationId: string,
+  provider: ProviderKind,
+  approvalId: string,
+  approved: boolean,
+  account?: string,
+): Promise<void> {
+  return invoke('respond_to_approval', {
+    conversationId,
+    provider,
+    approvalId,
+    approved,
+    account: account || null,
+  });
 }
 
-export async function interruptTurn(conversationId: string, provider: ProviderKind): Promise<void> {
-  return invoke('interrupt_turn', { conversationId, provider });
+export async function interruptTurn(
+  conversationId: string,
+  provider: ProviderKind,
+  account?: string,
+): Promise<void> {
+  return invoke('interrupt_turn', {
+    conversationId,
+    provider,
+    account: account || null,
+  });
 }
 
 export async function saveAttachment(conversationId: string, fileName: string, fileData: number[], mimeType?: string): Promise<AttachmentInfo> {

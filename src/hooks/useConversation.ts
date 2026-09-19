@@ -28,6 +28,7 @@ export function useConversation() {
   const [pendingApproval, setPendingApproval] = useState<PendingApproval | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [streamingProvider, setStreamingProvider] = useState<ProviderKind | null>(null);
+  const [streamingAccount, setStreamingAccount] = useState<string | null>(null);
 
   const loadConversations = useCallback(async () => {
     try {
@@ -151,6 +152,7 @@ export function useConversation() {
     if (!targetId) return;
     setIsStreaming(true);
     setStreamingProvider(provider);
+    setStreamingAccount(account || null);
     setStreamingContent('');
     setStreamingThinking('');
     setActiveTools([]);
@@ -177,34 +179,42 @@ export function useConversation() {
       console.error(e);
       setIsStreaming(false);
       setStreamingProvider(null);
+      setStreamingAccount(null);
       setErrorMessage(String(e));
     }
   }, [currentConversationId, messages]);
 
-  const interrupt = useCallback(async (providerOverride?: ProviderKind) => {
+  const interrupt = useCallback(async (providerOverride?: ProviderKind, accountOverride?: string) => {
     if (!currentConversationId) return;
     const targetProvider = providerOverride || streamingProvider;
     if (!targetProvider) return;
     try {
-      await api.interruptTurn(currentConversationId, targetProvider);
+      await api.interruptTurn(currentConversationId, targetProvider, accountOverride || streamingAccount || undefined);
       setIsStreaming(false);
       setStreamingProvider(null);
+      setStreamingAccount(null);
     } catch (e) {
       console.error('Failed to interrupt:', e);
     }
-  }, [currentConversationId, streamingProvider]);
+  }, [currentConversationId, streamingProvider, streamingAccount]);
 
-  const respondToApproval = useCallback(async (provider: ProviderKind, approved: boolean) => {
+  const respondToApproval = useCallback(async (provider: ProviderKind, approved: boolean, accountOverride?: string) => {
     if (!currentConversationId || !pendingApproval) return;
     const approvalId = pendingApproval.approval_id;
     setPendingApproval(null);
     try {
-      await api.respondToApproval(currentConversationId, provider, approvalId, approved);
+      await api.respondToApproval(
+        currentConversationId,
+        provider,
+        approvalId,
+        approved,
+        accountOverride || streamingAccount || undefined,
+      );
     } catch (e) {
       console.error('Failed to respond to approval:', e);
       setErrorMessage(String(e));
     }
-  }, [currentConversationId, pendingApproval]);
+  }, [currentConversationId, pendingApproval, streamingAccount]);
 
   const handleEvent = useCallback((event: NormalizedEvent) => {
     if (event.conversation_id !== currentConversationId) return;
@@ -308,6 +318,8 @@ export function useConversation() {
 
       case 'Error':
         setIsStreaming(false);
+        setStreamingProvider(null);
+        setStreamingAccount(null);
         if (event.payload.kind === 'Error') {
           setErrorMessage(event.payload.message);
         }
@@ -317,6 +329,8 @@ export function useConversation() {
 
       case 'SessionFinished':
         setIsStreaming(false);
+        setStreamingProvider(null);
+        setStreamingAccount(null);
         selectConversation(currentConversationId, event.provider);
         loadConversations();
         setStreamingContent('');
@@ -335,6 +349,7 @@ export function useConversation() {
     isLoading,
     isStreaming,
     streamingProvider,
+    streamingAccount,
     streamingContent,
     streamingThinking,
     currentUsage,

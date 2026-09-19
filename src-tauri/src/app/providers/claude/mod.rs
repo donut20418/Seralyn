@@ -13,8 +13,8 @@ use crate::app::error::Result;
 use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::{detect_executable, spawn, ManagedProcess, SpawnConfig};
 use crate::app::providers::{
-    AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
-    ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
+    resolve_profile_dir, AuthStatus, InstallationInfo, PermissionMode, Provider,
+    ProviderCapabilities, ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
 use parser::{claude_event_to_normalized, parse_claude_line, ClaudeEvent};
 
@@ -179,26 +179,16 @@ impl ProviderSession for ClaudeSession {
             args.push(m.clone());
         }
 
-        // 2. Account profile flag & env
+        // 2. Account profile isolation via dedicated config directory
         let mut env = self.config.env.clone();
-        if let Some(acc) = &self.config.account {
-            args.push("--profile".to_string());
-            args.push(acc.clone());
-            env.insert("CLAUDE_PROFILE".to_string(), acc.clone());
+        if let Some(profile_dir) = resolve_profile_dir(ProviderKind::Claude, self.config.account.as_deref()) {
+            env.insert("CLAUDE_CONFIG_DIR".to_string(), profile_dir.to_string_lossy().to_string());
         }
 
-        // 3. Reasoning effort mapping
+        // 3. Native reasoning effort flag
         if let Some(effort) = &self.config.effort {
-            let tokens = match effort.as_str() {
-                "low" => 1024,
-                "medium" => 4096,
-                "high" => 16384,
-                "xhigh" => 32768,
-                _ => 4096,
-            };
-            args.push("--max-thinking-tokens".to_string());
-            args.push(tokens.to_string());
-            env.insert("ANTHROPIC_THINKING_BUDGET".to_string(), tokens.to_string());
+            args.push("--effort".to_string());
+            args.push(effort.clone());
         }
 
         // Resume flag semantics

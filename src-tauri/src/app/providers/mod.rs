@@ -310,3 +310,28 @@ pub struct ProviderStatus {
     pub capabilities: ProviderCapabilities,
     pub error: Option<String>,
 }
+
+/// Resolves an isolated profile directory for a given provider and account.
+/// Returns None if account is None, empty, or "default".
+pub fn resolve_profile_dir(provider: ProviderKind, account: Option<&str>) -> Option<PathBuf> {
+    let acc = account?;
+    if acc.trim().is_empty() || acc == "default" {
+        return None;
+    }
+    let safe_name: String = acc
+        .chars()
+        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect();
+    if safe_name.is_empty() {
+        return None;
+    }
+
+    let mut path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
+    path.push("Seralyn");
+    path.push("profiles");
+    path.push(provider.to_string());
+    path.push(safe_name);
+
+    let _ = std::fs::create_dir_all(&path);
+    Some(path)
+}

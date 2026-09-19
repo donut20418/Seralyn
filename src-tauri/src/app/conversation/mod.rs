@@ -457,7 +457,7 @@ impl ConversationManager {
         // This completely prevents approval and interrupt deadlocks!
         session.send(msg).await?;
         
-        if let Some(record) = provider_sessions::get_active_session(&self.db, conversation_id, &provider_str)? {
+        if let Some(record) = provider_sessions::get_active_session_for_account(&self.db, conversation_id, &provider_str, Some(&profile_id))? {
             provider_sessions::update_session_used(&self.db, &record.id)?;
         }
 
@@ -473,18 +473,34 @@ impl ConversationManager {
         &self,
         conversation_id: &str,
         provider: ProviderKind,
+        account: Option<&str>,
         approval_id: &str,
         approved: bool,
     ) -> Result<()> {
-        let matching_sessions: Vec<Arc<dyn ProviderSession>> = {
+        let profile_id = account.unwrap_or("default");
+        let session = {
             let sessions = self.active_sessions.lock().await;
             sessions
-                .iter()
-                .filter(|((cid, p, _), _)| cid == conversation_id && *p == provider)
-                .map(|(_, e)| e.session.clone())
-                .collect()
+                .get(&(conversation_id.to_string(), provider, profile_id.to_string()))
+                .map(|e| e.session.clone())
+                .or_else(|| {
+                    if account.is_none() {
+                        let matches: Vec<_> = sessions
+                            .iter()
+                            .filter(|((cid, p, _), _)| cid == conversation_id && *p == provider)
+                            .map(|(_, e)| e.session.clone())
+                            .collect();
+                        if matches.len() == 1 {
+                            matches.into_iter().next()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
         };
-        for session in matching_sessions {
+        if let Some(session) = session {
             session.respond_to_approval(approval_id, approved).await?;
         }
         Ok(())
@@ -510,16 +526,32 @@ impl ConversationManager {
         &self,
         conversation_id: &str,
         provider: ProviderKind,
+        account: Option<&str>,
     ) -> Result<()> {
-        let matching_sessions: Vec<Arc<dyn ProviderSession>> = {
+        let profile_id = account.unwrap_or("default");
+        let session = {
             let sessions = self.active_sessions.lock().await;
             sessions
-                .iter()
-                .filter(|((cid, p, _), _)| cid == conversation_id && *p == provider)
-                .map(|(_, e)| e.session.clone())
-                .collect()
+                .get(&(conversation_id.to_string(), provider, profile_id.to_string()))
+                .map(|e| e.session.clone())
+                .or_else(|| {
+                    if account.is_none() {
+                        let matches: Vec<_> = sessions
+                            .iter()
+                            .filter(|((cid, p, _), _)| cid == conversation_id && *p == provider)
+                            .map(|(_, e)| e.session.clone())
+                            .collect();
+                        if matches.len() == 1 {
+                            matches.into_iter().next()
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
         };
-        for session in matching_sessions {
+        if let Some(session) = session {
             let _ = session.interrupt().await;
         }
         Ok(())

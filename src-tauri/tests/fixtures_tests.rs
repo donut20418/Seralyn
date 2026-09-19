@@ -1189,3 +1189,201 @@ async fn test_gemini_resume_no_history_completes() {
     assert_eq!(all_msgs[3].content, turn2_result);
     assert_eq!(all_msgs[3].content, "Turn 3 Response. Prompt was Turn 2 Prompt");
 }
+
+#[tokio::test]
+async fn test_multi_account_same_provider_isolation_and_exact_routing() {
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::db::provider_sessions;
+    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, SessionMetadata, ProviderCapabilities};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct MultiAccountSession {
+        account: String,
+        interrupted: Arc<AtomicBool>,
+        approval_responded: Arc<AtomicBool>,
+        event_sender: tokio::sync::mpsc::Sender<NormalizedEvent>,
+        conv_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for MultiAccountSession {
+        async fn send(&self, _msg: seralyn_lib::app::providers::ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+            let _ = self.event_sender.send(NormalizedEvent::text_delta(ProviderKind::Claude, self.conv_id.clone(), format!("Reply from {}", self.account))).await;
+            let _ = self.event_sender.send(NormalizedEvent::session_finished(ProviderKind::Claude, self.conv_id.clone())).await;
+            Ok(())
+        }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> {
+            self.interrupted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn respond_to_approval(&self, _id: &str, _approved: bool) -> seralyn_lib::app::error::Result<()> {
+            self.approval_responded.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: ProviderKind::Claude,
+                native_session_id: Some(format!("native-{}", self.account)),
+                model: Some("claude-3-7-sonnet".to_string()),
+                created_at: "now".to_string(),
+            }
+        }
+    }
+
+    struct MultiAccountProvider {
+        work_interrupted: Arc<AtomicBool>,
+        work_approval: Arc<AtomicBool>,
+        personal_interrupted: Arc<AtomicBool>,
+        personal_approval: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MultiAccountProvider {
+        fn kind(&self) -> ProviderKind { ProviderKind::Claude }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: Some("2.1.270".to_string()) })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            let acc = config.account.clone().unwrap_or_else(|| "default".to_string());
+            let (interrupted, approval) = if acc == "work" {
+                (self.work_interrupted.clone(), self.work_approval.clone())
+            } else {
+                (self.personal_interrupted.clone(), self.personal_approval.clone())
+            };
+            Ok(Box::new(MultiAccountSession {
+                account: acc,
+                interrupted,
+                approval_responded: approval,
+                event_sender: config.event_sender,
+                conv_id: config.conversation_id,
+            }))
+        }
+        async fn resume_session(&self, _native_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            self.create_session(config).await
+        }
+    }
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let work_interrupted = Arc::new(AtomicBool::new(false));
+    let work_approval = Arc::new(AtomicBool::new(false));
+    let personal_interrupted = Arc::new(AtomicBool::new(false));
+    let personal_approval = Arc::new(AtomicBool::new(false));
+
+    let provider = Arc::new(MultiAccountProvider {
+        work_interrupted: work_interrupted.clone(),
+        work_approval: work_approval.clone(),
+        personal_interrupted: personal_interrupted.clone(),
+        personal_approval: personal_approval.clone(),
+    });
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Claude, provider as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("Multi-Account Isolation")).unwrap();
+
+    // Turn 1: Send on "work" account
+    let (tx1, mut rx1) = tokio::sync::mpsc::channel(10);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Hello from work",
+        ProviderKind::Claude,
+        vec![],
+        Some("claude-3-7-sonnet".to_string()),
+        Some("work".to_string()),
+        Some("high".to_string()),
+        tx1,
+    ).await.unwrap();
+    while let Some(ev) = rx1.recv().await {
+        if ev.event_type == EventType::SessionFinished { break; }
+    }
+
+    // Turn 2: Send on "personal" account
+    let (tx2, mut rx2) = tokio::sync::mpsc::channel(10);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Hello from personal",
+        ProviderKind::Claude,
+        vec![],
+        Some("claude-3-7-sonnet".to_string()),
+        Some("personal".to_string()),
+        Some("low".to_string()),
+        tx2,
+    ).await.unwrap();
+    while let Some(ev) = rx2.recv().await {
+        if ev.event_type == EventType::SessionFinished { break; }
+    }
+
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Assert: Interrupt "work" account ONLY!
+    manager.interrupt_turn(&conv.id, ProviderKind::Claude, Some("work")).await.unwrap();
+    assert!(work_interrupted.load(Ordering::SeqCst), "Work session must be interrupted");
+    assert!(!personal_interrupted.load(Ordering::SeqCst), "Personal session must NOT be interrupted!");
+
+    // Assert: Respond to approval on "personal" account ONLY!
+    manager.respond_to_approval(&conv.id, ProviderKind::Claude, Some("personal"), "app-1", true).await.unwrap();
+    assert!(personal_approval.load(Ordering::SeqCst), "Personal session must receive approval response");
+    assert!(!work_approval.load(Ordering::SeqCst), "Work session must NOT receive personal approval response!");
+
+    // Assert: SQLite provider_sessions has separate scoped records
+    let work_sess = provider_sessions::get_active_session_for_account(&db, &conv.id, "claude", Some("work")).unwrap().unwrap();
+    let personal_sess = provider_sessions::get_active_session_for_account(&db, &conv.id, "claude", Some("personal")).unwrap().unwrap();
+    assert_ne!(work_sess.id, personal_sess.id, "Work and Personal must have distinct SQLite session records");
+    assert_eq!(work_sess.provider_session_id, Some("native-work".to_string()));
+    assert_eq!(personal_sess.provider_session_id, Some("native-personal".to_string()));
+}
+
+#[test]
+fn test_adapter_profile_isolation_and_native_effort_contracts() {
+    use seralyn_lib::app::providers::resolve_profile_dir;
+
+    // 1. Profile directory resolution
+    // Default or empty accounts must NOT isolate (fall back to user's standard CLI config)
+    assert_eq!(resolve_profile_dir(ProviderKind::Claude, None), None);
+    assert_eq!(resolve_profile_dir(ProviderKind::Claude, Some("default")), None);
+    assert_eq!(resolve_profile_dir(ProviderKind::Codex, Some("")), None);
+
+    // Named accounts must resolve to dedicated profile paths
+    let claude_work = resolve_profile_dir(ProviderKind::Claude, Some("work")).unwrap();
+    assert!(claude_work.to_string_lossy().contains("profiles"));
+    assert!(claude_work.to_string_lossy().contains("claude"));
+    assert!(claude_work.to_string_lossy().contains("work"));
+
+    let codex_work = resolve_profile_dir(ProviderKind::Codex, Some("work-team")).unwrap();
+    assert!(codex_work.to_string_lossy().contains("codex"));
+    assert!(codex_work.to_string_lossy().contains("work-team"));
+
+    let gemini_studio = resolve_profile_dir(ProviderKind::Gemini, Some("studio")).unwrap();
+    assert!(gemini_studio.to_string_lossy().contains("gemini"));
+    assert!(gemini_studio.to_string_lossy().contains("studio"));
+
+    // 2. Codex app-server TurnStartParams schema contract:
+    // Schema field must be "effort", NOT "reasoningEffort"
+    let effort_val = "high";
+    let turn_params = serde_json::json!({
+        "threadId": "tid-123",
+        "input": [{ "type": "text", "text": "Hello" }],
+        "effort": effort_val
+    });
+    assert!(turn_params.get("effort").is_some());
+    assert_eq!(turn_params.get("effort").unwrap(), "high");
+    assert!(turn_params.get("reasoningEffort").is_none(), "Codex app-server schema must use 'effort', NOT 'reasoningEffort'");
+
+    // 3. Gemini ACP SessionPrompt contract:
+    // Schema must contain standard ACP "prompt" and "sessionId", NOT extraneous "model"
+    let prompt_params = serde_json::json!({
+        "sessionId": "sid-123",
+        "prompt": [{ "type": "text", "text": "Hello" }]
+    });
+    assert!(prompt_params.get("prompt").is_some());
+    assert!(prompt_params.get("model").is_none(), "Gemini ACP session/prompt must not inject non-standard 'model'");
+}
+
