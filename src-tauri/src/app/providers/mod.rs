@@ -158,6 +158,10 @@ pub struct SessionConfig {
     pub system_prompt: Option<String>,
     /// Model override (if None, use provider default).
     pub model: Option<String>,
+    /// Account / Profile identifier.
+    pub account: Option<String>,
+    /// Reasoning effort level.
+    pub effort: Option<String>,
     /// Additional environment variables.
     pub env: HashMap<String, String>,
     /// Channel to send normalized events through.

@@ -73,17 +73,22 @@ impl Provider for CodexProvider {
             native_compact: false,
             token_usage: true,
             context_window: false,
-            reasoning: false,
+            reasoning: true,
             streaming: true,
         }
     }
 
     async fn create_session(&self, config: SessionConfig) -> Result<Box<dyn ProviderSession>> {
+        let mut env = config.env.clone();
+        if let Some(acc) = &config.account {
+            env.insert("CODEX_PROFILE".to_string(), acc.clone());
+        }
+
         let spawn_config = SpawnConfig {
             executable: "codex".to_string(),
             args: vec!["app-server".to_string(), "--listen".to_string(), "stdio://".to_string()],
             working_dir: config.working_dir.clone(),
-            env: config.env.clone(),
+            env,
             startup_timeout: Duration::from_secs(10),
         };
 
@@ -117,8 +122,11 @@ impl Provider for CodexProvider {
         if let Some(prompt) = config.system_prompt.filter(|s| !s.is_empty()) {
             start_params["baseInstructions"] = json!(prompt);
         }
-        if let Some(model) = config.model.filter(|m| !m.is_empty()) {
+        if let Some(model) = config.model.as_ref().filter(|m| !m.is_empty()) {
             start_params["model"] = json!(model);
+        }
+        if let Some(effort) = config.effort.as_ref().filter(|e| !e.is_empty()) {
+            start_params["reasoningEffort"] = json!(effort);
         }
 
         // 4. thread/start request -> await response containing threadId
@@ -136,6 +144,8 @@ impl Provider for CodexProvider {
             transport,
             thread_id,
             config.conversation_id,
+            config.model,
+            config.effort,
             config.event_sender,
             notif_rx,
             server_req_rx,
@@ -185,6 +195,8 @@ impl Provider for CodexProvider {
             transport,
             Some(native_session_id.to_string()),
             config.conversation_id,
+            config.model,
+            config.effort,
             config.event_sender,
             notif_rx,
             server_req_rx,
@@ -201,6 +213,8 @@ pub struct CodexSession {
     thread_id: Arc<RwLock<Option<String>>>,
     active_turn_id: Arc<RwLock<Option<String>>>,
     conversation_id: String,
+    model: Option<String>,
+    effort: Option<String>,
     event_sender: mpsc::Sender<NormalizedEvent>,
     created_at: String,
     notif_rx: Arc<Mutex<Option<mpsc::Receiver<JsonRpcNotification>>>>,
@@ -213,6 +227,8 @@ impl CodexSession {
         transport: Arc<JsonRpcTransport>,
         thread_id: Option<String>,
         conversation_id: String,
+        model: Option<String>,
+        effort: Option<String>,
         event_sender: mpsc::Sender<NormalizedEvent>,
         notif_rx: mpsc::Receiver<JsonRpcNotification>,
         server_req_rx: mpsc::Receiver<JsonRpcServerRequest>,
@@ -222,6 +238,8 @@ impl CodexSession {
             thread_id: Arc::new(RwLock::new(thread_id)),
             active_turn_id: Arc::new(RwLock::new(None)),
             conversation_id,
+            model,
+            effort,
             event_sender,
             created_at: Utc::now().to_rfc3339(),
             notif_rx: Arc::new(Mutex::new(Some(notif_rx))),
@@ -325,16 +343,21 @@ impl ProviderSession for CodexSession {
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
 
-        let turn_resp = self.transport.request(
-            "turn/start",
-            json!({
-                "threadId": tid,
-                "input": [{
-                    "type": "text",
-                    "text": prompt_text,
-                }],
-            }),
-        ).await?;
+        let mut turn_params = json!({
+            "threadId": tid,
+            "input": [{
+                "type": "text",
+                "text": prompt_text,
+            }],
+        });
+        if let Some(m) = &self.model {
+            turn_params["model"] = json!(m);
+        }
+        if let Some(e) = &self.effort {
+            turn_params["reasoningEffort"] = json!(e);
+        }
+
+        let turn_resp = self.transport.request("turn/start", turn_params).await?;
 
         if let Some(turn_id) = turn_resp
             .get("turn")
@@ -419,7 +442,7 @@ impl ProviderSession for CodexSession {
         SessionMetadata {
             provider: ProviderKind::Codex,
             native_session_id: self.native_session_id(),
-            model: None,
+            model: self.model.clone(),
             created_at: self.created_at.clone(),
         }
     }

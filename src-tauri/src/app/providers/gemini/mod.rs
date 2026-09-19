@@ -100,16 +100,31 @@ impl Provider for GeminiProvider {
 
         let cwd_str = resolve_canonical_cwd(config.working_dir.as_deref());
 
+        let mut args = vec![
+            "--acp".to_string(),
+            "--skip-trust".to_string(),
+            "--approval-mode".to_string(),
+            approval_mode.to_string(),
+        ];
+
+        if let Some(m) = &config.model {
+            args.push("--model".to_string());
+            args.push(m.clone());
+        }
+
+        let mut env = config.env.clone();
+        if let Some(acc) = &config.account {
+            args.push("--account".to_string());
+            args.push(acc.clone());
+            env.insert("GEMINI_ACCOUNT".to_string(), acc.clone());
+            env.insert("GOOGLE_ACCOUNT".to_string(), acc.clone());
+        }
+
         let spawn_config = SpawnConfig {
             executable: "gemini".to_string(),
-            args: vec![
-                "--acp".to_string(),
-                "--skip-trust".to_string(),
-                "--approval-mode".to_string(),
-                approval_mode.to_string(),
-            ],
+            args,
             working_dir: config.working_dir.clone(),
-            env: config.env.clone(),
+            env,
             startup_timeout: Duration::from_secs(10),
         };
 
@@ -139,13 +154,15 @@ impl Provider for GeminiProvider {
         }
 
         // Step 2: session/new request -> await response to extract real sessionId
-        let new_resp = transport.request(
-            "session/new",
-            json!({
-                "cwd": cwd_str,
-                "mcpServers": []
-            }),
-        ).await?;
+        let mut new_params = json!({
+            "cwd": cwd_str,
+            "mcpServers": []
+        });
+        if let Some(m) = &config.model {
+            new_params["model"] = json!(m);
+        }
+
+        let new_resp = transport.request("session/new", new_params).await?;
 
         let session_id = new_resp
             .get("sessionId")
@@ -182,16 +199,31 @@ impl Provider for GeminiProvider {
 
         let cwd_str = resolve_canonical_cwd(config.working_dir.as_deref());
 
+        let mut args = vec![
+            "--acp".to_string(),
+            "--skip-trust".to_string(),
+            "--approval-mode".to_string(),
+            approval_mode.to_string(),
+        ];
+
+        if let Some(m) = &config.model {
+            args.push("--model".to_string());
+            args.push(m.clone());
+        }
+
+        let mut env = config.env.clone();
+        if let Some(acc) = &config.account {
+            args.push("--account".to_string());
+            args.push(acc.clone());
+            env.insert("GEMINI_ACCOUNT".to_string(), acc.clone());
+            env.insert("GOOGLE_ACCOUNT".to_string(), acc.clone());
+        }
+
         let spawn_config = SpawnConfig {
             executable: "gemini".to_string(),
-            args: vec![
-                "--acp".to_string(),
-                "--skip-trust".to_string(),
-                "--approval-mode".to_string(),
-                approval_mode.to_string(),
-            ],
+            args,
             working_dir: config.working_dir.clone(),
-            env: config.env.clone(),
+            env,
             startup_timeout: Duration::from_secs(10),
         };
 
@@ -221,14 +253,16 @@ impl Provider for GeminiProvider {
         }
 
         // Step 2: session/load request -> await response
-        let _ = transport.request(
-            "session/load",
-            json!({
-                "sessionId": native_session_id,
-                "cwd": cwd_str,
-                "mcpServers": []
-            }),
-        ).await?;
+        let mut load_params = json!({
+            "sessionId": native_session_id,
+            "cwd": cwd_str,
+            "mcpServers": []
+        });
+        if let Some(m) = &config.model {
+            load_params["model"] = json!(m);
+        }
+
+        let _ = transport.request("session/load", load_params).await?;
 
         let session = GeminiSession::new(
             transport,
@@ -463,19 +497,22 @@ impl ProviderSession for GeminiSession {
         }
 
         // Cross-provider context injection:
-        let prompt_text = format_context_for_prompt(&message.context, &message.content);
+        let mut prompt_params = json!({
+            "sessionId": sid,
+            "prompt": [
+                {
+                    "type": "text",
+                    "text": prompt_text,
+                }
+            ]
+        });
+        if let Some(m) = &self.model {
+            prompt_params["model"] = json!(m);
+        }
 
         let _ = self.transport.request_with_timeout(
             "session/prompt",
-            json!({
-                "sessionId": sid,
-                "prompt": [
-                    {
-                        "type": "text",
-                        "text": prompt_text,
-                    }
-                ]
-            }),
+            prompt_params,
             Some(std::time::Duration::from_secs(1800)), // 30 mins for thinking, tool execution, and user approvals
         ).await?;
 

@@ -39,8 +39,8 @@ pub struct ConversationWithMessages {
     pub provider_sessions: Vec<ProviderSessionRecord>,
 }
 
-/// Key for tracking active provider sessions per conversation and provider
-type SessionKey = (String, ProviderKind);
+/// Key for tracking active provider sessions per conversation, provider, and profile/account
+type SessionKey = (String, ProviderKind, String);
 
 #[derive(Clone)]
 pub struct ActiveSessionEntry {
@@ -173,6 +173,7 @@ impl ConversationManager {
             None,
             model.as_deref(),
             None,
+            None,
             user_metadata.as_deref(),
         )?;
 
@@ -191,10 +192,11 @@ impl ConversationManager {
         let provider = self.provider_manager.get(provider_kind.clone())?;
         let provider_str = provider_kind.to_string();
         
-        let session_key = (conversation_id.to_string(), provider_kind.clone());
+        let profile_id = account.clone().unwrap_or_else(|| "default".to_string());
+        let session_key = (conversation_id.to_string(), provider_kind.clone(), profile_id.clone());
         
         // 2. Lookup existing provider session record in SQLite to determine sync cursor
-        let existing_record = provider_sessions::get_active_session(&self.db, conversation_id, &provider_str)?;
+        let existing_record = provider_sessions::get_active_session_for_account(&self.db, conversation_id, &provider_str, Some(&profile_id))?;
         let synced_through_seq = existing_record.as_ref().map(|r| r.synced_through_seq).unwrap_or(0);
 
         // 3. Get existing session or create outside active_sessions lock
@@ -204,14 +206,11 @@ impl ConversationManager {
         };
 
         let should_reuse_session = if let Some(ref entry) = existing_entry {
-            if let Some(ref req_model) = model {
-                if let Some(ref current_model) = entry.session.metadata().model {
-                    current_model == req_model
-                } else {
-                    true
-                }
-            } else {
-                true
+            let current_model = entry.session.metadata().model;
+            match (&current_model, &model) {
+                (Some(curr), Some(req)) => curr == req,
+                (None, None) => true,
+                _ => false, // model changed -> re-create session with new model!
             }
         } else {
             false
@@ -244,50 +243,57 @@ impl ConversationManager {
                 permission_mode: PermissionMode::Safe,
                 system_prompt: None,
                 model: model.clone(),
+                account: account.clone(),
+                effort: effort.clone(),
                 env,
                 event_sender: internal_tx,
             };
             
-            let (sess, provider_session_id): (Arc<dyn ProviderSession>, String) = match &existing_record {
-                Some(record) if record.provider_session_id.is_some() => {
-                    let native_id = record.provider_session_id.as_ref().unwrap();
-                    match provider.resume_session(native_id, config.clone()).await {
-                        Ok(sess) => (Arc::from(sess), record.id.clone()),
-                        Err(_) => {
-                            let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
-                            let rec = provider_sessions::create_provider_session(
-                                &self.db,
-                                conversation_id,
-                                &provider_str,
-                                sess.native_session_id().as_deref(),
-                                model.as_deref().or(sess.metadata().model.as_deref()),
-                            )?;
-                            (sess, rec.id)
-                        }
+            let can_resume = if let Some(ref record) = existing_record {
+                if record.provider_session_id.is_some() {
+                    match (&record.model, &model) {
+                        (Some(curr), Some(req)) => curr == req,
+                        (None, None) => true,
+                        _ => false, // model changed from previous record -> spawn fresh session
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+
+            let (sess, provider_session_id): (Arc<dyn ProviderSession>, String) = if can_resume {
+                let record = existing_record.as_ref().unwrap();
+                let native_id = record.provider_session_id.as_ref().unwrap();
+                match provider.resume_session(native_id, config.clone()).await {
+                    Ok(sess) => (Arc::from(sess), record.id.clone()),
+                    Err(_) => {
+                        let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
+                        let meta_json = serde_json::json!({ "account": profile_id }).to_string();
+                        let rec = provider_sessions::create_provider_session_with_metadata(
+                            &self.db,
+                            conversation_id,
+                            &provider_str,
+                            sess.native_session_id().as_deref(),
+                            model.as_deref().or(sess.metadata().model.as_deref()),
+                            Some(&meta_json),
+                        )?;
+                        (sess, rec.id)
                     }
                 }
-                Some(record) => {
-                    let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
-                    let rec = provider_sessions::create_provider_session(
-                        &self.db,
-                        conversation_id,
-                        &provider_str,
-                        sess.native_session_id().as_deref(),
-                        model.as_deref().or(sess.metadata().model.as_deref()),
-                    )?;
-                    (sess, rec.id)
-                }
-                None => {
-                    let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
-                    let rec = provider_sessions::create_provider_session(
-                        &self.db,
-                        conversation_id,
-                        &provider_str,
-                        sess.native_session_id().as_deref(),
-                        model.as_deref().or(sess.metadata().model.as_deref()),
-                    )?;
-                    (sess, rec.id)
-                }
+            } else {
+                let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
+                let meta_json = serde_json::json!({ "account": profile_id }).to_string();
+                let rec = provider_sessions::create_provider_session_with_metadata(
+                    &self.db,
+                    conversation_id,
+                    &provider_str,
+                    sess.native_session_id().as_deref(),
+                    model.as_deref().or(sess.metadata().model.as_deref()),
+                    Some(&meta_json),
+                )?;
+                (sess, rec.id)
             };
 
             // If session reports a native ID immediately, persist it
@@ -463,11 +469,15 @@ impl ConversationManager {
         approval_id: &str,
         approved: bool,
     ) -> Result<()> {
-        let session = {
+        let matching_sessions: Vec<Arc<dyn ProviderSession>> = {
             let sessions = self.active_sessions.lock().await;
-            sessions.get(&(conversation_id.to_string(), provider)).map(|e| e.session.clone())
+            sessions
+                .iter()
+                .filter(|((cid, p, _), _)| cid == conversation_id && *p == provider)
+                .map(|(_, e)| e.session.clone())
+                .collect()
         };
-        if let Some(session) = session {
+        for session in matching_sessions {
             session.respond_to_approval(approval_id, approved).await?;
         }
         Ok(())
@@ -494,12 +504,16 @@ impl ConversationManager {
         conversation_id: &str,
         provider: ProviderKind,
     ) -> Result<()> {
-        let session = {
+        let matching_sessions: Vec<Arc<dyn ProviderSession>> = {
             let sessions = self.active_sessions.lock().await;
-            sessions.get(&(conversation_id.to_string(), provider)).map(|e| e.session.clone())
+            sessions
+                .iter()
+                .filter(|((cid, p, _), _)| cid == conversation_id && *p == provider)
+                .map(|(_, e)| e.session.clone())
+                .collect()
         };
-        if let Some(session) = session {
-            session.interrupt().await?;
+        for session in matching_sessions {
+            let _ = session.interrupt().await;
         }
         Ok(())
     }

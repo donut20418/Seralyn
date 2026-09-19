@@ -173,6 +173,34 @@ impl ProviderSession for ClaudeSession {
             "--include-partial-messages".to_string(),
         ];
 
+        // 1. Model flag
+        if let Some(m) = &self.model {
+            args.push("--model".to_string());
+            args.push(m.clone());
+        }
+
+        // 2. Account profile flag & env
+        let mut env = self.config.env.clone();
+        if let Some(acc) = &self.config.account {
+            args.push("--profile".to_string());
+            args.push(acc.clone());
+            env.insert("CLAUDE_PROFILE".to_string(), acc.clone());
+        }
+
+        // 3. Reasoning effort mapping
+        if let Some(effort) = &self.config.effort {
+            let tokens = match effort.as_str() {
+                "low" => 1024,
+                "medium" => 4096,
+                "high" => 16384,
+                "xhigh" => 32768,
+                _ => 4096,
+            };
+            args.push("--max-thinking-tokens".to_string());
+            args.push(tokens.to_string());
+            env.insert("ANTHROPIC_THINKING_BUDGET".to_string(), tokens.to_string());
+        }
+
         // Resume flag semantics
         if let Some(sid) = &sid_opt {
             args.push("--resume".to_string());
@@ -188,7 +216,7 @@ impl ProviderSession for ClaudeSession {
             executable: "claude".to_string(),
             args,
             working_dir: self.config.working_dir.clone(),
-            env: self.config.env.clone(),
+            env,
             startup_timeout: Duration::from_secs(10),
         };
 

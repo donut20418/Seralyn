@@ -598,7 +598,48 @@ Following the external audit of commit `2bbc081`, all reported P1 items and mock
 - **Dynamic User Identifier**: `Sidebar.tsx` footer displays dynamic `userName` and avatar initial rather than static mock text.
 
 ### 6. Provider Core Frozen Boundary
-- Comparison against baseline confirms **zero lines changed** in `src-tauri/src/app/providers/{claude,codex,gemini}/*`.
+- Comparison against baseline confirms **zero lines changed** in `src-tauri/src/app/providers/{claude,codex,gemini}/*` prior to the authorized scoped unfreeze.
+
+---
+
+## Phase 2.1 — Scoped Adapter Unfreeze: Native Model, Account & Effort CLI Wiring
+
+Following external audit feedback on commit `87d8e2a`, the provider adapters were unfrozen in a targeted, scoped manner to wire `model`, `account`, and `reasoning effort` natively into each CLI's specific protocol/flags, while fixing the CI `Cargo Check` argument mismatch:
+
+### 1. Rust Compiler Fix (`conversation/mod.rs`)
+- **Fix**: Updated `messages::create_message_with_metadata` call to pass all 10 arguments, properly supplying `token_estimate: None` before `user_metadata`. This resolves the `Cargo Check` failure on CI.
+
+### 2. Multi-Account Session Key & SQLite Persistence (`conversation/mod.rs`, `db/provider_sessions.rs`)
+- **3-Tuple Active Session Key**: Changed in-memory `active_sessions` key from `(conversation_id, provider_kind)` to `(conversation_id, provider_kind, profile_id)`, where `profile_id = account.unwrap_or("default")`. Multiple accounts for the same provider can now coexist without collision.
+- **SQLite Profile Metadata**: Added `create_provider_session_with_metadata` to record `metadata_json` with profile/account information, and `get_active_session_for_account` to resume native sessions scoped to the selected account.
+- **Model Switch Safety**: In-memory session reuse and SQLite native session resumption now verify `record.model == req_model`. If the user selects a different model, Seralyn safely spawns a fresh session with the new model instead of reusing the old model's session.
+- **Multi-Session Dispatch**: `interrupt_turn` and `respond_to_approval` safely query and dispatch across all matching sessions for `(conversation_id, provider)`.
+
+### 3. Native Claude Code CLI Adapter Wiring (`claude/mod.rs`)
+- In `ClaudeSession::send`:
+  - `--model <model>`: Injected into CLI arguments when a model is selected.
+  - `--profile <account>` & `CLAUDE_PROFILE`: Set in process args and environment variables.
+  - `--max-thinking-tokens <budget>` & `ANTHROPIC_THINKING_BUDGET`: Mapped from effort levels:
+    - `"low"` -> 1024 tokens
+    - `"medium"` -> 4096 tokens
+    - `"high"` -> 16384 tokens
+    - `"max"` -> 32768 tokens
+
+### 4. Native Gemini ACP Adapter Wiring (`gemini/mod.rs`)
+- In `create_session` & `resume_session`:
+  - `--model <model>`: Appended to process startup arguments.
+  - `--account <account>` & `GEMINI_ACCOUNT` / `GOOGLE_ACCOUNT`: Appended to process arguments and environment variables.
+  - ACP JSON-RPC `"model": model`: Passed in `session/new`, `session/load`, and `session/prompt` payloads.
+
+### 5. Native Codex App-Server Adapter Wiring (`codex/mod.rs`)
+- **Reasoning Capability**: Set `reasoning: true` in `CodexProvider::capabilities()` so frontend reasoning effort controls remain active.
+- **Environment**: Set `CODEX_PROFILE` in process environment when an account is selected.
+- **Protocol Payloads**:
+  - Injected `"model": model` and `"reasoningEffort": effort` into both `thread/start` and `turn/start`.
+  - Added `model` and `effort` fields to `CodexSession`, and updated `metadata().model` to return `self.model.clone()`.
+
+### 6. Accurate Model Catalog Definition
+- The catalog is defined as: **"Static configured model/profile catalog + live CLI installation/auth/capability status"**. Model and account menus are populated from validated configurations, with live CLI health checks indicating availability and credentials.
 
 
 
