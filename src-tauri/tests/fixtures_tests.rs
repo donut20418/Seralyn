@@ -1616,7 +1616,7 @@ fn test_canonical_db_fidelity_unmodified_by_compaction() {
     ).unwrap();
 
     // Query SQLite messages table directly: verify canonical records are 100% intact!
-    let all_messages = messages::get_conversation_messages(&db, &conv.id).unwrap();
+    let all_messages = messages::get_messages(&db, &conv.id).unwrap();
     assert_eq!(all_messages.len(), 3);
     assert_eq!(all_messages[0].content, original_content_1);
     assert_eq!(all_messages[1].content, original_content_2);
