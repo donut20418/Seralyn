@@ -221,9 +221,6 @@ impl ConversationManager {
             *tx_guard = Some(event_sender.clone());
             entry.session.clone()
         } else {
-            if let Some(entry) = existing_entry {
-                let _ = entry.session.close().await;
-            }
             // Creation/resumption happens OUTSIDE active_sessions lock!
             let (internal_tx, mut internal_rx) = mpsc::channel(100);
             

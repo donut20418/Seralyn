@@ -1766,7 +1766,7 @@ fn test_adaptive_context_hard_budget_guarantee_single_large_message() {
 fn test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle() {
     use seralyn_lib::app::conversation::context::build_adaptive_context;
     use seralyn_lib::app::db::provider_sessions::{create_provider_session_with_metadata, get_active_session_for_account_model, update_synced_seq};
-    use seralyn_lib::app::db::usage_snapshots::{save_usage_snapshot, get_latest_usage_snapshot};
+    use seralyn_lib::app::db::usage_snapshots::{create_usage_snapshot, get_latest_usage_snapshot};
 
     let db = Database::new_in_memory().unwrap();
     db.run_migrations().unwrap();
@@ -1800,7 +1800,7 @@ fn test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle() {
     update_synced_seq(&db, &opus_session.id, 500).unwrap();
 
     // Opus has recorded native usage snapshot of 400K tokens
-    save_usage_snapshot(&db, &conv.id, Some(&opus_session.id), Some(400_000), Some(10_000), None, None, None, Some(410_000), Some(1_000_000), "Exact").unwrap();
+    create_usage_snapshot(&db, &conv.id, Some(&opus_session.id), Some(400_000), Some(10_000), None, None, None, Some(410_000), Some(1_000_000), "Exact").unwrap();
 
     // Verify Opus session lookup by (account, model)
     let found_opus = get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("opus")).unwrap().unwrap();
@@ -1879,7 +1879,7 @@ fn test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle() {
         turn_505.seq,
         ProviderKind::Claude,
         Some("opus"),
-        opus_existing_tokens,
+        opus_existing_tokens as u64,
         "Back to Opus prompt",
     ).unwrap();
 
