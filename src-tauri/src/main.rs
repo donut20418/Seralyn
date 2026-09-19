@@ -165,11 +165,12 @@ async fn update_conversation_title(
 async fn get_conversation_usage(
     conversation_id: String,
     provider: Option<String>,
+    account: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Option<UsageSnapshotRecord>, String> {
     state
         .conversation_manager
-        .get_conversation_usage(&conversation_id, provider.as_deref())
+        .get_conversation_usage(&conversation_id, provider.as_deref(), account.as_deref())
         .map_err(|e| e.to_string())
 }
 

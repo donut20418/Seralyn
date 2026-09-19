@@ -151,7 +151,7 @@ export default function App() {
         effort: reconcileEffort(provider, prev.effort, providers),
       }));
       if (currentConversationId) {
-        fetchUsage(currentConversationId, provider);
+        fetchUsage(currentConversationId, provider, accountId);
       }
     },
     [setActiveProvider, providers, currentConversationId, fetchUsage],
@@ -259,7 +259,7 @@ export default function App() {
   }));
 
   const handleSelectConversation = (id: string) => {
-    selectConversation(id, selection.provider);
+    selectConversation(id, selection.provider, selection.accountId);
   };
 
   const handleNewChat = useCallback(async () => {

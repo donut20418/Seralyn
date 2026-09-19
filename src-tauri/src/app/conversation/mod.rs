@@ -5,7 +5,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::app::conversation::context::build_context_delta;
+use crate::app::conversation::context::{build_adaptive_context, build_context_delta};
 pub use crate::app::db::conversations::{Conversation, ConversationSummary};
 use crate::app::db::conversations;
 pub use crate::app::db::messages::Message;
@@ -423,10 +423,18 @@ impl ConversationManager {
             }
         };
 
-        // 4. Calculate exact context delta between sync cursor and current message
-        let context_delta = build_context_delta(&self.db, conversation_id, synced_through_seq, user_msg.seq)?;
+        // 4. Calculate adaptive context delta between sync cursor and current message,
+        // enforcing target model's context window budget and applying compaction if delta exceeds budget
+        let adaptive_ctx = build_adaptive_context(
+            &self.db,
+            conversation_id,
+            synced_through_seq,
+            user_msg.seq,
+            provider_kind,
+            model.as_deref(),
+        )?;
 
-        // 5. Create ProviderMessage with content + missing context delta + attachments
+        // 5. Create ProviderMessage with content + adaptive context delta + attachments
         let attachment_refs: Vec<crate::app::providers::AttachmentRef> = attachments
             .iter()
             .map(|a| crate::app::providers::AttachmentRef {
@@ -449,7 +457,7 @@ impl ConversationManager {
 
         let msg = ProviderMessage {
             content: provider_prompt,
-            context: context_delta,
+            context: adaptive_ctx.messages,
             attachments: attachment_refs,
         };
 
@@ -518,8 +526,9 @@ impl ConversationManager {
         &self,
         conversation_id: &str,
         provider: Option<&str>,
+        account: Option<&str>,
     ) -> Result<Option<UsageSnapshotRecord>> {
-        usage_snapshots::get_latest_usage_snapshot(&self.db, conversation_id, provider)
+        usage_snapshots::get_latest_usage_snapshot(&self.db, conversation_id, provider, account)
     }
 
     pub async fn interrupt_turn(

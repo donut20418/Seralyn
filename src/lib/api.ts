@@ -97,6 +97,6 @@ export async function deleteAttachment(conversationId: string, attachmentId: str
   return invoke('delete_attachment', { conversationId, attachmentId });
 }
 
-export async function getConversationUsage(conversationId: string, provider?: ProviderKind): Promise<UsageSnapshot | null> {
-  return invoke('get_conversation_usage', { conversationId, provider });
+export async function getConversationUsage(conversationId: string, provider?: ProviderKind, account?: string): Promise<UsageSnapshot | null> {
+  return invoke('get_conversation_usage', { conversationId, provider, account });
 }

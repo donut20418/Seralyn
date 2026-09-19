@@ -40,7 +40,7 @@ export function useConversation() {
     }
   }, []);
 
-  const selectConversation = useCallback(async (id: string, provider?: ProviderKind) => {
+  const selectConversation = useCallback(async (id: string, provider?: ProviderKind, account?: string) => {
     setIsLoading(true);
     setErrorMessage(null);
     try {
@@ -50,9 +50,9 @@ export function useConversation() {
       setMessages(messages);
       setProviderSessions(provider_sessions || []);
 
-      // Fetch latest usage snapshot scoped to provider
+      // Fetch latest usage snapshot scoped to provider and account
       try {
-        const usage = await api.getConversationUsage(id, provider);
+        const usage = await api.getConversationUsage(id, provider, account);
         setCurrentUsage(usage);
       } catch (err) {
         console.warn('Could not fetch usage snapshot:', err);
@@ -65,11 +65,11 @@ export function useConversation() {
     }
   }, []);
 
-  const fetchUsage = useCallback(async (convId?: string | null, provider?: ProviderKind) => {
+  const fetchUsage = useCallback(async (convId?: string | null, provider?: ProviderKind, account?: string) => {
     const targetId = convId || currentConversationId;
     if (!targetId) return;
     try {
-      const usage = await api.getConversationUsage(targetId, provider);
+      const usage = await api.getConversationUsage(targetId, provider, account);
       setCurrentUsage(usage);
     } catch (err) {
       console.warn('Could not fetch usage snapshot:', err);
@@ -323,7 +323,7 @@ export function useConversation() {
         if (event.payload.kind === 'Error') {
           setErrorMessage(event.payload.message);
         }
-        selectConversation(currentConversationId, event.provider);
+        selectConversation(currentConversationId, event.provider, streamingAccount || undefined);
         loadConversations();
         break;
 
@@ -331,7 +331,7 @@ export function useConversation() {
         setIsStreaming(false);
         setStreamingProvider(null);
         setStreamingAccount(null);
-        selectConversation(currentConversationId, event.provider);
+        selectConversation(currentConversationId, event.provider, streamingAccount || undefined);
         loadConversations();
         setStreamingContent('');
         setStreamingThinking('');

@@ -705,3 +705,53 @@ Following the external audit of commit `7965b5a`, the remaining isolation vulner
   - Added `o3`, `o3-mini`, `o1`, `gpt-4.5`, `gpt-4o`.
 - **Gemini Models**:
   - Added `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-2.0-flash`.
+
+---
+
+## Phase 2.4 — Adaptive Context & Handoff Manager, Model Budget Compaction, and Account-Scoped Usage Tracking
+
+Following the external audit of commit `5120b61`, Phase 2.4 delivers the full **Adaptive Context & Handoff Manager**, aligns model context windows to official specs, activates adapter context window capabilities, eliminates context meter crosstalk across multi-account profiles, and guarantees canonical DB immutability during cross-model handoffs.
+
+### 1. Model Context Window Corrections & Official Model IDs (`providers.ts`)
+- **Claude Opus 5 & Sonnet 5**: Updated context window to **1,000,000 (1M tokens)** for `claude-opus-5`, `claude-sonnet-5`, and official aliases `opus` and `sonnet`.
+- **Claude Haiku 4.5**: Updated context window to **200,000 (200K tokens)** for alias `haiku` and replaced invalid identifier `claude-haiku-4.5` with the official identifier `claude-haiku-4-5-20251001`.
+
+### 2. Adapter Capabilities Semantics (`claude/mod.rs`, `codex/mod.rs`, `gemini/mod.rs`)
+- Set `context_window: true` in `capabilities()` for `ClaudeProvider`, `CodexProvider`, and `GeminiProvider`.
+- Live provider capability checks now accurately reflect backend context window support, preventing the frontend Context Meter from collapsing to disabled/null states.
+
+### 3. Adaptive Context & Dynamic Input Budgeting (`conversation/context.rs`, `conversation/mod.rs`)
+- **`resolve_model_context_window(model)`**: Resolves native context limits across all providers:
+  - Gemini: 2,000,000 tokens (Pro) / 1,000,000 tokens (Flash)
+  - Claude: 1,000,000 tokens (Opus 5, Sonnet 5, aliases `opus`, `sonnet`) / 200,000 tokens (Haiku 4.5, alias `haiku`)
+  - Codex / GPT: 200,000 tokens (`o3`, `o3-mini`, `o1`) / 128,000 tokens (`gpt-4o`, `gpt-4.5`)
+- **`calculate_input_budget(context_window)`**: Computes effective input budget by dynamically reserving:
+  - Output token headroom: 15% of context window, clamped between 16,000 and 64,000 tokens.
+  - System overhead: 10,000 tokens.
+  - Safety buffer: 10,000 tokens.
+- **`build_adaptive_context(messages, model, max_budget_override)`**:
+  - If total delta tokens <= input budget: injects un-synced canonical messages untouched (`compacted: false`).
+  - If delta tokens exceed input budget (e.g. cross-model handoff from a 1M token Opus turn into a 200K Haiku turn): older turns are compacted into a structured handoff summary (`[Context Hand-off: Prior ~{older_tokens} tokens compacted for model context budget...]`), while preserving recent turns raw up to ~60% of the budget.
+  - **Canonical DB Invariant**: Compaction is strictly session-local. The SQLite database remains 100% full-fidelity; messages are never truncated, summarized, or deleted in the canonical database.
+
+### 4. Session-Local Compaction & Resumption Isolation (`conversation/mod.rs`)
+- Compaction only formats un-synced delta messages for the specific receiving session.
+- When switching back to an existing native session (e.g. switching back to Opus 5), Seralyn resumes that native session and fetches only incremental canonical messages created since that session's `synced_through_seq`.
+- Sessions with larger context windows are never polluted with compacted summaries generated for smaller models.
+
+### 5. Multi-Account & Session-Scoped Usage Tracking (`usage_snapshots.rs`, `conversation/mod.rs`, `main.rs`, `api.ts`, `useConversation.ts`, `App.tsx`)
+- **Database Query Scoping**: Extended `get_latest_usage_snapshot` to accept `account: Option<&str>` and added `get_latest_usage_snapshot_for_session`.
+- **IPC & Frontend Plumbing**:
+  - `get_conversation_usage` command now passes `account` filter down to the DB layer.
+  - Frontend `useConversation` hooks (`fetchUsage`, `selectConversation`, `Error`, `SessionFinished`) pass the active `accountId`.
+  - Prevents usage snapshot crosstalk between Work and Personal profiles, ensuring Context Meters reflect the exact active account and session.
+
+### 6. Comprehensive Automated Test Suite (`usage_snapshots.rs`, `fixtures_tests.rs`)
+- **Unit Test**: `test_usage_snapshot_account_and_session_isolation` in `usage_snapshots.rs` verifies that snapshots recorded for `work` do not leak into `personal` or `default` queries.
+- **Integration Tests in `fixtures_tests.rs`**:
+  1. `test_adaptive_context_model_windows_and_budget_calculation`: Validates context window resolution and budget calculation formulas across models.
+  2. `test_adaptive_context_no_compaction_within_budget`: Verifies raw message preservation when within budget.
+  3. `test_adaptive_context_compaction_when_exceeding_budget`: Asserts structured handoff summary compaction and preservation of recent turns.
+  4. `test_canonical_db_fidelity_unmodified_by_compaction`: Asserts SQLite messages and token estimates remain identical and unmutated before and after compaction.
+  5. `test_switch_back_to_larger_session_resumes_without_compaction_pollution`: Verifies that returning to a large-window session fetches incremental canonical delta without compacted summary artifacts.
+

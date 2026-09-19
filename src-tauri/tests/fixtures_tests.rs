@@ -1474,3 +1474,196 @@ fn test_adapter_profile_isolation_and_native_effort_contracts() {
     assert!(!claude_args.contains(&"--max-thinking-tokens".to_string()), "Claude must use --effort, NOT --max-thinking-tokens");
 }
 
+#[test]
+fn test_adaptive_context_model_windows_and_budget_calculation() {
+    use seralyn_lib::app::conversation::context::{calculate_input_budget, resolve_model_context_window};
+
+    // 1. Claude model windows
+    assert_eq!(resolve_model_context_window(ProviderKind::Claude, Some("opus")), 1_000_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Claude, Some("claude-opus-5")), 1_000_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Claude, Some("sonnet")), 1_000_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Claude, Some("claude-sonnet-5")), 1_000_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Claude, Some("haiku")), 200_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Claude, Some("claude-haiku-4-5-20251001")), 200_000);
+
+    // 2. Codex model windows
+    assert_eq!(resolve_model_context_window(ProviderKind::Codex, Some("o3")), 200_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Codex, Some("o3-mini")), 200_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Codex, Some("o1")), 200_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Codex, Some("gpt-4.5")), 128_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Codex, Some("gpt-4o")), 128_000);
+
+    // 3. Gemini model windows
+    assert_eq!(resolve_model_context_window(ProviderKind::Gemini, Some("gemini-2.5-flash")), 1_000_000);
+    assert_eq!(resolve_model_context_window(ProviderKind::Gemini, Some("gemini-2.5-pro")), 1_000_000);
+
+    // 4. Input budget calculations:
+    // 200K window -> 30K output reserve + 10K overhead + 10K safety = 50K total reserve -> 150K input budget
+    assert_eq!(calculate_input_budget(200_000), 150_000);
+
+    // 1M window -> clamped 64K output reserve + 10K overhead + 10K safety = 84K total reserve -> 916K input budget
+    assert_eq!(calculate_input_budget(1_000_000), 916_000);
+
+    // 128K window -> 19.2K reserve + 20K = ~39.2K reserve -> 88.8K budget
+    assert_eq!(calculate_input_budget(128_000), 88_800);
+}
+
+#[test]
+fn test_adaptive_context_no_compaction_when_within_budget() {
+    use seralyn_lib::app::conversation::context::build_adaptive_context;
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Adaptive Test - No Compaction")).unwrap();
+    messages::create_message(&db, &conv.id, None, "user", "Hello Opus", None, None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "assistant", "Hello! I am ready.", Some("claude"), None, None, None).unwrap();
+    let current_turn = messages::create_message(&db, &conv.id, None, "user", "Next turn", None, None, None, None).unwrap();
+
+    // Calling adaptive context for Opus 5 (1M window, 916K budget):
+    let result = build_adaptive_context(
+        &db,
+        &conv.id,
+        0,
+        current_turn.seq,
+        ProviderKind::Claude,
+        Some("opus"),
+    ).unwrap();
+
+    assert!(!result.compacted, "Within 916K budget, no compaction must occur");
+    assert_eq!(result.messages.len(), 2);
+    assert_eq!(result.messages[0].content, "Hello Opus");
+    assert_eq!(result.messages[1].content, "Hello! I am ready.");
+    assert_eq!(result.working_tokens, result.canonical_tokens);
+}
+
+#[test]
+fn test_adaptive_context_compaction_when_exceeding_budget() {
+    use seralyn_lib::app::conversation::context::build_adaptive_context;
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Adaptive Test - Compaction")).unwrap();
+
+    // Create 12 large turns in canonical history to simulate token volume exceeding 150K
+    let large_chunk = "Detailed technical analysis of complex architectural patterns and memory safety invariants. ".repeat(600);
+    for i in 1..=12 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        let prov = if role == "assistant" { Some("claude") } else { None };
+        messages::create_message(
+            &db,
+            &conv.id,
+            None,
+            role,
+            &format!("Turn {i}: {large_chunk}"),
+            prov,
+            None,
+            None,
+            None,
+        ).unwrap();
+    }
+    let current_turn = messages::create_message(&db, &conv.id, None, "user", "Current turn prompt", None, None, None, None).unwrap();
+
+    // Switching to Haiku (200K window, 150K budget):
+    let result = build_adaptive_context(
+        &db,
+        &conv.id,
+        0,
+        current_turn.seq,
+        ProviderKind::Claude,
+        Some("haiku"),
+    ).unwrap();
+
+    assert!(result.compacted, "Exceeding 150K budget must trigger compaction");
+    assert!(result.canonical_tokens > result.input_budget, "Canonical tokens should exceed budget");
+    assert!(result.working_tokens <= result.input_budget, "Working tokens must fit within 150K budget! Actual: {}", result.working_tokens);
+
+    // Assert that the first message is the handoff summary
+    assert_eq!(result.messages[0].role, "assistant");
+    assert_eq!(result.messages[0].provider.as_deref(), Some("handoff-manager"));
+    assert!(result.messages[0].content.contains("[Context Hand-off:"));
+    assert!(result.messages[0].content.contains("### Summary of Previous Context"));
+
+    // Assert that recent turns are preserved in raw fidelity
+    let last_raw_msg = result.messages.last().unwrap();
+    assert!(last_raw_msg.content.contains("Turn 12:"));
+}
+
+#[test]
+fn test_canonical_db_fidelity_unmodified_by_compaction() {
+    use seralyn_lib::app::conversation::context::build_adaptive_context;
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Canonical DB Fidelity Test")).unwrap();
+
+    let original_content_1 = "Original turn 1 content with precise invariant specifications";
+    let original_content_2 = "Original assistant turn 2 response with verbatim code";
+    messages::create_message(&db, &conv.id, None, "user", original_content_1, None, None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "assistant", original_content_2, Some("claude"), None, None, None).unwrap();
+    let current = messages::create_message(&db, &conv.id, None, "user", "Turn 3", None, None, None, None).unwrap();
+
+    // Execute adaptive context with compaction target
+    let _ = build_adaptive_context(
+        &db,
+        &conv.id,
+        0,
+        current.seq,
+        ProviderKind::Claude,
+        Some("haiku"),
+    ).unwrap();
+
+    // Query SQLite messages table directly: verify canonical records are 100% intact!
+    let all_messages = messages::get_conversation_messages(&db, &conv.id).unwrap();
+    assert_eq!(all_messages.len(), 3);
+    assert_eq!(all_messages[0].content, original_content_1);
+    assert_eq!(all_messages[1].content, original_content_2);
+    assert_eq!(all_messages[2].content, "Turn 3");
+}
+
+#[test]
+fn test_switch_back_to_larger_session_resumes_without_compaction_pollution() {
+    use seralyn_lib::app::conversation::context::build_adaptive_context;
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Switch Back Resumption Test")).unwrap();
+
+    // 1. Opus session had run up to seq 4 (Opus sync cursor = 4)
+    messages::create_message(&db, &conv.id, None, "user", "Opus Turn 1", None, None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "assistant", "Opus Answer 1", Some("claude"), None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "user", "Opus Turn 2", None, None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "assistant", "Opus Answer 2", Some("claude"), None, None, None).unwrap();
+
+    // 2. User switched to Haiku (Haiku sync cursor = 0):
+    // Haiku ran turns 5 and 6
+    messages::create_message(&db, &conv.id, None, "user", "Haiku Turn 3", None, None, None, None).unwrap();
+    messages::create_message(&db, &conv.id, None, "assistant", "Haiku Answer 3", Some("claude"), None, None, None).unwrap();
+
+    // 3. User sends turn 7 and switches BACK to Opus 5:
+    let current_turn = messages::create_message(&db, &conv.id, None, "user", "Back to Opus Turn 4", None, None, None, None).unwrap();
+
+    // For Opus 5, its sync cursor is 4!
+    let opus_res = build_adaptive_context(
+        &db,
+        &conv.id,
+        4, // Opus synced_through_seq!
+        current_turn.seq,
+        ProviderKind::Claude,
+        Some("opus"),
+    ).unwrap();
+
+    // Assert: Opus ONLY receives turns 5 and 6 (the delta since its sync cursor)
+    assert!(!opus_res.compacted, "Opus incremental delta is small and fits in 916K budget without compaction");
+    assert_eq!(opus_res.messages.len(), 2);
+    assert_eq!(opus_res.messages[0].content, "Haiku Turn 3");
+    assert_eq!(opus_res.messages[1].content, "Haiku Answer 3");
+
+    // ZERO pollution: Opus does NOT receive Haiku's compacted summary!
+    assert!(!opus_res.messages.iter().any(|m| m.content.contains("Context Hand-off")));
+}
+
+

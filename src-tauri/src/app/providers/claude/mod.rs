@@ -109,7 +109,7 @@ impl Provider for ClaudeProvider {
             resume: true,
             native_compact: false,
             token_usage: true,
-            context_window: false,
+            context_window: true,
             reasoning: true,
             streaming: true,
         }

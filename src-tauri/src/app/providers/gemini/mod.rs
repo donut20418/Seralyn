@@ -85,7 +85,7 @@ impl Provider for GeminiProvider {
             resume: true,
             native_compact: false,
             token_usage: false,
-            context_window: false,
+            context_window: true,
             reasoning: false,
             streaming: true,
         }
