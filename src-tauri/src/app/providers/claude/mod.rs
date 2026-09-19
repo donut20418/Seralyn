@@ -164,42 +164,18 @@ impl ProviderSession for ClaudeSession {
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
 
-        let mut args = vec![
-            "-p".to_string(),
-            prompt_text,
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-            "--include-partial-messages".to_string(),
-        ];
+        let args = build_claude_args(
+            &prompt_text,
+            self.model.as_deref(),
+            self.config.effort.as_deref(),
+            sid_opt.as_deref(),
+            self.config.permission_mode,
+        );
 
-        // 1. Model flag
-        if let Some(m) = &self.model {
-            args.push("--model".to_string());
-            args.push(m.clone());
-        }
-
-        // 2. Account profile isolation via dedicated config directory
+        // Account profile isolation via dedicated config directory
         let mut env = self.config.env.clone();
         if let Some(profile_dir) = resolve_profile_dir(ProviderKind::Claude, self.config.account.as_deref()) {
             env.insert("CLAUDE_CONFIG_DIR".to_string(), profile_dir.to_string_lossy().to_string());
-        }
-
-        // 3. Native reasoning effort flag
-        if let Some(effort) = &self.config.effort {
-            args.push("--effort".to_string());
-            args.push(effort.clone());
-        }
-
-        // Resume flag semantics
-        if let Some(sid) = &sid_opt {
-            args.push("--resume".to_string());
-            args.push(sid.clone());
-        }
-
-        // Enforce permission mode
-        if self.config.permission_mode == PermissionMode::FullAccess {
-            args.push("--dangerously-skip-permissions".to_string());
         }
 
         let spawn_config = SpawnConfig {
@@ -327,4 +303,42 @@ impl ProviderSession for ClaudeSession {
     fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
     }
+}
+
+pub fn build_claude_args(
+    prompt_text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+    resume_sid: Option<&str>,
+    permission_mode: PermissionMode,
+) -> Vec<String> {
+    let mut args = vec![
+        "-p".to_string(),
+        prompt_text.to_string(),
+        "--output-format".to_string(),
+        "stream-json".to_string(),
+        "--verbose".to_string(),
+        "--include-partial-messages".to_string(),
+    ];
+
+    if let Some(m) = model {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
+
+    if let Some(e) = effort {
+        args.push("--effort".to_string());
+        args.push(e.to_string());
+    }
+
+    if let Some(sid) = resume_sid {
+        args.push("--resume".to_string());
+        args.push(sid.to_string());
+    }
+
+    if permission_mode == PermissionMode::FullAccess {
+        args.push("--dangerously-skip-permissions".to_string());
+    }
+
+    args
 }

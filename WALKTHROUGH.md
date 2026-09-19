@@ -676,5 +676,32 @@ Following the Phase 2.1 external audit, we resolved the remaining protocol, mult
 - `test_multi_account_same_provider_isolation_and_exact_routing`: Proves 2 distinct accounts on the same provider run in parallel, interrupt and approval route to the exact target account, and SQLite maintains isolated records.
 - `test_adapter_profile_isolation_and_native_effort_contracts`: Asserts `resolve_profile_dir` behavior, Codex `"effort"` schema, and Gemini ACP payload cleanliness.
 
+---
 
+## Phase 2.3 — Elimination of Default Account Leaks, Production Adapter Contract Testing, and Official Model Aliases
 
+Following the external audit of commit `7965b5a`, the remaining isolation vulnerability and model alias items were resolved and verified:
+
+### 1. Default vs. Named Account Isolation in SQLite (`src-tauri/src/app/db/provider_sessions.rs`)
+- **Vulnerability Eliminated**: Previously, if a conversation turn targeted `"default"` (or `None`) and no unassigned/default session existed, `get_active_session_for_account` had a fallback assignment that could return the most recent named account session (e.g. `work` or `personal`). This allowed default-mode queries to leak into isolated named sessions.
+- **Fix**: Removed the `fallback = Some(rec)` logic entirely. A query for `"default"` now strictly matches an exact `"default"` account in `metadata_json` or a legacy session record where `metadata_json.is_none()`. Named accounts (`work`, `personal`) are never returned for a default lookup, returning `Ok(None)` cleanly.
+
+### 2. Real Production Adapter Builders for Contract Tests (`claude/mod.rs`, `codex/mod.rs`, `gemini/mod.rs`, `fixtures_tests.rs`)
+- **Extracted Production Builders**:
+  - `build_codex_start_params` and `build_codex_turn_params`: Construct the JSON-RPC payload in production with `"effort"` (and never `"reasoningEffort"`).
+  - `build_claude_args`: Constructs the CLI arguments in production with `--effort` (and never `--max-thinking-tokens` or `--profile`).
+  - `build_gemini_prompt_params`: Constructs the ACP prompt payload in production with standard ACP format (and never `"model"`).
+- **Hardened Contract Tests**:
+  - `test_adapter_profile_isolation_and_native_effort_contracts` now calls these exact production builder functions directly, guaranteeing that any regression in production code will instantly fail CI.
+  - Added new automated test `test_default_vs_named_account_isolation_in_db`: Asserts that when named accounts (`work`, `personal`) exist in DB, querying for `"default"` or `None` strictly returns `None`, while legacy records without `metadata_json` resolve correctly. Total fixtures & integration tests: 48.
+
+### 3. Model Catalog Modernization with Official CLI Aliases (`providers.ts`, `App.tsx`)
+- **Claude Models**:
+  - Replaced retired `claude-3-7-sonnet-latest` and older 3.5 references with official Claude Code CLI aliases and latest generation models:
+    - Official Aliases: `sonnet` (Claude Sonnet Latest - default), `opus` (Claude Opus Latest), `haiku` (Claude Haiku Latest).
+    - Modern Generation: `claude-sonnet-5`, `claude-opus-5`, `claude-haiku-4.5`.
+  - Updated default frontend selection in `App.tsx` from `claude-3-7-sonnet-latest` to `sonnet`.
+- **Codex Models**:
+  - Added `o3`, `o3-mini`, `o1`, `gpt-4.5`, `gpt-4o`.
+- **Gemini Models**:
+  - Added `gemini-2.5-flash`, `gemini-2.5-pro`, `gemini-3.1-pro-preview`, `gemini-3.1-flash-lite`, `gemini-2.0-flash`.

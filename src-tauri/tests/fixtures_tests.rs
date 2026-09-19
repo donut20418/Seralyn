@@ -1354,6 +1354,67 @@ async fn test_multi_account_same_provider_isolation_and_exact_routing() {
 }
 
 #[test]
+fn test_default_vs_named_account_isolation_in_db() {
+    use seralyn_lib::app::db::provider_sessions;
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv_id = "test-conv-default-isolation";
+    // Create work session
+    let work_meta = serde_json::json!({ "account": "work" }).to_string();
+    provider_sessions::create_provider_session_with_metadata(
+        &db,
+        conv_id,
+        "claude",
+        Some("native-work"),
+        Some("sonnet"),
+        Some(&work_meta),
+    ).unwrap();
+
+    // Create personal session
+    let personal_meta = serde_json::json!({ "account": "personal" }).to_string();
+    provider_sessions::create_provider_session_with_metadata(
+        &db,
+        conv_id,
+        "claude",
+        Some("native-personal"),
+        Some("sonnet"),
+        Some(&personal_meta),
+    ).unwrap();
+
+    // 1. Exact lookups
+    let work = provider_sessions::get_active_session_for_account(&db, conv_id, "claude", Some("work")).unwrap();
+    assert!(work.is_some());
+    assert_eq!(work.unwrap().provider_session_id, Some("native-work".to_string()));
+
+    let personal = provider_sessions::get_active_session_for_account(&db, conv_id, "claude", Some("personal")).unwrap();
+    assert!(personal.is_some());
+    assert_eq!(personal.unwrap().provider_session_id, Some("native-personal".to_string()));
+
+    // 2. Default lookup MUST NOT return work or personal!
+    let default_lookup = provider_sessions::get_active_session_for_account(&db, conv_id, "claude", Some("default")).unwrap();
+    assert!(default_lookup.is_none(), "Default lookup must NOT fallback to named accounts like work or personal!");
+
+    let none_lookup = provider_sessions::get_active_session_for_account(&db, conv_id, "claude", None).unwrap();
+    assert!(none_lookup.is_none(), "None lookup must NOT fallback to named accounts!");
+
+    // 3. If a legacy record (metadata_json is None) exists, default lookup returns it
+    let conv_id_legacy = "test-conv-legacy";
+    provider_sessions::create_provider_session(
+        &db,
+        conv_id_legacy,
+        "claude",
+        Some("native-legacy"),
+        Some("sonnet"),
+    ).unwrap();
+
+    let legacy_lookup = provider_sessions::get_active_session_for_account(&db, conv_id_legacy, "claude", Some("default")).unwrap();
+    assert!(legacy_lookup.is_some());
+    assert_eq!(legacy_lookup.unwrap().provider_session_id, Some("native-legacy".to_string()));
+}
+
+#[test]
 fn test_adapter_profile_isolation_and_native_effort_contracts() {
     use seralyn_lib::app::providers::resolve_profile_dir;
 
@@ -1377,25 +1438,35 @@ fn test_adapter_profile_isolation_and_native_effort_contracts() {
     assert!(gemini_studio.to_string_lossy().contains("gemini"));
     assert!(gemini_studio.to_string_lossy().contains("studio"));
 
-    // 2. Codex app-server TurnStartParams schema contract:
-    // Schema field must be "effort", NOT "reasoningEffort"
-    let effort_val = "high";
-    let turn_params = serde_json::json!({
-        "threadId": "tid-123",
-        "input": [{ "type": "text", "text": "Hello" }],
-        "effort": effort_val
-    });
-    assert!(turn_params.get("effort").is_some());
-    assert_eq!(turn_params.get("effort").unwrap(), "high");
-    assert!(turn_params.get("reasoningEffort").is_none(), "Codex app-server schema must use 'effort', NOT 'reasoningEffort'");
+    // 2. Real production Codex builder contracts:
+    let turn_params = seralyn_lib::app::providers::codex::build_codex_turn_params("tid-123", "Hello", Some("o3-mini"), Some("high"));
+    assert_eq!(turn_params.get("effort").and_then(|v| v.as_str()), Some("high"));
+    assert!(turn_params.get("reasoningEffort").is_none(), "Codex turn/start must use 'effort', NOT 'reasoningEffort'");
 
-    // 3. Gemini ACP SessionPrompt contract:
-    // Schema must contain standard ACP "prompt" and "sessionId", NOT extraneous "model"
-    let prompt_params = serde_json::json!({
-        "sessionId": "sid-123",
-        "prompt": [{ "type": "text", "text": "Hello" }]
-    });
+    let start_params = seralyn_lib::app::providers::codex::build_codex_start_params(
+        seralyn_lib::app::providers::PermissionMode::Safe,
+        None,
+        Some("o3-mini"),
+        Some("high"),
+    );
+    assert_eq!(start_params.get("effort").and_then(|v| v.as_str()), Some("high"));
+    assert!(start_params.get("reasoningEffort").is_none(), "Codex thread/start must use 'effort', NOT 'reasoningEffort'");
+
+    // 3. Real production Gemini prompt builder contract:
+    let prompt_params = seralyn_lib::app::providers::gemini::build_gemini_prompt_params("sid-123", "Hello");
     assert!(prompt_params.get("prompt").is_some());
-    assert!(prompt_params.get("model").is_none(), "Gemini ACP session/prompt must not inject non-standard 'model'");
+    assert!(prompt_params.get("model").is_none(), "Gemini ACP session/prompt must NOT contain 'model'");
+
+    // 4. Real production Claude args builder contract:
+    let claude_args = seralyn_lib::app::providers::claude::build_claude_args(
+        "Hello",
+        Some("sonnet"),
+        Some("high"),
+        Some("sid-123"),
+        seralyn_lib::app::providers::PermissionMode::Safe,
+    );
+    assert!(claude_args.contains(&"--effort".to_string()));
+    assert!(!claude_args.contains(&"--profile".to_string()), "Claude must NOT use non-standard --profile");
+    assert!(!claude_args.contains(&"--max-thinking-tokens".to_string()), "Claude must use --effort, NOT --max-thinking-tokens");
 }
 

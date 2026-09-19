@@ -122,7 +122,7 @@ export default function App() {
   const [selection, setSelection] = useState<Selection>({
     provider: "claude",
     accountId: "claude-work",
-    modelId: "claude-3-7-sonnet-latest",
+    modelId: "sonnet",
     effort: "high",
   });
 

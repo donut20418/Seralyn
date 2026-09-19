@@ -95,7 +95,6 @@ pub fn get_active_session_for_account(
     }).map_err(|e| AppError::Database(e.to_string()))?;
 
     let target_account = account.unwrap_or("default");
-    let mut fallback = None;
     for r in rows {
         let rec = r.map_err(|e| AppError::Database(e.to_string()))?;
         if let Some(ref meta) = rec.metadata_json {
@@ -105,17 +104,11 @@ pub fn get_active_session_for_account(
                 }
             }
         } else if target_account == "default" {
+            // Legacy record without metadata_json belongs strictly to default account
             return Ok(Some(rec));
         }
-        if fallback.is_none() {
-            fallback = Some(rec);
-        }
     }
-    if account.is_none() || target_account == "default" {
-        Ok(fallback)
-    } else {
-        Ok(None)
-    }
+    Ok(None)
 }
 
 pub fn update_session_used(db: &Database, id: &str) -> Result<()> {

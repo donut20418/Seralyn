@@ -488,15 +488,7 @@ impl ProviderSession for GeminiSession {
 
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
-        let prompt_params = json!({
-            "sessionId": sid,
-            "prompt": [
-                {
-                    "type": "text",
-                    "text": prompt_text,
-                }
-            ]
-        });
+        let prompt_params = build_gemini_prompt_params(&sid, &prompt_text);
 
         let _ = self.transport.request_with_timeout(
             "session/prompt",
@@ -635,6 +627,18 @@ pub fn resolve_canonical_cwd(working_dir: Option<&std::path::Path>) -> String {
     } else {
         s
     }
+}
+
+pub fn build_gemini_prompt_params(session_id: &str, prompt_text: &str) -> Value {
+    json!({
+        "sessionId": session_id,
+        "prompt": [
+            {
+                "type": "text",
+                "text": prompt_text,
+            }
+        ]
+    })
 }
 
 #[cfg(test)]

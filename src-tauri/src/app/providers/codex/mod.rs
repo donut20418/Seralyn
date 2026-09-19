@@ -107,27 +107,13 @@ impl Provider for CodexProvider {
         // 2. initialized notification
         transport.notify("initialized", json!({})).await?;
 
-        // 3. Map permissions to sandbox and approvalPolicy
-        let (approval_policy, sandbox) = match config.permission_mode {
-            PermissionMode::Safe => ("on-request", "read-only"),
-            PermissionMode::Workspace => ("on-request", "workspace-write"),
-            PermissionMode::FullAccess => ("never", "danger-full-access"),
-        };
-
-        let mut start_params = json!({
-            "approvalPolicy": approval_policy,
-            "sandbox": sandbox,
-        });
-
-        if let Some(prompt) = config.system_prompt.filter(|s| !s.is_empty()) {
-            start_params["baseInstructions"] = json!(prompt);
-        }
-        if let Some(model) = config.model.as_ref().filter(|m| !m.is_empty()) {
-            start_params["model"] = json!(model);
-        }
-        if let Some(effort) = config.effort.as_ref().filter(|e| !e.is_empty()) {
-            start_params["effort"] = json!(effort);
-        }
+        // 3. Map permissions to sandbox and approvalPolicy and build start_params
+        let start_params = build_codex_start_params(
+            config.permission_mode,
+            config.system_prompt.as_deref(),
+            config.model.as_deref(),
+            config.effort.as_deref(),
+        );
 
         // 4. thread/start request -> await response containing threadId
         let thread_resp = transport.request("thread/start", start_params).await?;
@@ -347,20 +333,7 @@ impl ProviderSession for CodexSession {
 
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
-
-        let mut turn_params = json!({
-            "threadId": tid,
-            "input": [{
-                "type": "text",
-                "text": prompt_text,
-            }],
-        });
-        if let Some(m) = &self.model {
-            turn_params["model"] = json!(m);
-        }
-        if let Some(e) = &self.effort {
-            turn_params["effort"] = json!(e);
-        }
+        let turn_params = build_codex_turn_params(&tid, &prompt_text, self.model.as_deref(), self.effort.as_deref());
 
         let turn_resp = self.transport.request("turn/start", turn_params).await?;
 
@@ -455,4 +428,55 @@ impl ProviderSession for CodexSession {
     fn is_active(&self) -> bool {
         self.transport.is_active()
     }
+}
+
+pub fn build_codex_start_params(
+    permission_mode: PermissionMode,
+    system_prompt: Option<&str>,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Value {
+    let (approval_policy, sandbox) = match permission_mode {
+        PermissionMode::Safe => ("on-request", "read-only"),
+        PermissionMode::Workspace => ("on-request", "workspace-write"),
+        PermissionMode::FullAccess => ("never", "danger-full-access"),
+    };
+
+    let mut start_params = json!({
+        "approvalPolicy": approval_policy,
+        "sandbox": sandbox,
+    });
+
+    if let Some(prompt) = system_prompt.filter(|s| !s.is_empty()) {
+        start_params["baseInstructions"] = json!(prompt);
+    }
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        start_params["model"] = json!(m);
+    }
+    if let Some(e) = effort.filter(|e| !e.is_empty()) {
+        start_params["effort"] = json!(e);
+    }
+    start_params
+}
+
+pub fn build_codex_turn_params(
+    thread_id: &str,
+    prompt_text: &str,
+    model: Option<&str>,
+    effort: Option<&str>,
+) -> Value {
+    let mut turn_params = json!({
+        "threadId": thread_id,
+        "input": [{
+            "type": "text",
+            "text": prompt_text,
+        }],
+    });
+    if let Some(m) = model {
+        turn_params["model"] = json!(m);
+    }
+    if let Some(e) = effort {
+        turn_params["effort"] = json!(e);
+    }
+    turn_params
 }
