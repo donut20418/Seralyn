@@ -216,7 +216,7 @@ impl Default for SessionMetadata {
 }
 
 /// Permission mode for provider operations.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum PermissionMode {
     /// Ask before filesystem writes or command execution.
     Safe,

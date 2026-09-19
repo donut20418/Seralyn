@@ -1360,7 +1360,9 @@ fn test_default_vs_named_account_isolation_in_db() {
     let db = Database::new_in_memory().unwrap();
     db.run_migrations().unwrap();
 
-    let conv_id = "test-conv-default-isolation";
+    let conv = conversations::create_conversation(&db, Some("Isolation Test")).unwrap();
+    let conv_id = &conv.id;
+
     // Create work session
     let work_meta = serde_json::json!({ "account": "work" }).to_string();
     provider_sessions::create_provider_session_with_metadata(
@@ -1400,7 +1402,9 @@ fn test_default_vs_named_account_isolation_in_db() {
     assert!(none_lookup.is_none(), "None lookup must NOT fallback to named accounts!");
 
     // 3. If a legacy record (metadata_json is None) exists, default lookup returns it
-    let conv_id_legacy = "test-conv-legacy";
+    let conv_legacy = conversations::create_conversation(&db, Some("Legacy Test")).unwrap();
+    let conv_id_legacy = &conv_legacy.id;
+
     provider_sessions::create_provider_session(
         &db,
         conv_id_legacy,
