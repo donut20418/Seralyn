@@ -1687,9 +1687,9 @@ fn test_adaptive_context_thai_unicode_safety() {
     let thai_turn_2 = "ได้เลยครับ สำหรับ Maya python script นั้นเราจำเป็นต้องกำหนด encoding utf-8 ให้ถูกต้อง และตรวจสอบ character boundary ให้แม่นยำเพื่อไม่ให้เกิด panic ในขณะที่มีการตัดคำภาษาไทยครับ";
 
     // Repeat to create a long string with multibyte characters (Thai characters are 3 bytes each)
-    let thai_long = format!("{} {}", thai_turn_1, thai_turn_2).repeat(150);
+    let thai_long = format!("{} {}", thai_turn_1, thai_turn_2).repeat(400);
 
-    for i in 1..=6 {
+    for i in 1..=12 {
         let role = if i % 2 == 1 { "user" } else { "assistant" };
         messages::create_message(
             &db,
@@ -1800,7 +1800,7 @@ fn test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle() {
     update_synced_seq(&db, &opus_session.id, 500).unwrap();
 
     // Opus has recorded native usage snapshot of 400K tokens
-    create_usage_snapshot(&db, &conv.id, Some(&opus_session.id), Some(400_000), Some(10_000), None, None, None, Some(410_000), Some(1_000_000), "Exact").unwrap();
+    create_usage_snapshot(&db, &conv.id, Some(&opus_session.id), Some(400_000), Some(10_000), None, None, None, Some(410_000), Some(1_000_000), "EXACT").unwrap();
 
     // Verify Opus session lookup by (account, model)
     let found_opus = get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("opus")).unwrap().unwrap();
