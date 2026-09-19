@@ -1221,6 +1221,18 @@ async fn test_multi_account_same_provider_isolation_and_exact_routing() {
             self.approval_responded.store(true, Ordering::SeqCst);
             Ok(())
         }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> {
+            Ok(())
+        }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> {
+            Ok(())
+        }
+        fn native_session_id(&self) -> Option<String> {
+            Some(format!("native-{}", self.account))
+        }
+        fn is_active(&self) -> bool {
+            true
+        }
         fn metadata(&self) -> SessionMetadata {
             SessionMetadata {
                 provider: ProviderKind::Claude,
