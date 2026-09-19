@@ -206,11 +206,14 @@ impl ConversationManager {
         };
 
         let should_reuse_session = if let Some(ref entry) = existing_entry {
-            let current_model = entry.session.metadata().model;
-            match (&current_model, &model) {
-                (Some(curr), Some(req)) => curr == req,
-                (None, None) => true,
-                _ => false, // model changed -> re-create session with new model!
+            if let Some(ref req_model) = model {
+                if let Some(ref curr_model) = entry.session.metadata().model {
+                    curr_model == req_model
+                } else {
+                    true
+                }
+            } else {
+                true
             }
         } else {
             false
@@ -251,10 +254,14 @@ impl ConversationManager {
             
             let can_resume = if let Some(ref record) = existing_record {
                 if record.provider_session_id.is_some() {
-                    match (&record.model, &model) {
-                        (Some(curr), Some(req)) => curr == req,
-                        (None, None) => true,
-                        _ => false, // model changed from previous record -> spawn fresh session
+                    if let Some(ref req_model) = model {
+                        if let Some(ref curr_model) = record.model {
+                            curr_model == req_model
+                        } else {
+                            true
+                        }
+                    } else {
+                        true
                     }
                 } else {
                     false
