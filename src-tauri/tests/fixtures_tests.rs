@@ -1774,6 +1774,7 @@ fn test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle() {
     let conv = conversations::create_conversation(&db, Some("Full Lifecycle Opus-Haiku Switch")).unwrap();
 
     // 1. Initial Opus 5 session (1M window) runs on account "work", processes turns 1..=500
+    let chunk = "Detailed architectural invariant chunk testing data for large context handoff. ".repeat(30);
     for i in 1..=500 {
         let role = if i % 2 == 1 { "user" } else { "assistant" };
         messages::create_message(
@@ -1781,7 +1782,7 @@ fn test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle() {
             &conv.id,
             None,
             role,
-            &format!("Turn {i}: content data chunk for large conversation testing"),
+            &format!("Turn {i}: {chunk}"),
             if role == "assistant" { Some("claude") } else { None },
             None,
             None,
