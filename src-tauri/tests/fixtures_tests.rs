@@ -2422,9 +2422,9 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
         "EXACT",
     ).unwrap();
 
-    // 4. Now send a new message with prompt ~200 tokens (e.g. repeated sentence)
-    // 115,900 native tokens + 200 prompt tokens = 116,100 > 116,000 base_input_budget!
-    let next_prompt = "Please explain the architectural details and invariant guarantees of Seralyn multi-provider framework in complete depth.".repeat(3);
+    // 4. Now send a new message with prompt > 100 tokens (e.g. repeated sentence)
+    // 115,900 native tokens + 158 prompt tokens = 116,058 > 116,000 base_input_budget!
+    let next_prompt = "Please explain the architectural details and invariant guarantees of Seralyn multi-provider framework in complete depth. ".repeat(6);
     let prompt_tokens = seralyn_lib::app::tokens::TokenManager::estimate_tokens(&next_prompt);
     assert!(115_900u64 + prompt_tokens > 116_000u64, "Total tokens must exceed base budget (116000)");
 
