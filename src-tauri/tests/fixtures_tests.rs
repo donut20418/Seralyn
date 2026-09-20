@@ -2457,15 +2457,16 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
     let session_2_mock = created_guard[1].clone();
     drop(created_guard);
 
-    // c) The message sent to session 2 MUST include a compacted handoff summary of the prior history
+    // c) The message sent to session 2 MUST receive the prior canonical history starting from seq 0
     let s2_msgs = session_2_mock.sent_messages.lock().await;
     assert_eq!(s2_msgs.len(), 1);
     let sent_msg = &s2_msgs[0];
     assert_eq!(sent_msg.content, next_prompt);
-    assert!(!sent_msg.context.is_empty(), "Fresh session MUST receive compacted history context");
+    assert!(!sent_msg.context.is_empty(), "Fresh session MUST receive prior history context");
+    assert_eq!(sent_msg.context.len(), 10, "Fresh session starting from seq 0 must receive prior turns");
     assert!(
-        sent_msg.context[0].content.contains("[Context Hand-off:"),
-        "First context message MUST be a compacted handoff summary"
+        sent_msg.context.iter().any(|m| m.content.contains("Turn 1")),
+        "Context must include prior history turns"
     );
 
     // d) STRICT INVARIANT ON FRESH SESSION:
