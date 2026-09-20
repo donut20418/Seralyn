@@ -45,6 +45,7 @@ type SessionKey = (String, ProviderKind, String, String);
 #[derive(Clone)]
 pub struct ActiveSessionEntry {
     pub session: Arc<dyn ProviderSession>,
+    pub db_session_id: String,
     pub event_tx: Arc<tokio::sync::RwLock<Option<mpsc::Sender<NormalizedEvent>>>>,
 }
 
@@ -214,12 +215,12 @@ impl ConversationManager {
 
         let should_reuse_session = existing_entry.is_some();
 
-        let session: Arc<dyn ProviderSession> = if should_reuse_session {
+        let (session, active_db_session_id): (Arc<dyn ProviderSession>, String) = if should_reuse_session {
             let entry = existing_entry.unwrap();
             // Dynamic event routing: update active event sender to the new channel for this turn!
             let mut tx_guard = entry.event_tx.write().await;
             *tx_guard = Some(event_sender.clone());
-            entry.session.clone()
+            (entry.session.clone(), entry.db_session_id.clone())
         } else {
             // Creation/resumption happens OUTSIDE active_sessions lock!
             let (internal_tx, mut internal_rx) = mpsc::channel(100);
@@ -400,6 +401,7 @@ impl ConversationManager {
             
             let entry = ActiveSessionEntry {
                 session: sess.clone(),
+                db_session_id: provider_session_id.clone(),
                 event_tx,
             };
 
@@ -408,10 +410,10 @@ impl ConversationManager {
             if let Some(existing) = sessions.get(&session_key) {
                 let mut tx_guard = existing.event_tx.write().await;
                 *tx_guard = Some(event_sender.clone());
-                existing.session.clone()
+                (existing.session.clone(), existing.db_session_id.clone())
             } else {
                 sessions.insert(session_key.clone(), entry);
-                sess
+                (sess, provider_session_id)
             }
         };
 
@@ -428,15 +430,11 @@ impl ConversationManager {
         };
 
         // 5. Query existing native tokens for this session from SQLite usage snapshots
-        let existing_native_tokens = if let Some(ref rec) = existing_record {
-            usage_snapshots::get_latest_usage_snapshot_for_session(&self.db, conversation_id, &rec.id)
-                .ok()
-                .flatten()
-                .and_then(|s| s.context_tokens)
-                .unwrap_or(0) as u64
-        } else {
-            0
-        };
+        let existing_native_tokens = usage_snapshots::get_latest_usage_snapshot_for_session(&self.db, conversation_id, &active_db_session_id)
+            .ok()
+            .flatten()
+            .and_then(|s| s.context_tokens)
+            .unwrap_or(0) as u64;
 
         // 6. Calculate adaptive context delta between sync cursor and current message,
         // factoring in existing native session context tokens and current prompt tokens
@@ -467,13 +465,11 @@ impl ConversationManager {
             attachments: attachment_refs,
         };
 
-        // 6. Call session.send(message) WITHOUT holding active_sessions lock!
+        // 8. Call session.send(message) WITHOUT holding active_sessions lock!
         // This completely prevents approval and interrupt deadlocks!
         session.send(msg).await?;
         
-        if let Some(record) = provider_sessions::get_active_session_for_account(&self.db, conversation_id, &provider_str, Some(&profile_id))? {
-            provider_sessions::update_session_used(&self.db, &record.id)?;
-        }
+        let _ = provider_sessions::update_session_used(&self.db, &active_db_session_id);
 
         Ok(())
     }
@@ -488,6 +484,7 @@ impl ConversationManager {
         conversation_id: &str,
         provider: ProviderKind,
         account: Option<&str>,
+        model: Option<&str>,
         approval_id: &str,
         approved: bool,
     ) -> Result<()> {
@@ -496,7 +493,12 @@ impl ConversationManager {
             let sessions = self.active_sessions.lock().await;
             let matches: Vec<_> = sessions
                 .iter()
-                .filter(|((cid, p, acc, _), _)| cid == conversation_id && *p == provider && (account.is_none() || acc == profile_id))
+                .filter(|((cid, p, acc, m), _)| {
+                    cid == conversation_id
+                        && *p == provider
+                        && (account.is_none() || acc == profile_id)
+                        && (model.is_none() || m == model.unwrap_or(""))
+                })
                 .map(|(_, e)| e.session.clone())
                 .collect();
             matches.into_iter().next()
@@ -530,13 +532,19 @@ impl ConversationManager {
         conversation_id: &str,
         provider: ProviderKind,
         account: Option<&str>,
+        model: Option<&str>,
     ) -> Result<()> {
         let profile_id = account.unwrap_or("default");
         let sessions_to_interrupt: Vec<Arc<dyn ProviderSession>> = {
             let sessions = self.active_sessions.lock().await;
             sessions
                 .iter()
-                .filter(|((cid, p, acc, _), _)| cid == conversation_id && *p == provider && (account.is_none() || acc == profile_id))
+                .filter(|((cid, p, acc, m), _)| {
+                    cid == conversation_id
+                        && *p == provider
+                        && (account.is_none() || acc == profile_id)
+                        && (model.is_none() || m == model.unwrap_or(""))
+                })
                 .map(|(_, e)| e.session.clone())
                 .collect()
         };

@@ -42,7 +42,31 @@ impl TokenManager {
     }
 
     pub fn estimate_tokens(text: &str) -> u64 {
-        (text.chars().count() as u64) / 4
+        if text.is_empty() {
+            return 0;
+        }
+
+        let mut ascii_count: u64 = 0;
+        let mut non_ascii_count: u64 = 0;
+
+        for c in text.chars() {
+            if c.is_ascii() {
+                ascii_count += 1;
+            } else {
+                non_ascii_count += 1;
+            }
+        }
+
+        let ascii_tokens = if ascii_count > 0 {
+            (ascii_count + 3) / 4
+        } else {
+            0
+        };
+
+        // Non-ASCII (Thai, CJK, Emoji, etc.): conservative estimate of 1 token per character
+        let non_ascii_tokens = non_ascii_count;
+
+        (ascii_tokens + non_ascii_tokens).max(1)
     }
 }
 
@@ -58,9 +82,18 @@ mod tests {
 
     #[test]
     fn test_estimate_tokens() {
+        assert_eq!(TokenManager::estimate_tokens(""), 0);
         assert_eq!(TokenManager::estimate_tokens("1234"), 1);
         assert_eq!(TokenManager::estimate_tokens("12345678"), 2);
         assert_eq!(TokenManager::estimate_tokens("hello world!"), 3);
+        // Single characters and short words must not be 0
+        assert_eq!(TokenManager::estimate_tokens("a"), 1);
+        assert_eq!(TokenManager::estimate_tokens("abc"), 1);
+        assert_eq!(TokenManager::estimate_tokens("ก"), 1);
+        // Thai text
+        assert_eq!(TokenManager::estimate_tokens("สวัสดี"), 6);
+        // CJK text
+        assert_eq!(TokenManager::estimate_tokens("你好"), 2);
     }
 
     #[test]

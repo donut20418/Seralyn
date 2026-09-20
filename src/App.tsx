@@ -96,6 +96,7 @@ export default function App() {
     interrupt,
     respondToApproval,
     streamingAccount,
+    streamingModel,
     handleEvent,
   } = useConversation();
 
@@ -544,12 +545,15 @@ export default function App() {
         (s) =>
           s.provider === pId &&
           getSessionAccount(s) === selection.accountId &&
-          (!s.model || s.model === selection.modelId),
+          s.model === selection.modelId,
       ) ??
       providerSessions.find(
-        (s) => s.provider === pId && getSessionAccount(s) === selection.accountId,
+        (s) =>
+          s.provider === pId &&
+          getSessionAccount(s) === selection.accountId &&
+          !s.model,
       ) ??
-      providerSessions.find((s) => s.provider === pId)
+      null
     );
   };
 
@@ -644,7 +648,8 @@ export default function App() {
               respondToApproval(
                 streamingProvider || activeProvider,
                 approved,
-                streamingAccount || selection.accountId
+                streamingAccount || selection.accountId,
+                streamingModel || selection.modelId
               )
             }
           />
@@ -662,7 +667,8 @@ export default function App() {
             onStop={() =>
               interrupt(
                 streamingProvider || activeProvider,
-                streamingAccount || selection.accountId
+                streamingAccount || selection.accountId,
+                streamingModel || selection.modelId
               )
             }
             webOpen={browserOpen}

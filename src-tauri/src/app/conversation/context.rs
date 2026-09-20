@@ -176,8 +176,19 @@ pub fn build_adaptive_context(
     let context_window = resolve_model_context_window(provider, model);
     let tm = TokenManager::new();
     let current_prompt_tokens = TokenManager::estimate_tokens(current_prompt);
-    let input_budget = calculate_available_input_budget(context_window, existing_native_tokens, current_prompt_tokens).max(500);
+    let input_budget = calculate_available_input_budget(context_window, existing_native_tokens, current_prompt_tokens);
     let canonical_tokens = estimate_context_tokens(&raw_delta, &tm);
+
+    if input_budget == 0 {
+        return Ok(AdaptiveContextResult {
+            messages: Vec::new(),
+            compacted: !raw_delta.is_empty(),
+            canonical_tokens,
+            working_tokens: 0,
+            context_window,
+            input_budget: 0,
+        });
+    }
 
     if canonical_tokens <= input_budget {
         return Ok(AdaptiveContextResult {
@@ -203,9 +214,13 @@ pub fn build_adaptive_context(
 
         // Edge case protection: if a single message exceeds recent_quota, safely truncate its content
         if msg_tokens > recent_quota && recent_messages.is_empty() {
-            let max_chars = (recent_quota as usize) * 4;
-            msg_content = safe_truncate_chars(&msg_content, max_chars);
-            msg_tokens = TokenManager::estimate_tokens(&msg_content);
+            let mut target_chars = msg_content.chars().count();
+            while msg_tokens > recent_quota && target_chars > 0 {
+                let step = (msg_tokens.saturating_sub(recent_quota)).max(1) as usize;
+                target_chars = target_chars.saturating_sub(step);
+                msg_content = safe_truncate_chars(&msg.content, target_chars);
+                msg_tokens = TokenManager::estimate_tokens(&msg_content);
+            }
         }
 
         if recent_tokens + msg_tokens <= recent_quota {
@@ -248,11 +263,19 @@ pub fn build_adaptive_context(
         working_tokens = estimate_context_tokens(&result_messages, &tm);
     }
 
-    // If summary header alone exceeds budget, truncate it to fit
+    // If summary header alone exceeds budget, iteratively truncate it to fit
     if working_tokens > input_budget && !result_messages.is_empty() {
-        let max_summary_chars = (input_budget as usize) * 4;
-        result_messages[0].content = safe_truncate_chars(&result_messages[0].content, max_summary_chars);
-        working_tokens = estimate_context_tokens(&result_messages, &tm);
+        while working_tokens > input_budget && !result_messages[0].content.is_empty() {
+            let current_chars = result_messages[0].content.chars().count();
+            let step = (working_tokens.saturating_sub(input_budget)).max(1) as usize;
+            let target_chars = current_chars.saturating_sub(step);
+            result_messages[0].content = safe_truncate_chars(&result_messages[0].content, target_chars);
+            working_tokens = estimate_context_tokens(&result_messages, &tm);
+        }
+        if working_tokens > input_budget {
+            result_messages.clear();
+            working_tokens = 0;
+        }
     }
 
     Ok(AdaptiveContextResult {

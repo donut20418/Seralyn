@@ -139,12 +139,20 @@ async fn respond_to_approval(
     approval_id: String,
     approved: bool,
     account: Option<String>,
+    model: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let provider_kind = ProviderKind::from_str(&provider).map_err(|e| e.to_string())?;
     state
         .conversation_manager
-        .respond_to_approval(&conversation_id, provider_kind, account.as_deref(), &approval_id, approved)
+        .respond_to_approval(
+            &conversation_id,
+            provider_kind,
+            account.as_deref(),
+            model.as_deref(),
+            &approval_id,
+            approved,
+        )
         .await
         .map_err(|e| e.to_string())
 }
@@ -192,12 +200,13 @@ async fn interrupt_turn(
     conversation_id: String,
     provider: String,
     account: Option<String>,
+    model: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
     let provider_kind = ProviderKind::from_str(&provider).map_err(|e| e.to_string())?;
     state
         .conversation_manager
-        .interrupt_turn(&conversation_id, provider_kind, account.as_deref())
+        .interrupt_turn(&conversation_id, provider_kind, account.as_deref(), model.as_deref())
         .await
         .map_err(|e| e.to_string())
 }

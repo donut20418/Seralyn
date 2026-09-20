@@ -1336,12 +1336,12 @@ async fn test_multi_account_same_provider_isolation_and_exact_routing() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 
     // Assert: Interrupt "work" account ONLY!
-    manager.interrupt_turn(&conv.id, ProviderKind::Claude, Some("work")).await.unwrap();
+    manager.interrupt_turn(&conv.id, ProviderKind::Claude, Some("work"), None).await.unwrap();
     assert!(work_interrupted.load(Ordering::SeqCst), "Work session must be interrupted");
     assert!(!personal_interrupted.load(Ordering::SeqCst), "Personal session must NOT be interrupted!");
 
     // Assert: Respond to approval on "personal" account ONLY!
-    manager.respond_to_approval(&conv.id, ProviderKind::Claude, Some("personal"), "app-1", true).await.unwrap();
+    manager.respond_to_approval(&conv.id, ProviderKind::Claude, Some("personal"), None, "app-1", true).await.unwrap();
     assert!(personal_approval.load(Ordering::SeqCst), "Personal session must receive approval response");
     assert!(!work_approval.load(Ordering::SeqCst), "Work session must NOT receive personal approval response!");
 
@@ -1897,6 +1897,380 @@ fn test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle() {
     // c) Available budget dynamically accounts for existing native tokens (1M - 84K reserve - 410K native - prompt)
     assert!(opus_resumed_context.input_budget < 600_000, "Input budget must be reduced by 410K native context");
     assert!(opus_resumed_context.working_tokens <= opus_resumed_context.input_budget);
+}
+
+#[test]
+fn test_token_estimator_multibyte_and_ceil() {
+    use seralyn_lib::app::tokens::TokenManager;
+
+    // ASCII ceil division: (ascii + 3) / 4
+    assert_eq!(TokenManager::estimate_tokens(""), 0);
+    assert_eq!(TokenManager::estimate_tokens("a"), 1);
+    assert_eq!(TokenManager::estimate_tokens("ab"), 1);
+    assert_eq!(TokenManager::estimate_tokens("abc"), 1);
+    assert_eq!(TokenManager::estimate_tokens("abcd"), 1);
+    assert_eq!(TokenManager::estimate_tokens("abcde"), 2);
+    assert_eq!(TokenManager::estimate_tokens("12345678"), 2);
+
+    // Multibyte Thai characters (conservative: 1 token / char)
+    assert_eq!(TokenManager::estimate_tokens("ก"), 1);
+    // "สวัสดี" has 6 characters: ส, ว, ั, ส, ด, ี -> 6 tokens
+    assert_eq!(TokenManager::estimate_tokens("สวัสดี"), 6);
+
+    // Multibyte CJK characters
+    // "你好" has 2 characters -> 2 tokens
+    assert_eq!(TokenManager::estimate_tokens("你好"), 2);
+
+    // Mixed ASCII and Thai
+    // "Hello " is 6 ASCII chars -> (6+3)/4 = 2 tokens.
+    // "สวัสดี" is 6 Thai chars -> 6 tokens.
+    // Total = 2 + 6 = 8 tokens.
+    assert_eq!(TokenManager::estimate_tokens("Hello สวัสดี"), 8);
+}
+
+#[test]
+fn test_adaptive_context_strict_total_budget_invariant() {
+    use seralyn_lib::app::conversation::context::{build_adaptive_context, calculate_input_budget, resolve_model_context_window};
+
+    let db = Database::new_in_memory().unwrap();
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Strict Budget Invariant Test")).unwrap();
+
+    // Create 10 turns of history
+    for i in 1..=10 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(&db, &conv.id, None, role, &format!("Turn {i}: test message content with several words."), None, None, None, None).unwrap();
+    }
+    let current_turn = messages::create_message(&db, &conv.id, None, "user", "Next user prompt here", None, None, None, None).unwrap();
+
+    let context_window = resolve_model_context_window(ProviderKind::Claude, Some("haiku"));
+    let total_input_budget = calculate_input_budget(context_window); // 200,000 - 84,000 = 116,000
+
+    let prompt = "Next user prompt here";
+    let prompt_tokens = seralyn_lib::app::tokens::TokenManager::estimate_tokens(prompt);
+
+    // Case 1: Normal available budget (e.g. existing_native_tokens = 50,000)
+    let existing_native_1 = 50_000u64;
+    let res1 = build_adaptive_context(
+        &db,
+        &conv.id,
+        0,
+        current_turn.seq,
+        ProviderKind::Claude,
+        Some("haiku"),
+        existing_native_1,
+        prompt,
+    ).unwrap();
+
+    // Invariant: existing_native_tokens + prompt_tokens + working_tokens <= total_input_budget
+    assert!(
+        existing_native_1 + prompt_tokens + res1.working_tokens <= total_input_budget,
+        "Invariant violated in Case 1: {} + {} + {} > {}",
+        existing_native_1, prompt_tokens, res1.working_tokens, total_input_budget
+    );
+
+    // Case 2: Budget nearly exhausted (e.g. existing_native_tokens is near total_input_budget - prompt_tokens)
+    let existing_native_2 = total_input_budget.saturating_sub(prompt_tokens + 8);
+    let res2 = build_adaptive_context(
+        &db,
+        &conv.id,
+        0,
+        current_turn.seq,
+        ProviderKind::Claude,
+        Some("haiku"),
+        existing_native_2,
+        prompt,
+    ).unwrap();
+
+    assert!(
+        existing_native_2 + prompt_tokens + res2.working_tokens <= total_input_budget,
+        "Invariant violated in Case 2 (near exhaustion): {} + {} + {} > {}",
+        existing_native_2, prompt_tokens, res2.working_tokens, total_input_budget
+    );
+
+    // Case 3: Budget fully exhausted (existing_native_tokens >= total_input_budget)
+    // In this case, available input budget is 0.
+    // Result MUST return empty delta (working_tokens = 0, messages empty), without artificially forcing min tokens.
+    let existing_native_3 = total_input_budget;
+    let res3 = build_adaptive_context(
+        &db,
+        &conv.id,
+        0,
+        current_turn.seq,
+        ProviderKind::Claude,
+        Some("haiku"),
+        existing_native_3,
+        prompt,
+    ).unwrap();
+
+    assert_eq!(res3.working_tokens, 0, "When input budget is 0, working tokens MUST be 0");
+    assert!(res3.messages.is_empty(), "When input budget is 0, messages delta MUST be empty");
+}
+
+#[tokio::test]
+async fn test_conversation_manager_model_scoped_approval_and_interrupt() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
+
+    #[derive(Clone)]
+    struct MockModelSession {
+        model: String,
+        interrupted: Arc<AtomicBool>,
+        approvals: Arc<tokio::sync::Mutex<Vec<(String, bool)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for MockModelSession {
+        async fn send(&self, _msg: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+            Ok(())
+        }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> {
+            self.interrupted.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn respond_to_approval(&self, approval_id: &str, approved: bool) -> seralyn_lib::app::error::Result<()> {
+            self.approvals.lock().await.push((approval_id.to_string(), approved));
+            Ok(())
+        }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        fn native_session_id(&self) -> Option<String> { Some(format!("native-{}", self.model)) }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: ProviderKind::Claude,
+                native_session_id: Some(format!("native-{}", self.model)),
+                model: Some(self.model.clone()),
+                created_at: String::new(),
+            }
+        }
+        fn is_active(&self) -> bool { true }
+    }
+
+    struct MockMultiModelProvider {
+        opus_session: MockModelSession,
+        haiku_session: MockModelSession,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for MockMultiModelProvider {
+        fn kind(&self) -> ProviderKind { ProviderKind::Claude }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            if config.model.as_deref() == Some("opus") {
+                Ok(Box::new(self.opus_session.clone()))
+            } else {
+                Ok(Box::new(self.haiku_session.clone()))
+            }
+        }
+        async fn resume_session(&self, _native_session_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            self.create_session(config).await
+        }
+    }
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let opus_interrupted = Arc::new(AtomicBool::new(false));
+    let opus_approvals = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let opus_session = MockModelSession {
+        model: "opus".to_string(),
+        interrupted: opus_interrupted.clone(),
+        approvals: opus_approvals.clone(),
+    };
+
+    let haiku_interrupted = Arc::new(AtomicBool::new(false));
+    let haiku_approvals = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let haiku_session = MockModelSession {
+        model: "haiku".to_string(),
+        interrupted: haiku_interrupted.clone(),
+        approvals: haiku_approvals.clone(),
+    };
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(
+        ProviderKind::Claude,
+        Arc::new(MockMultiModelProvider { opus_session, haiku_session }) as Arc<dyn Provider>,
+    );
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("Model Scoped Routing Test")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    // 1. Send message with model "opus" under account "work"
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Message to Opus",
+        &[],
+        ProviderKind::Claude,
+        Some("opus".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    // 2. Send message with model "haiku" under account "work"
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Message to Haiku",
+        &[],
+        ProviderKind::Claude,
+        Some("haiku".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    // 3. Respond to approval specifically targeting "opus"
+    manager.respond_to_approval(
+        &conv.id,
+        ProviderKind::Claude,
+        Some("work"),
+        Some("opus"),
+        "appr-opus-1",
+        true,
+    ).await.unwrap();
+
+    let opus_apprs = opus_approvals.lock().await;
+    let haiku_apprs = haiku_approvals.lock().await;
+    assert_eq!(opus_apprs.len(), 1, "Opus MUST receive the approval response");
+    assert_eq!(opus_apprs[0], ("appr-opus-1".to_string(), true));
+    assert_eq!(haiku_apprs.len(), 0, "Haiku MUST NOT receive the Opus approval");
+    drop(opus_apprs);
+    drop(haiku_apprs);
+
+    // 4. Interrupt specifically targeting "haiku"
+    manager.interrupt_turn(
+        &conv.id,
+        ProviderKind::Claude,
+        Some("work"),
+        Some("haiku"),
+    ).await.unwrap();
+
+    assert!(haiku_interrupted.load(Ordering::SeqCst), "Haiku MUST be interrupted");
+    assert!(!opus_interrupted.load(Ordering::SeqCst), "Opus MUST NOT be interrupted when Haiku is stopped");
+}
+
+#[tokio::test]
+async fn test_send_message_updates_exact_session_last_used() {
+    use std::sync::Arc;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
+    use seralyn_lib::app::db::provider_sessions;
+
+    #[derive(Clone)]
+    struct DummySession {
+        model: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for DummySession {
+        async fn send(&self, _msg: ProviderMessage) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn respond_to_approval(&self, _approval_id: &str, _approved: bool) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        fn native_session_id(&self) -> Option<String> { Some(format!("native-dummy-{}", self.model)) }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: ProviderKind::Claude,
+                native_session_id: Some(format!("native-dummy-{}", self.model)),
+                model: Some(self.model.clone()),
+                created_at: String::new(),
+            }
+        }
+        fn is_active(&self) -> bool { true }
+    }
+
+    struct DummyMultiProvider;
+
+    #[async_trait::async_trait]
+    impl Provider for DummyMultiProvider {
+        fn kind(&self) -> ProviderKind { ProviderKind::Claude }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            let model = config.model.unwrap_or_else(|| "default".to_string());
+            Ok(Box::new(DummySession { model }))
+        }
+        async fn resume_session(&self, _native_session_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            self.create_session(config).await
+        }
+    }
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(
+        ProviderKind::Claude,
+        Arc::new(DummyMultiProvider) as Arc<dyn Provider>,
+    );
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("Exact Last Used Test")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    // Send on Opus
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Msg 1 to Opus",
+        &[],
+        ProviderKind::Claude,
+        Some("opus".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    let sessions_after_opus = provider_sessions::get_provider_sessions(&db, &conv.id).unwrap();
+    let opus_session_rec = sessions_after_opus.iter().find(|s| s.model.as_deref() == Some("opus")).unwrap();
+    let opus_initial_last_used = opus_session_rec.last_used_at.clone();
+    assert!(opus_initial_last_used.is_some(), "Opus session must have last_used_at set");
+
+    // Small delay to ensure timestamp difference if updated
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+    // Send on Haiku
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Msg 2 to Haiku",
+        &[],
+        ProviderKind::Claude,
+        Some("haiku".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    let sessions_after_haiku = provider_sessions::get_provider_sessions(&db, &conv.id).unwrap();
+    let opus_after = sessions_after_haiku.iter().find(|s| s.model.as_deref() == Some("opus")).unwrap();
+    let haiku_after = sessions_after_haiku.iter().find(|s| s.model.as_deref() == Some("haiku")).unwrap();
+
+    assert_eq!(
+        opus_after.last_used_at,
+        opus_initial_last_used,
+        "Opus session's last_used_at MUST NOT be modified when sending message to Haiku"
+    );
+    assert!(
+        haiku_after.last_used_at.is_some(),
+        "Haiku session's last_used_at MUST be set"
+    );
 }
 
 

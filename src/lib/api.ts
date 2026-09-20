@@ -67,6 +67,7 @@ export async function respondToApproval(
   approvalId: string,
   approved: boolean,
   account?: string,
+  model?: string,
 ): Promise<void> {
   return invoke('respond_to_approval', {
     conversationId,
@@ -74,6 +75,7 @@ export async function respondToApproval(
     approvalId,
     approved,
     account: account || null,
+    model: model || null,
   });
 }
 
@@ -81,11 +83,13 @@ export async function interruptTurn(
   conversationId: string,
   provider: ProviderKind,
   account?: string,
+  model?: string,
 ): Promise<void> {
   return invoke('interrupt_turn', {
     conversationId,
     provider,
     account: account || null,
+    model: model || null,
   });
 }
 

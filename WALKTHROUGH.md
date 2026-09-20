@@ -793,3 +793,39 @@ Following external audit on commit `331cbec`, Phase 2.5 closes all remaining gap
 2. `test_adaptive_context_hard_budget_guarantee_single_large_message`: Tests a single 180K token message against a 150K budget, guaranteeing `working_tokens <= input_budget`.
 3. `test_cross_model_switch_opus_to_haiku_and_back_full_lifecycle`: Tests full cross-model handoff lifecycle (Opus cursor 500 -> Haiku cursor 0 with handoff -> Opus resume cursor 500 with zero compaction pollution and dynamic native budget deduction).
 
+---
+
+## Phase 2.5 Finalization — Model-Scoped Approval/Interrupt, Strict Hard Budget Guarantee & Multibyte Token Estimation
+
+Following audit on commit `2c297fe`, the remaining items have been comprehensively addressed:
+
+### 1. Model-Scoped Approval & Interrupt Routing (`ConversationManager`, `main.rs`, `api.ts`, `useConversation.ts`, `App.tsx`)
+- **End-to-End 4-Tuple Routing**: `respond_to_approval` and `interrupt_turn` now accept `model: Option<&str>`, routing approvals and interrupts to the exact `(conversation_id, provider, account, model)` active session.
+- **No Cross-Model Interference**: Interrupting or approving one model (e.g. Haiku) does not stop or approve other models (e.g. Opus) running concurrently under the same account.
+- **Frontend IPC**: `respondToApproval` and `interruptTurn` in `api.ts`, `useConversation.ts`, and `App.tsx` pass `streamingModel || selection.modelId`.
+
+### 2. Strict Hard Budget Guarantee (`context.rs`)
+- **Zero-Budget Empty Delta**: Removed `.max(500)`. When available input budget is 0 (`existing_native_tokens + current_prompt_tokens >= calculate_input_budget(context_window)`), `build_adaptive_context` returns an empty delta (`messages: []`, `working_tokens: 0`).
+- **Mathematical Invariant**: Enforces and tests the invariant:
+  $$\text{existing\_native\_tokens} + \text{current\_prompt\_tokens} + \text{working\_tokens} \le \text{calculate\_input\_budget}(\text{context\_window})$$
+- **Iterative Shrink Loop**: Both recent messages and compacted summaries are safely shrunk character-by-character along Unicode scalar boundaries until strictly within the available budget.
+
+### 3. Multibyte & Thai Conservative Token Estimation (`tokens/mod.rs`)
+- **Ceil Division for ASCII**: Uses `(ascii_count + 3) / 4` so 1-3 character words and punctuation are never truncated to 0 tokens.
+- **1 Token / Char for Non-ASCII**: Conservative 1 token per character for Thai, CJK, and emojis.
+- **Non-Empty Min 1**: Guarantees any non-empty input evaluates to at least 1 token.
+
+### 4. Direct Session Tracking for `last_used_at` (`conversation/mod.rs`)
+- **Exact Record ID**: `ActiveSessionEntry` stores `pub db_session_id: String`.
+- After `session.send()`, `update_session_used` directly updates `active_db_session_id`, eliminating ambiguity from account-only queries when multiple models exist for the same account.
+
+### 5. Inspector Strict Model Matching & Stream Completion Scoping (`App.tsx`, `useConversation.ts`)
+- **Strict Inspector Lookup**: `findSession` matches exact `(account, model)` or `(account, legacy null)`, returning `null` rather than falling back to an unrelated model under the same account.
+- **Completion Model State**: `useConversation.ts` tracks `streamingModel` during turn execution and passes it to `selectConversation` on `SessionFinished` and `Error`.
+
+### 6. Automated Verification Tests (`fixtures_tests.rs`)
+1. `test_token_estimator_multibyte_and_ceil`: Asserts ceil division on ASCII and conservative estimation on Thai and CJK.
+2. `test_adaptive_context_strict_total_budget_invariant`: Asserts total model input budget invariant under normal, near-exhaustion, and zero-budget conditions.
+3. `test_conversation_manager_model_scoped_approval_and_interrupt`: Proves that approvals and interrupts target the exact model and never affect other models under the same account.
+4. `test_send_message_updates_exact_session_last_used`: Proves that sending a message on one model updates only that specific session's `last_used_at` record in SQLite.
+

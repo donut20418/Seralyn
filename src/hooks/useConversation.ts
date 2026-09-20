@@ -29,6 +29,7 @@ export function useConversation() {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [streamingProvider, setStreamingProvider] = useState<ProviderKind | null>(null);
   const [streamingAccount, setStreamingAccount] = useState<string | null>(null);
+  const [streamingModel, setStreamingModel] = useState<string | null>(null);
 
   const loadConversations = useCallback(async () => {
     try {
@@ -153,6 +154,7 @@ export function useConversation() {
     setIsStreaming(true);
     setStreamingProvider(provider);
     setStreamingAccount(account || null);
+    setStreamingModel(model || null);
     setStreamingContent('');
     setStreamingThinking('');
     setActiveTools([]);
@@ -180,25 +182,37 @@ export function useConversation() {
       setIsStreaming(false);
       setStreamingProvider(null);
       setStreamingAccount(null);
+      setStreamingModel(null);
       setErrorMessage(String(e));
     }
   }, [currentConversationId, messages]);
 
-  const interrupt = useCallback(async (providerOverride?: ProviderKind, accountOverride?: string) => {
+  const interrupt = useCallback(async (providerOverride?: ProviderKind, accountOverride?: string, modelOverride?: string) => {
     if (!currentConversationId) return;
     const targetProvider = providerOverride || streamingProvider;
     if (!targetProvider) return;
     try {
-      await api.interruptTurn(currentConversationId, targetProvider, accountOverride || streamingAccount || undefined);
+      await api.interruptTurn(
+        currentConversationId,
+        targetProvider,
+        accountOverride || streamingAccount || undefined,
+        modelOverride || streamingModel || undefined,
+      );
       setIsStreaming(false);
       setStreamingProvider(null);
       setStreamingAccount(null);
+      setStreamingModel(null);
     } catch (e) {
       console.error('Failed to interrupt:', e);
     }
-  }, [currentConversationId, streamingProvider, streamingAccount]);
+  }, [currentConversationId, streamingProvider, streamingAccount, streamingModel]);
 
-  const respondToApproval = useCallback(async (provider: ProviderKind, approved: boolean, accountOverride?: string) => {
+  const respondToApproval = useCallback(async (
+    provider: ProviderKind,
+    approved: boolean,
+    accountOverride?: string,
+    modelOverride?: string,
+  ) => {
     if (!currentConversationId || !pendingApproval) return;
     const approvalId = pendingApproval.approval_id;
     setPendingApproval(null);
@@ -209,12 +223,13 @@ export function useConversation() {
         approvalId,
         approved,
         accountOverride || streamingAccount || undefined,
+        modelOverride || streamingModel || undefined,
       );
     } catch (e) {
       console.error('Failed to respond to approval:', e);
       setErrorMessage(String(e));
     }
-  }, [currentConversationId, pendingApproval, streamingAccount]);
+  }, [currentConversationId, pendingApproval, streamingAccount, streamingModel]);
 
   const handleEvent = useCallback((event: NormalizedEvent) => {
     if (event.conversation_id !== currentConversationId) return;
@@ -318,27 +333,33 @@ export function useConversation() {
 
       case 'Error':
         setIsStreaming(false);
+        const errAccount = streamingAccount || undefined;
+        const errModel = streamingModel || undefined;
         setStreamingProvider(null);
         setStreamingAccount(null);
+        setStreamingModel(null);
         if (event.payload.kind === 'Error') {
           setErrorMessage(event.payload.message);
         }
-        selectConversation(currentConversationId, event.provider, streamingAccount || undefined);
+        selectConversation(currentConversationId, event.provider, errAccount, errModel);
         loadConversations();
         break;
 
       case 'SessionFinished':
         setIsStreaming(false);
+        const finAccount = streamingAccount || undefined;
+        const finModel = streamingModel || undefined;
         setStreamingProvider(null);
         setStreamingAccount(null);
-        selectConversation(currentConversationId, event.provider, streamingAccount || undefined);
+        setStreamingModel(null);
+        selectConversation(currentConversationId, event.provider, finAccount, finModel);
         loadConversations();
         setStreamingContent('');
         setStreamingThinking('');
         setActiveTools([]);
         break;
     }
-  }, [currentConversationId, selectConversation, loadConversations, streamingAccount]);
+  }, [currentConversationId, selectConversation, loadConversations, streamingAccount, streamingModel]);
 
   return {
     currentConversationId,
@@ -350,6 +371,7 @@ export function useConversation() {
     isStreaming,
     streamingProvider,
     streamingAccount,
+    streamingModel,
     streamingContent,
     streamingThinking,
     currentUsage,
