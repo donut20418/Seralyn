@@ -2110,8 +2110,8 @@ async fn test_conversation_manager_model_scoped_approval_and_interrupt() {
     manager.send_message_with_attachments(
         &conv.id,
         "Message to Opus",
-        &[],
         ProviderKind::Claude,
+        Vec::new(),
         Some("opus".to_string()),
         Some("work".to_string()),
         None,
@@ -2122,8 +2122,8 @@ async fn test_conversation_manager_model_scoped_approval_and_interrupt() {
     manager.send_message_with_attachments(
         &conv.id,
         "Message to Haiku",
-        &[],
         ProviderKind::Claude,
+        Vec::new(),
         Some("haiku".to_string()),
         Some("work".to_string()),
         None,
@@ -2230,16 +2230,15 @@ async fn test_send_message_updates_exact_session_last_used() {
     manager.send_message_with_attachments(
         &conv.id,
         "Msg 1 to Opus",
-        &[],
         ProviderKind::Claude,
+        Vec::new(),
         Some("opus".to_string()),
         Some("work".to_string()),
         None,
         tx.clone(),
     ).await.unwrap();
 
-    let sessions_after_opus = provider_sessions::get_provider_sessions(&db, &conv.id).unwrap();
-    let opus_session_rec = sessions_after_opus.iter().find(|s| s.model.as_deref() == Some("opus")).unwrap();
+    let opus_session_rec = provider_sessions::get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("opus")).unwrap().unwrap();
     let opus_initial_last_used = opus_session_rec.last_used_at.clone();
     assert!(opus_initial_last_used.is_some(), "Opus session must have last_used_at set");
 
@@ -2250,17 +2249,16 @@ async fn test_send_message_updates_exact_session_last_used() {
     manager.send_message_with_attachments(
         &conv.id,
         "Msg 2 to Haiku",
-        &[],
         ProviderKind::Claude,
+        Vec::new(),
         Some("haiku".to_string()),
         Some("work".to_string()),
         None,
         tx.clone(),
     ).await.unwrap();
 
-    let sessions_after_haiku = provider_sessions::get_provider_sessions(&db, &conv.id).unwrap();
-    let opus_after = sessions_after_haiku.iter().find(|s| s.model.as_deref() == Some("opus")).unwrap();
-    let haiku_after = sessions_after_haiku.iter().find(|s| s.model.as_deref() == Some("haiku")).unwrap();
+    let opus_after = provider_sessions::get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("opus")).unwrap().unwrap();
+    let haiku_after = provider_sessions::get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("haiku")).unwrap().unwrap();
 
     assert_eq!(
         opus_after.last_used_at,
