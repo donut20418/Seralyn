@@ -1945,7 +1945,7 @@ fn test_adaptive_context_strict_total_budget_invariant() {
     let current_turn = messages::create_message(&db, &conv.id, None, "user", "Next user prompt here", None, None, None, None).unwrap();
 
     let context_window = resolve_model_context_window(ProviderKind::Claude, Some("haiku"));
-    let total_input_budget = calculate_input_budget(context_window); // 200,000 - 84,000 = 116,000
+    let total_input_budget = calculate_input_budget(context_window); // 200,000 - 50,000 = 150,000
 
     let prompt = "Next user prompt here";
     let prompt_tokens = seralyn_lib::app::tokens::TokenManager::estimate_tokens(prompt);
@@ -2407,26 +2407,27 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
     drop(created_guard);
 
     // 3. Simulate that session 1 has grown to 115,900 native context tokens in SQLite!
-    // Base budget for Haiku is 116,000.
+    // 3. Simulate that session 1 has grown to 149,900 native context tokens in SQLite!
+    // Base budget for Haiku is 150,000 (200,000 window - 50,000 reserve).
     usage_snapshots::create_usage_snapshot(
         &db,
         &conv.id,
         Some(&session_1_rec.id),
-        Some(110_000),
-        Some(5_900),
+        Some(140_000),
+        Some(9_900),
         None,
         None,
         None,
-        Some(115_900),
+        Some(149_900),
         Some(200_000),
         "EXACT",
     ).unwrap();
 
     // 4. Now send a new message with prompt > 100 tokens (e.g. repeated sentence)
-    // 115,900 native tokens + 158 prompt tokens = 116,058 > 116,000 base_input_budget!
+    // 149,900 native tokens + 158 prompt tokens = 150,058 > 150,000 base_input_budget!
     let next_prompt = "Please explain the architectural details and invariant guarantees of Seralyn multi-provider framework in complete depth. ".repeat(6);
     let prompt_tokens = seralyn_lib::app::tokens::TokenManager::estimate_tokens(&next_prompt);
-    assert!(115_900u64 + prompt_tokens > 116_000u64, "Total tokens must exceed base budget (116000)");
+    assert!(149_900u64 + prompt_tokens > 150_000u64, "Total tokens must exceed base budget (150000)");
 
     manager.send_message_with_attachments(
         &conv.id,
@@ -2468,13 +2469,13 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
     );
 
     // d) STRICT INVARIANT ON FRESH SESSION:
-    // native_tokens (0) + prompt_tokens + working_tokens <= base_input_budget (116,000)
+    // native_tokens (0) + prompt_tokens + working_tokens <= base_input_budget (150,000)
     let fresh_native_tokens = 0u64;
     let working_tokens: u64 = sent_msg.context.iter().map(|m| seralyn_lib::app::tokens::TokenManager::estimate_tokens(&m.content)).sum();
     let total_fresh_tokens = fresh_native_tokens + prompt_tokens + working_tokens;
     assert!(
-        total_fresh_tokens <= 116_000,
-        "Total tokens in fresh session ({} native + {} prompt + {} working = {}) MUST be <= base input budget 116,000",
+        total_fresh_tokens <= 150_000,
+        "Total tokens in fresh session ({} native + {} prompt + {} working = {}) MUST be <= base input budget 150,000",
         fresh_native_tokens, prompt_tokens, working_tokens, total_fresh_tokens
     );
 }
