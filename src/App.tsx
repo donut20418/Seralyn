@@ -545,7 +545,21 @@ export default function App() {
         (s) =>
           s.provider === pId &&
           getSessionAccount(s) === selection.accountId &&
+          s.model === selection.modelId &&
+          s.status === "active",
+      ) ??
+      providerSessions.find(
+        (s) =>
+          s.provider === pId &&
+          getSessionAccount(s) === selection.accountId &&
           s.model === selection.modelId,
+      ) ??
+      providerSessions.find(
+        (s) =>
+          s.provider === pId &&
+          getSessionAccount(s) === selection.accountId &&
+          !s.model &&
+          s.status === "active",
       ) ??
       providerSessions.find(
         (s) =>

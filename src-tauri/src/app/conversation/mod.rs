@@ -5,7 +5,10 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
-use crate::app::conversation::context::{build_adaptive_context, build_context_delta};
+use crate::app::conversation::context::{
+    build_adaptive_context, build_context_delta, calculate_input_budget, resolve_model_context_window,
+};
+use crate::app::tokens::TokenManager;
 pub use crate::app::db::conversations::{Conversation, ConversationSummary};
 use crate::app::db::conversations;
 pub use crate::app::db::messages::Message;
@@ -190,6 +193,29 @@ impl ConversationManager {
             }
         }
 
+        // 2. Create provider_prompt with attachment header and user message content
+        let provider_prompt = if !attachments.is_empty() {
+            let attachment_header = attachments
+                .iter()
+                .map(|a| format!("[Attached File: {} ({}, {:.1} KB)]", a.path, a.name, a.size as f64 / 1024.0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}\n\n{}", attachment_header, content)
+        } else {
+            content.to_string()
+        };
+
+        let context_window = resolve_model_context_window(provider_kind.clone(), model.as_deref());
+        let base_input_budget = calculate_input_budget(context_window);
+        let prompt_tokens = TokenManager::estimate_tokens(&provider_prompt);
+
+        if prompt_tokens > base_input_budget {
+            return Err(crate::app::error::AppError::InvalidInput(format!(
+                "Prompt size ({} tokens) exceeds model's maximum input budget ({} tokens)",
+                prompt_tokens, base_input_budget
+            )));
+        }
+
         let provider = self.provider_manager.get(provider_kind.clone())?;
         let provider_str = provider_kind.to_string();
         
@@ -197,22 +223,71 @@ impl ConversationManager {
         let model_id = model.clone().unwrap_or_else(|| "default".to_string());
         let session_key = (conversation_id.to_string(), provider_kind.clone(), profile_id.clone(), model_id.clone());
         
-        // 2. Lookup existing provider session record in SQLite for this exact (account, model) to determine sync cursor
-        let existing_record = provider_sessions::get_active_session_for_account_model(
+        // 3. Lookup existing provider session record in SQLite for this exact (account, model)
+        let mut existing_record = provider_sessions::get_active_session_for_account_model(
             &self.db,
             conversation_id,
             &provider_str,
             Some(&profile_id),
             model.as_deref(),
         )?;
-        let synced_through_seq = existing_record.as_ref().map(|r| r.synced_through_seq).unwrap_or(0);
 
-        // 3. Get existing session or create outside active_sessions lock
-        let existing_entry = {
+        let mut existing_entry = {
             let sessions = self.active_sessions.lock().await;
             sessions.get(&session_key).cloned()
         };
 
+        let existing_db_id = existing_entry
+            .as_ref()
+            .map(|e| e.db_session_id.clone())
+            .or_else(|| existing_record.as_ref().map(|r| r.id.clone()));
+
+        let existing_native_tokens = if let Some(ref db_id) = existing_db_id {
+            usage_snapshots::get_latest_usage_snapshot_for_session(&self.db, conversation_id, db_id)
+                .ok()
+                .flatten()
+                .and_then(|s| s.context_tokens)
+                .unwrap_or(0) as u64
+        } else {
+            0
+        };
+
+        // Hard Budget Saturation Check:
+        // If the current native session cannot accommodate the prompt without exceeding the model's base input budget,
+        // transparently roll over: retire the saturated native session and start a fresh session with a compacted handoff.
+        let is_saturated = existing_native_tokens > 0
+            && existing_native_tokens.saturating_add(prompt_tokens) > base_input_budget;
+
+        if is_saturated {
+            tracing::info!(
+                conversation_id = %conversation_id,
+                provider = %provider_str,
+                model = ?model,
+                existing_native_tokens = existing_native_tokens,
+                prompt_tokens = prompt_tokens,
+                base_input_budget = base_input_budget,
+                "Native session saturated; rolling over to fresh session with compacted handoff"
+            );
+
+            // Close old in-memory session if active and remove from active_sessions
+            if let Some(entry) = existing_entry.take() {
+                let _ = entry.session.close().await;
+            }
+            {
+                let mut sessions = self.active_sessions.lock().await;
+                sessions.remove(&session_key);
+            }
+
+            // Close old session record in SQLite
+            if let Some(ref db_id) = existing_db_id {
+                let _ = provider_sessions::close_session(&self.db, db_id);
+            }
+
+            existing_record = None;
+        }
+
+        let synced_through_seq = existing_record.as_ref().map(|r| r.synced_through_seq).unwrap_or(0);
+        let effective_existing_native_tokens = if is_saturated { 0 } else { existing_native_tokens };
         let should_reuse_session = existing_entry.is_some();
 
         let (session, active_db_session_id): (Arc<dyn ProviderSession>, String) = if should_reuse_session {
@@ -417,27 +492,8 @@ impl ConversationManager {
             }
         };
 
-        // 4. Create provider_prompt with attachment header and user message content
-        let provider_prompt = if !attachments.is_empty() {
-            let attachment_header = attachments
-                .iter()
-                .map(|a| format!("[Attached File: {} ({}, {:.1} KB)]", a.path, a.name, a.size as f64 / 1024.0))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{}\n\n{}", attachment_header, content)
-        } else {
-            content.to_string()
-        };
-
-        // 5. Query existing native tokens for this session from SQLite usage snapshots
-        let existing_native_tokens = usage_snapshots::get_latest_usage_snapshot_for_session(&self.db, conversation_id, &active_db_session_id)
-            .ok()
-            .flatten()
-            .and_then(|s| s.context_tokens)
-            .unwrap_or(0) as u64;
-
-        // 6. Calculate adaptive context delta between sync cursor and current message,
-        // factoring in existing native session context tokens and current prompt tokens
+        // 5. Calculate adaptive context delta between sync cursor and current message,
+        // factoring in effective existing native session context tokens and current prompt tokens
         let adaptive_ctx = build_adaptive_context(
             &self.db,
             conversation_id,
@@ -445,7 +501,7 @@ impl ConversationManager {
             user_msg.seq,
             provider_kind,
             model.as_deref(),
-            existing_native_tokens,
+            effective_existing_native_tokens,
             &provider_prompt,
         )?;
 
@@ -501,6 +557,12 @@ impl ConversationManager {
                 })
                 .map(|(_, e)| e.session.clone())
                 .collect();
+
+            if model.is_none() && matches.len() > 1 {
+                return Err(crate::app::error::AppError::InvalidInput(
+                    "Ambiguous approval target: multiple active model sessions exist for this account; specify model".to_string(),
+                ));
+            }
             matches.into_iter().next()
         };
         if let Some(session) = session {
@@ -537,7 +599,7 @@ impl ConversationManager {
         let profile_id = account.unwrap_or("default");
         let sessions_to_interrupt: Vec<Arc<dyn ProviderSession>> = {
             let sessions = self.active_sessions.lock().await;
-            sessions
+            let matches: Vec<_> = sessions
                 .iter()
                 .filter(|((cid, p, acc, m), _)| {
                     cid == conversation_id
@@ -546,7 +608,14 @@ impl ConversationManager {
                         && (model.is_none() || m == model.unwrap_or(""))
                 })
                 .map(|(_, e)| e.session.clone())
-                .collect()
+                .collect();
+
+            if model.is_none() && matches.len() > 1 {
+                return Err(crate::app::error::AppError::InvalidInput(
+                    "Ambiguous interrupt target: multiple active model sessions exist for this account; specify model".to_string(),
+                ));
+            }
+            matches
         };
         for session in sessions_to_interrupt {
             let _ = session.interrupt().await;

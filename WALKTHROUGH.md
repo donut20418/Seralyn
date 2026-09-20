@@ -809,23 +809,34 @@ Following audit on commit `2c297fe`, the remaining items have been comprehensive
 - **Mathematical Invariant**: Enforces and tests the invariant:
   $$\text{existing\_native\_tokens} + \text{current\_prompt\_tokens} + \text{working\_tokens} \le \text{calculate\_input\_budget}(\text{context\_window})$$
 - **Iterative Shrink Loop**: Both recent messages and compacted summaries are safely shrunk character-by-character along Unicode scalar boundaries until strictly within the available budget.
+- **Native Session Saturation Rollover (`send_message_with_attachments`)**:
+  - When a native session is saturated such that `existing_native_tokens.saturating_add(prompt_tokens) > base_input_budget`, Seralyn does not fail or send an overflowing prompt to CLI backends.
+  - Seralyn automatically and transparently retires the saturated session (`close_session(&db)` and in-memory `close()`), spawns a fresh session for the same provider/account/model, and invokes `build_adaptive_context(synced_through_seq = 0, existing_native_tokens = 0)`.
+  - The entire conversation history in SQLite is compacted into a structured handoff message (`[Context Hand-off: ...]`) fitting within `base_input_budget - prompt_tokens`.
+  - The fresh session receives the handoff summary and current prompt, strictly enforcing:
+    $$\text{fresh\_native\_tokens (0)} + \text{prompt\_tokens} + \text{working\_tokens} \le \text{base\_input\_budget}$$
 
-### 3. Multibyte & Thai Conservative Token Estimation (`tokens/mod.rs`)
+### 3. Backend Routing Ambiguity Elimination (`conversation/mod.rs`)
+- **Strict Disambiguation**: In `respond_to_approval` and `interrupt_turn`, if `model` is `None` and multiple active model sessions exist for the account, the backend returns `Err(AppError::InvalidInput("Ambiguous ... target: multiple active model sessions exist for this account; specify model"))`.
+- Eliminates any non-deterministic `.next()` selection or accidental broadcasting to multiple models.
+
+### 4. Multibyte & Thai Conservative Token Estimation (`tokens/mod.rs`)
 - **Ceil Division for ASCII**: Uses `(ascii_count + 3) / 4` so 1-3 character words and punctuation are never truncated to 0 tokens.
 - **1 Token / Char for Non-ASCII**: Conservative 1 token per character for Thai, CJK, and emojis.
 - **Non-Empty Min 1**: Guarantees any non-empty input evaluates to at least 1 token.
 
-### 4. Direct Session Tracking for `last_used_at` (`conversation/mod.rs`)
+### 5. Direct Session Tracking for `last_used_at` (`conversation/mod.rs`)
 - **Exact Record ID**: `ActiveSessionEntry` stores `pub db_session_id: String`.
 - After `session.send()`, `update_session_used` directly updates `active_db_session_id`, eliminating ambiguity from account-only queries when multiple models exist for the same account.
 
-### 5. Inspector Strict Model Matching & Stream Completion Scoping (`App.tsx`, `useConversation.ts`)
-- **Strict Inspector Lookup**: `findSession` matches exact `(account, model)` or `(account, legacy null)`, returning `null` rather than falling back to an unrelated model under the same account.
+### 6. Inspector Strict Model Matching & Stream Completion Scoping (`App.tsx`, `useConversation.ts`)
+- **Strict Inspector Lookup**: `findSession` matches exact `(account, model)` or `(account, legacy null)`, prioritizing `s.status === "active"` and returning `null` rather than falling back to an unrelated model under the same account.
 - **Completion Model State**: `useConversation.ts` tracks `streamingModel` during turn execution and passes it to `selectConversation` on `SessionFinished` and `Error`.
 
-### 6. Automated Verification Tests (`fixtures_tests.rs`)
+### 7. Automated Verification Tests (`fixtures_tests.rs`)
 1. `test_token_estimator_multibyte_and_ceil`: Asserts ceil division on ASCII and conservative estimation on Thai and CJK.
 2. `test_adaptive_context_strict_total_budget_invariant`: Asserts total model input budget invariant under normal, near-exhaustion, and zero-budget conditions.
-3. `test_conversation_manager_model_scoped_approval_and_interrupt`: Proves that approvals and interrupts target the exact model and never affect other models under the same account.
+3. `test_conversation_manager_model_scoped_approval_and_interrupt`: Proves that approvals and interrupts target the exact model, and that omitting model when multiple models are active returns an ambiguity error.
 4. `test_send_message_updates_exact_session_last_used`: Proves that sending a message on one model updates only that specific session's `last_used_at` record in SQLite.
+5. `test_send_message_rolls_over_saturated_native_session_with_compacted_handoff`: Verifies that when `existing_native + prompt > base_input_budget`, `send_message_with_attachments` closes the old session in memory and SQLite, spawns a fresh session, and delivers a compacted handoff satisfying the hard budget invariant $\le \text{base\_input\_budget}$.
 

@@ -2158,6 +2158,25 @@ async fn test_conversation_manager_model_scoped_approval_and_interrupt() {
 
     assert!(haiku_interrupted.load(Ordering::SeqCst), "Haiku MUST be interrupted");
     assert!(!opus_interrupted.load(Ordering::SeqCst), "Opus MUST NOT be interrupted when Haiku is stopped");
+
+    // 5. Ambiguity checks: when multiple models are active under account "work", omitting model MUST return Err(AppError::InvalidInput)
+    let ambiguous_appr = manager.respond_to_approval(
+        &conv.id,
+        ProviderKind::Claude,
+        Some("work"),
+        None,
+        "appr-ambiguous",
+        true,
+    ).await;
+    assert!(ambiguous_appr.is_err(), "Omitting model when multiple models are active MUST return ambiguity error");
+
+    let ambiguous_interrupt = manager.interrupt_turn(
+        &conv.id,
+        ProviderKind::Claude,
+        Some("work"),
+        None,
+    ).await;
+    assert!(ambiguous_interrupt.is_err(), "Omitting model when multiple models are active MUST return ambiguity error");
 }
 
 #[tokio::test]
@@ -2268,6 +2287,195 @@ async fn test_send_message_updates_exact_session_last_used() {
     assert!(
         haiku_after.last_used_at.is_some(),
         "Haiku session's last_used_at MUST be set"
+    );
+}
+
+#[tokio::test]
+async fn test_send_message_rolls_over_saturated_native_session_with_compacted_handoff() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
+    use seralyn_lib::app::db::{provider_sessions, usage_snapshots};
+
+    #[derive(Clone)]
+    struct TrackedSession {
+        id: String,
+        sent_messages: Arc<tokio::sync::Mutex<Vec<ProviderMessage>>>,
+        closed: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProviderSession for TrackedSession {
+        async fn send(&self, msg: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+            self.sent_messages.lock().await.push(msg);
+            Ok(())
+        }
+        async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn respond_to_approval(&self, _approval_id: &str, _approved: bool) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+        async fn close(&self) -> seralyn_lib::app::error::Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn native_session_id(&self) -> Option<String> { Some(self.id.clone()) }
+        fn metadata(&self) -> SessionMetadata {
+            SessionMetadata {
+                provider: ProviderKind::Claude,
+                native_session_id: Some(self.id.clone()),
+                model: Some("haiku".to_string()),
+                created_at: String::new(),
+            }
+        }
+        fn is_active(&self) -> bool { !self.closed.load(Ordering::SeqCst) }
+    }
+
+    struct DynamicMultiSessionProvider {
+        session_counter: Arc<std::sync::atomic::AtomicUsize>,
+        created_sessions: Arc<tokio::sync::Mutex<Vec<TrackedSession>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for DynamicMultiSessionProvider {
+        fn kind(&self) -> ProviderKind { ProviderKind::Claude }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
+        async fn create_session(&self, _config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            let n = self.session_counter.fetch_add(1, Ordering::SeqCst);
+            let sess = TrackedSession {
+                id: format!("native-sess-{}", n),
+                sent_messages: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                closed: Arc::new(AtomicBool::new(false)),
+            };
+            self.created_sessions.lock().await.push(sess.clone());
+            Ok(Box::new(sess))
+        }
+        async fn resume_session(&self, _native_session_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+            self.create_session(config).await
+        }
+    }
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let session_counter = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let created_sessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = DynamicMultiSessionProvider {
+        session_counter: session_counter.clone(),
+        created_sessions: created_sessions.clone(),
+    };
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Claude, Arc::new(provider) as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("Session Saturation Rollover Test")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    // 1. Create turns 1..=10 in SQLite so there is substantial canonical history
+    for i in 1..=10 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(&db, &conv.id, None, role, &format!("Turn {i}: canonical conversation history content data."), None, None, None, None).unwrap();
+    }
+
+    // 2. Initial message through manager on Haiku (base_budget = 116,000 for 200K window)
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Initial prompt to Haiku",
+        ProviderKind::Claude,
+        Vec::new(),
+        Some("haiku".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    // Verify session 1 was created
+    let sessions_snap1 = provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    let session_1_rec = sessions_snap1.iter().find(|s| s.model.as_deref() == Some("haiku")).unwrap().clone();
+    assert_eq!(session_1_rec.status, "active");
+
+    let created_guard = created_sessions.lock().await;
+    assert_eq!(created_guard.len(), 1);
+    let session_1_mock = created_guard[0].clone();
+    drop(created_guard);
+
+    // 3. Simulate that session 1 has grown to 115,900 native context tokens in SQLite!
+    // Base budget for Haiku is 116,000.
+    usage_snapshots::create_usage_snapshot(
+        &db,
+        &conv.id,
+        Some(&session_1_rec.id),
+        Some(110_000),
+        Some(5_900),
+        None,
+        None,
+        None,
+        Some(115_900),
+        Some(200_000),
+        "EXACT",
+    ).unwrap();
+
+    // 4. Now send a new message with prompt ~200 tokens (e.g. repeated sentence)
+    // 115,900 native tokens + 200 prompt tokens = 116,100 > 116,000 base_input_budget!
+    let next_prompt = "Please explain the architectural details and invariant guarantees of Seralyn multi-provider framework in complete depth.".repeat(3);
+    let prompt_tokens = seralyn_lib::app::tokens::TokenManager::estimate_tokens(&next_prompt);
+    assert!(115_900u64 + prompt_tokens > 116_000u64, "Total tokens must exceed base budget (116000)");
+
+    manager.send_message_with_attachments(
+        &conv.id,
+        &next_prompt,
+        ProviderKind::Claude,
+        Vec::new(),
+        Some("haiku".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    // 5. Verification:
+    // a) Session 1 MUST be closed
+    assert!(session_1_mock.closed.load(Ordering::SeqCst), "Old saturated session MUST be closed in memory");
+    let all_db_sessions = provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    let old_db_sess = all_db_sessions.iter().find(|s| s.id == session_1_rec.id).unwrap();
+    assert_eq!(old_db_sess.status, "closed", "Old saturated session MUST be marked closed in SQLite");
+
+    // b) A fresh session 2 MUST be created and active
+    let active_db_sess = provider_sessions::get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("haiku")).unwrap().unwrap();
+    assert_ne!(active_db_sess.id, session_1_rec.id, "Active session MUST be a fresh session record");
+    assert_eq!(active_db_sess.status, "active");
+
+    let created_guard = created_sessions.lock().await;
+    assert_eq!(created_guard.len(), 2, "A fresh native session MUST be created");
+    let session_2_mock = created_guard[1].clone();
+    drop(created_guard);
+
+    // c) The message sent to session 2 MUST include a compacted handoff summary of the prior history
+    let s2_msgs = session_2_mock.sent_messages.lock().await;
+    assert_eq!(s2_msgs.len(), 1);
+    let sent_msg = &s2_msgs[0];
+    assert_eq!(sent_msg.content, next_prompt);
+    assert!(!sent_msg.context.is_empty(), "Fresh session MUST receive compacted history context");
+    assert!(
+        sent_msg.context[0].content.contains("[Context Hand-off:"),
+        "First context message MUST be a compacted handoff summary"
+    );
+
+    // d) STRICT INVARIANT ON FRESH SESSION:
+    // native_tokens (0) + prompt_tokens + working_tokens <= base_input_budget (116,000)
+    let fresh_native_tokens = 0u64;
+    let working_tokens: u64 = sent_msg.context.iter().map(|m| seralyn_lib::app::tokens::TokenManager::estimate_tokens(&m.content)).sum();
+    let total_fresh_tokens = fresh_native_tokens + prompt_tokens + working_tokens;
+    assert!(
+        total_fresh_tokens <= 116_000,
+        "Total tokens in fresh session ({} native + {} prompt + {} working = {}) MUST be <= base input budget 116,000",
+        fresh_native_tokens, prompt_tokens, working_tokens, total_fresh_tokens
     );
 }
 
