@@ -2463,7 +2463,7 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
     let sent_msg = &s2_msgs[0];
     assert_eq!(sent_msg.content, next_prompt);
     assert!(!sent_msg.context.is_empty(), "Fresh session MUST receive prior history context");
-    assert_eq!(sent_msg.context.len(), 10, "Fresh session starting from seq 0 must receive prior turns");
+    assert_eq!(sent_msg.context.len(), 11, "Fresh session starting from seq 0 must receive all 11 prior turns (10 canonical + 1 initial prompt)");
     assert!(
         sent_msg.context.iter().any(|m| m.content.contains("Turn 1")),
         "Context must include prior history turns"
