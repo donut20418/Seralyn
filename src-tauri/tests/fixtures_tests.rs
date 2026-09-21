@@ -2850,7 +2850,8 @@ async fn test_gemini_multi_turn_dynamic_estimated_snapshots_and_rollover_no_loop
 
     // 4. Turn 4: Saturated rollover + Compacted Handoff
     // Create large canonical history in SQLite so total history exceeds fresh budget (> 916K tokens)
-    let big_segment = "Deep canonical conversation history data segment for multi-turn testing. ".repeat(2_700);
+    // 5 messages with ~803K chars = ~200,750 tokens * 5 = ~1,003,750 tokens
+    let big_segment = "Deep canonical conversation history data segment for multi-turn testing. ".repeat(11_000);
     for i in 1..=5 {
         let role = if i % 2 == 1 { "user" } else { "assistant" };
         messages::create_message(&db, &conv.id, None, role, &big_segment, Some("gemini"), None, Some(&s1_rec.id), None).unwrap();
