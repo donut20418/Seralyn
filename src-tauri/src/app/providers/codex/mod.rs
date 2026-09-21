@@ -16,7 +16,7 @@ use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::json_rpc::{JsonRpcNotification, JsonRpcServerRequest, JsonRpcTransport};
 use crate::app::process::{detect_executable, spawn, SpawnConfig};
 use crate::app::providers::{
-    resolve_profile_dir, AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
+    resolve_profile_dir, AttachmentKind, AttachmentRef, AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
     ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
 use parser::{codex_notification_to_normalized, codex_server_request_to_normalized};
@@ -64,7 +64,7 @@ impl Provider for CodexProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             text: true,
-            image: false,
+            image: true,
             file: false,
             tools: true,
             skills: false,
@@ -333,7 +333,7 @@ impl ProviderSession for CodexSession {
 
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
-        let turn_params = build_codex_turn_params(&tid, &prompt_text, self.model.as_deref(), self.effort.as_deref());
+        let turn_params = build_codex_turn_params(&tid, &prompt_text, &message.attachments, self.model.as_deref(), self.effort.as_deref());
 
         let turn_resp = self.transport.request("turn/start", turn_params).await?;
 
@@ -462,15 +462,27 @@ pub fn build_codex_start_params(
 pub fn build_codex_turn_params(
     thread_id: &str,
     prompt_text: &str,
+    attachments: &[AttachmentRef],
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Value {
+    let mut input_items = vec![json!({
+        "type": "text",
+        "text": prompt_text,
+    })];
+
+    for att in attachments {
+        if att.kind == AttachmentKind::Image {
+            input_items.push(json!({
+                "type": "localImage",
+                "path": att.path.to_string_lossy().to_string(),
+            }));
+        }
+    }
+
     let mut turn_params = json!({
         "threadId": thread_id,
-        "input": [{
-            "type": "text",
-            "text": prompt_text,
-        }],
+        "input": input_items,
     });
     if let Some(m) = model {
         turn_params["model"] = json!(m);

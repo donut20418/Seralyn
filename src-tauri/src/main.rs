@@ -67,13 +67,21 @@ async fn archive_conversation(id: String, state: State<'_, AppState>) -> Result<
         .map_err(|e| e.to_string())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum AttachmentArg {
+    Id(String),
+    Record { id: String },
+}
+
 #[tauri::command]
 async fn send_message(
     app: AppHandle,
     conversation_id: String,
     content: String,
     provider: String,
-    attachments: Option<Vec<AttachmentInfo>>,
+    attachment_ids: Option<Vec<AttachmentArg>>,
+    attachments: Option<Vec<AttachmentArg>>,
     model: Option<String>,
     account: Option<String>,
     effort: Option<String>,
@@ -92,13 +100,22 @@ async fn send_message(
         }
     });
 
+    let raw_args = attachment_ids.or(attachments).unwrap_or_default();
+    let validated_ids: Vec<String> = raw_args
+        .into_iter()
+        .map(|a| match a {
+            AttachmentArg::Id(id) => id,
+            AttachmentArg::Record { id } => id,
+        })
+        .collect();
+
     state
         .conversation_manager
         .send_message_with_attachments(
             &conversation_id,
             &content,
             provider_kind,
-            attachments.unwrap_or_default(),
+            validated_ids,
             model,
             account,
             effort,

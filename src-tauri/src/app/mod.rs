@@ -1,4 +1,5 @@
 pub mod db;
+pub mod attachments;
 pub mod conversation;
 pub mod providers;
 pub mod process;

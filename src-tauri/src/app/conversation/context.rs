@@ -15,11 +15,7 @@ pub fn build_context(db: &Database, conversation_id: &str, max_messages: usize) 
             continue;
         }
         
-        context.push(ContextMessage {
-            role: msg.role,
-            content: msg.content,
-            provider: msg.provider,
-        });
+        context.push(ContextMessage::new(msg.role, msg.content, msg.provider));
     }
     
     Ok(context)
@@ -27,7 +23,7 @@ pub fn build_context(db: &Database, conversation_id: &str, max_messages: usize) 
 
 /// Builds the context delta between a provider session's sync cursor (`after_seq`)
 /// and the current user message (`before_seq`).
-/// Only messages in range (after_seq, before_seq) are returned.
+/// Only messages in range (after_seq, before_seq) are returned, including their canonical attachments.
 pub fn build_context_delta(
     db: &Database,
     conversation_id: &str,
@@ -36,27 +32,72 @@ pub fn build_context_delta(
 ) -> Result<Vec<ContextMessage>> {
     let conn = db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT role, content, provider
+        "SELECT id, role, content, provider
          FROM messages
          WHERE conversation_id = ?1 AND seq > ?2 AND seq < ?3
          ORDER BY seq ASC"
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
     let iter = stmt.query_map(params![conversation_id, after_seq, before_seq], |row| {
-        Ok(ContextMessage {
-            role: row.get(0)?,
-            content: row.get(1)?,
-            provider: row.get(2)?,
-        })
+        let msg_id: String = row.get(0)?;
+        let role: String = row.get(1)?;
+        let content: String = row.get(2)?;
+        let provider: Option<String> = row.get(3)?;
+        Ok((msg_id, role, content, provider))
     }).map_err(|e| AppError::Database(e.to_string()))?;
 
-    let mut context = Vec::new();
+    let mut raw_rows = Vec::new();
     for row in iter {
-        let msg = row.map_err(|e| AppError::Database(e.to_string()))?;
-        if msg.role == "system" || msg.role == "tool" {
+        raw_rows.push(row.map_err(|e| AppError::Database(e.to_string()))?);
+    }
+
+    // Query canonical attachments associated with messages in this conversation
+    let mut att_stmt = conn.prepare(
+        "SELECT id, message_id, name, mime_type, size_bytes, sha256, kind
+         FROM attachments
+         WHERE conversation_id = ?1 AND state = 'attached' AND message_id IS NOT NULL
+         ORDER BY rowid ASC"
+    ).map_err(|e| AppError::Database(e.to_string()))?;
+
+    let att_iter = att_stmt.query_map(params![conversation_id], |row| {
+        let id: String = row.get(0)?;
+        let message_id: String = row.get(1)?;
+        let name: String = row.get(2)?;
+        let mime_type: String = row.get(3)?;
+        let size_raw: i64 = row.get(4)?;
+        let sha256: String = row.get(5)?;
+        let kind_str: String = row.get(6)?;
+        let kind = kind_str.parse::<crate::app::attachments::AttachmentKind>()
+            .unwrap_or(crate::app::attachments::AttachmentKind::Binary);
+        Ok((message_id, crate::app::providers::AttachmentDescriptor {
+            id,
+            name,
+            mime_type,
+            size_bytes: size_raw as u64,
+            sha256,
+            kind,
+        }))
+    }).map_err(|e| AppError::Database(e.to_string()))?;
+
+    let mut att_map: std::collections::HashMap<String, Vec<crate::app::providers::AttachmentDescriptor>> = std::collections::HashMap::new();
+    for r in att_iter {
+        if let Ok((mid, desc)) = r {
+            att_map.entry(mid).or_default().push(desc);
+        }
+    }
+
+    let mut context = Vec::new();
+    for (msg_id, role, content, provider) in raw_rows {
+        if role == "system" || role == "tool" {
             continue;
         }
-        context.push(msg);
+        let attachments = att_map.remove(&msg_id).unwrap_or_default();
+        context.push(ContextMessage {
+            role,
+            content,
+            provider,
+            attachments,
+        });
     }
 
     Ok(context)
@@ -157,7 +198,20 @@ pub fn compact_older_messages(older: &[ContextMessage]) -> String {
             trimmed.to_string()
         };
 
-        summary.push_str(&format!("- Turn {}: [{}] {}\n", i + 1, role_label, condensed));
+        let att_descriptors = if !msg.attachments.is_empty() {
+            let parts: Vec<String> = msg.attachments
+                .iter()
+                .map(|a| {
+                    let hash_prefix = if a.sha256.len() >= 8 { &a.sha256[..8] } else { &a.sha256 };
+                    format!("[Attachment: {} | {} | sha256:{}]", a.name, a.mime_type, hash_prefix)
+                })
+                .collect();
+            format!(" {}", parts.join(" "))
+        } else {
+            String::new()
+        };
+
+        summary.push_str(&format!("- Turn {}: [{}] {}{}\n", i + 1, role_label, condensed, att_descriptors));
     }
     summary
 }
@@ -229,6 +283,7 @@ pub fn build_adaptive_context(
                 role: msg.role.clone(),
                 content: msg_content,
                 provider: msg.provider.clone(),
+                attachments: msg.attachments.clone(),
             });
             split_idx = idx;
         } else {
@@ -252,6 +307,7 @@ pub fn build_adaptive_context(
         role: "assistant".to_string(),
         content: handoff_content,
         provider: Some("handoff-manager".to_string()),
+        attachments: Vec::new(),
     });
     result_messages.extend(recent_messages);
 
@@ -362,8 +418,8 @@ mod tests {
     
     #[test]
     fn test_estimate_context_tokens() {
-        let msg1 = ContextMessage { role: "user".into(), content: "hello".into(), provider: None };
-        let msg2 = ContextMessage { role: "assistant".into(), content: "world".into(), provider: None };
+        let msg1 = ContextMessage::new("user", "hello", None);
+        let msg2 = ContextMessage::new("assistant", "world", None);
         let tokens = estimate_context_tokens(&[msg1, msg2], &TokenManager::new());
         assert!(tokens > 0);
     }

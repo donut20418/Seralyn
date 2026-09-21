@@ -18,6 +18,13 @@ pub use crate::app::db::provider_sessions::ProviderSessionRecord;
 use crate::app::db::provider_sessions;
 pub use crate::app::db::usage_snapshots::UsageSnapshotRecord;
 use crate::app::db::usage_snapshots;
+pub use crate::app::db::attachments::AttachmentRecord;
+use crate::app::db::attachments;
+use crate::app::attachments::{
+    classify_mime_and_kind, compute_sha256, get_conversation_attachment_dir,
+    resolve_and_verify_managed_path, sanitize_file_name, AttachmentKind,
+    MAX_AGGREGATE_SIZE_PER_TURN, MAX_ATTACHMENTS_PER_TURN, MAX_SINGLE_FILE_SIZE,
+};
 use crate::app::db::Database;
 use crate::app::error::Result;
 use crate::app::events::{EventPayload, EventType, NormalizedEvent, ProviderKind};
@@ -25,15 +32,8 @@ use crate::app::providers::{
     PermissionMode, ProviderManager, ProviderMessage, ProviderSession, ProviderStatus, SessionConfig,
 };
 
-/// Attachment info returned when saving attachments
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttachmentInfo {
-    pub id: String,
-    pub name: String,
-    pub path: String,
-    pub size: u64,
-    pub mime_type: String,
-}
+/// Canonical attachment record alias for backward compatibility
+pub type AttachmentInfo = AttachmentRecord;
 
 /// Conversation with full history and active provider sessions (used by frontend / Tauri IPC)
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -157,65 +157,89 @@ impl ConversationManager {
         conversation_id: &str,
         content: &str,
         provider_kind: ProviderKind,
-        attachments: Vec<AttachmentInfo>,
+        attachment_ids: Vec<String>,
         model: Option<String>,
         account: Option<String>,
         effort: Option<String>,
         event_sender: mpsc::Sender<NormalizedEvent>,
     ) -> Result<()> {
-        // 1. Build provider_prompt with attachment header and validate prompt budget BEFORE writing to DB
-        let provider_prompt = if !attachments.is_empty() {
-            let attachment_header = attachments
-                .iter()
-                .map(|a| format!("[Attached File: {} ({}, {:.1} KB)]", a.path, a.name, a.size as f64 / 1024.0))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{}\n\n{}", attachment_header, content)
-        } else {
-            content.to_string()
-        };
+        // 1. Validate attachment count
+        if attachment_ids.len() > MAX_ATTACHMENTS_PER_TURN {
+            return Err(crate::app::error::AppError::InvalidInput(format!(
+                "Too many attachments ({}): maximum allowed is {}",
+                attachment_ids.len(),
+                MAX_ATTACHMENTS_PER_TURN
+            )));
+        }
 
+        // 2. Validate and load attachment records (INV-A2, INV-A3, INV-A4, INV-A5)
+        let mut aggregate_size: u64 = 0;
+        let mut validated_records = Vec::with_capacity(attachment_ids.len());
+        let mut attachment_refs = Vec::with_capacity(attachment_ids.len());
+
+        for att_id in &attachment_ids {
+            let record = attachments::get_attachment(&self.db, att_id)?
+                .ok_or_else(|| crate::app::error::AppError::InvalidInput(format!("Attachment not found: {}", att_id)))?;
+
+            // Cross-conversation isolation (INV-A2)
+            if record.conversation_id != conversation_id {
+                return Err(crate::app::error::AppError::InvalidInput(format!(
+                    "Attachment {} does not belong to conversation {}",
+                    att_id, conversation_id
+                )));
+            }
+
+            // Must be staged or attached to this conversation
+            if record.state != "staged" && record.state != "attached" {
+                return Err(crate::app::error::AppError::InvalidInput(format!(
+                    "Attachment {} is not in a valid state (current: {})",
+                    att_id, record.state
+                )));
+            }
+
+            // Verify physical containment within conversation folder (INV-A4, INV-A10)
+            let managed_path = resolve_and_verify_managed_path(conversation_id, &record.stored_name)?;
+
+            // Check single file size limit (25 MB)
+            if record.size_bytes > MAX_SINGLE_FILE_SIZE as u64 {
+                return Err(crate::app::error::AppError::InvalidInput(format!(
+                    "Attachment '{}' ({} bytes) exceeds single file limit of 25MB",
+                    record.name, record.size_bytes
+                )));
+            }
+
+            aggregate_size = aggregate_size.saturating_add(record.size_bytes);
+            if aggregate_size > MAX_AGGREGATE_SIZE_PER_TURN as u64 {
+                return Err(crate::app::error::AppError::InvalidInput(format!(
+                    "Aggregate attachment size ({} bytes) exceeds limit of 50MB",
+                    aggregate_size
+                )));
+            }
+
+            let att_ref = crate::app::providers::AttachmentRef {
+                id: record.id.clone(),
+                name: record.name.clone(),
+                path: managed_path,
+                mime_type: record.mime_type.clone(),
+                size_bytes: record.size_bytes,
+                sha256: record.sha256.clone(),
+                kind: record.kind,
+            };
+
+            attachment_refs.push(att_ref);
+            validated_records.push(record);
+        }
+
+        // 3. Validate prompt budget on pure content (INV-A7: no fake text headers!)
         let context_window = resolve_model_context_window(provider_kind.clone(), model.as_deref());
         let base_input_budget = calculate_input_budget(context_window);
-        let prompt_tokens = TokenManager::estimate_tokens(&provider_prompt);
+        let prompt_tokens = TokenManager::estimate_tokens(content);
 
         if prompt_tokens > base_input_budget {
             return Err(crate::app::error::AppError::InvalidInput(format!(
                 "Prompt size ({} tokens) exceeds model's maximum input budget ({} tokens)",
                 prompt_tokens, base_input_budget
             )));
-        }
-
-        // 2. Save user message to DB with attachments in metadata -> returns user_msg with assigned sequence number
-        let user_metadata = if !attachments.is_empty() {
-            Some(serde_json::to_string(&serde_json::json!({ "attachments": attachments }))?)
-        } else {
-            None
-        };
-
-        let user_msg = messages::create_message_with_metadata(
-            &self.db,
-            conversation_id,
-            None,
-            "user",
-            content,
-            None,
-            model.as_deref(),
-            None,
-            None,
-            user_metadata.as_deref(),
-        )?;
-
-        // Auto-title conversation if title is unset or default
-        if let Ok(conv) = conversations::get_conversation(&self.db, conversation_id) {
-            let needs_title = conv.title.as_ref().map(|t| t.trim().is_empty() || t == "New Conversation").unwrap_or(true);
-            if needs_title {
-                let first_line = content.lines().next().unwrap_or("").trim();
-                let clean_title: String = first_line.chars().take(40).collect();
-                if !clean_title.is_empty() {
-                    let _ = conversations::update_conversation_title(&self.db, conversation_id, &clean_title);
-                }
-            }
         }
 
         let provider = self.provider_manager.get(provider_kind.clone())?;
@@ -558,7 +582,46 @@ impl ConversationManager {
             }
         };
 
-        // 5. Calculate adaptive context delta between sync cursor and current message,
+        // 5. Pre-flight Capability Check: If message has image attachments, ensure provider supports images (INV-A5, AT-08)
+        let has_images = validated_records.iter().any(|r| r.kind == AttachmentKind::Image);
+        if has_images && !session.supports_images().await {
+            return Err(crate::app::error::AppError::InvalidInput(
+                "Image attachments are not supported by this provider/session capabilities".to_string(),
+            ));
+        }
+
+        // 6. Save user message to DB (INV-A7: pure user prompt, no fake header!) -> returns user_msg with assigned sequence number
+        let user_msg = messages::create_message_with_metadata(
+            &self.db,
+            conversation_id,
+            None,
+            "user",
+            content,
+            None,
+            model.as_deref(),
+            None,
+            None,
+            None,
+        )?;
+
+        // 7. Transition attachments in DB from staged to attached and associate with user_msg (INV-A8)
+        for rec in &validated_records {
+            attachments::attach_to_message(&self.db, &rec.id, &user_msg.id)?;
+        }
+
+        // Auto-title conversation if title is unset or default
+        if let Ok(conv) = conversations::get_conversation(&self.db, conversation_id) {
+            let needs_title = conv.title.as_ref().map(|t| t.trim().is_empty() || t == "New Conversation").unwrap_or(true);
+            if needs_title {
+                let first_line = content.lines().next().unwrap_or("").trim();
+                let clean_title: String = first_line.chars().take(40).collect();
+                if !clean_title.is_empty() {
+                    let _ = conversations::update_conversation_title(&self.db, conversation_id, &clean_title);
+                }
+            }
+        }
+
+        // 8. Calculate adaptive context delta between sync cursor and current message,
         // factoring in effective existing native session context tokens and current prompt tokens
         let adaptive_ctx = build_adaptive_context(
             &self.db,
@@ -568,21 +631,12 @@ impl ConversationManager {
             provider_kind,
             model.as_deref(),
             effective_existing_native_tokens,
-            &provider_prompt,
+            content,
         )?;
 
-        // 7. Create ProviderMessage with content + adaptive context delta + attachments
-        let attachment_refs: Vec<crate::app::providers::AttachmentRef> = attachments
-            .iter()
-            .map(|a| crate::app::providers::AttachmentRef {
-                id: a.id.clone(),
-                path: std::path::PathBuf::from(&a.path),
-                mime_type: a.mime_type.clone(),
-            })
-            .collect();
-
+        // 9. Create ProviderMessage with pure content + adaptive context delta + structured attachments
         let msg = ProviderMessage {
-            content: provider_prompt,
+            content: content.to_string(),
             context: adaptive_ctx.messages,
             attachments: attachment_refs,
         };
@@ -593,10 +647,10 @@ impl ConversationManager {
             .saturating_add(prompt_tokens);
         active_turn_input_tokens.store(accumulated_input, Ordering::SeqCst);
 
-        // 8. Call session.send(message) WITHOUT holding active_sessions lock!
+        // 10. Call session.send(message) WITHOUT holding active_sessions lock!
         // This completely prevents approval and interrupt deadlocks!
         session.send(msg).await?;
-        
+
         let _ = provider_sessions::update_session_used(&self.db, &active_db_session_id);
 
         Ok(())
@@ -701,7 +755,7 @@ impl ConversationManager {
         file_name: &str,
         file_data: &[u8],
         mime_type: Option<&str>,
-    ) -> Result<AttachmentInfo> {
+    ) -> Result<AttachmentRecord> {
         // 1. Validate conversation_id format (must be valid UUID)
         uuid::Uuid::parse_str(conversation_id)
             .map_err(|_| crate::app::error::AppError::InvalidInput("Invalid conversation id: must be a valid UUID".to_string()))?;
@@ -709,56 +763,19 @@ impl ConversationManager {
         // 2. Validate that conversation exists in database
         conversations::get_conversation(&self.db, conversation_id)?;
 
-        // 3. File size limit: 25 MB max
-        const MAX_ATTACHMENT_SIZE: usize = 25 * 1024 * 1024;
-        if file_data.len() > MAX_ATTACHMENT_SIZE {
+        // 3. File size limit: 25 MB max (INV-A5)
+        if file_data.len() > MAX_SINGLE_FILE_SIZE {
             return Err(crate::app::error::AppError::InvalidInput(format!(
                 "File size ({} bytes) exceeds maximum limit of 25MB",
                 file_data.len()
             )));
         }
 
-        // 4. Filename sanitization: extract leaf and reject control / path separator characters
-        let raw_leaf = std::path::Path::new(file_name)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("attachment.bin");
+        // 4. Filename sanitization: extract leaf and remove traversal / control characters (INV-A4)
+        let safe_name = sanitize_file_name(file_name);
 
-        let sanitized: String = raw_leaf
-            .chars()
-            .filter(|c| c.is_alphanumeric() || *c == '.' || *c == '_' || *c == '-' || *c == ' ')
-            .collect();
-
-        let safe_name = if sanitized.trim().is_empty() {
-            "attachment.bin"
-        } else {
-            sanitized.trim()
-        };
-
-        // 5. Build and canonicalize attachments root directory first
-        let mut root_path = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        root_path.push("Seralyn");
-        root_path.push("attachments");
-        std::fs::create_dir_all(&root_path)?;
-        let canon_root = root_path.canonicalize()?;
-
-        let conv_dir = canon_root.join(conversation_id);
-        // Ensure conv_dir is strictly inside canon_root and is a direct child
-        if !conv_dir.starts_with(&canon_root) || conv_dir.parent() != Some(canon_root.as_path()) {
-            return Err(crate::app::error::AppError::InvalidInput(
-                "Path traversal attempt detected in conversation id".to_string(),
-            ));
-        }
-
-        std::fs::create_dir_all(&conv_dir)?;
-        let canon_conv_dir = conv_dir.canonicalize()?;
-
-        // Verify resolved path against symlink / junction escapes
-        if !canon_conv_dir.starts_with(&canon_root) || canon_conv_dir.parent() != Some(canon_root.as_path()) {
-            return Err(crate::app::error::AppError::InvalidInput(
-                "Junction/symlink traversal attempt detected in conversation directory".to_string(),
-            ));
-        }
+        // 5. Build and canonicalize conversation attachments directory (INV-A4, INV-A10)
+        let canon_conv_dir = get_conversation_attachment_dir(conversation_id)?;
 
         let id = uuid::Uuid::new_v4().to_string();
         let dest_filename = format!("{}_{}", id, safe_name);
@@ -773,15 +790,25 @@ impl ConversationManager {
 
         std::fs::write(&dest_path, file_data)?;
 
-        let mime = mime_type.unwrap_or("application/octet-stream").to_string();
+        let sha256 = compute_sha256(file_data);
+        let (mime, kind) = classify_mime_and_kind(&safe_name, file_data, mime_type);
 
-        Ok(AttachmentInfo {
-            id,
-            name: safe_name.to_string(),
-            path: dest_path.to_string_lossy().to_string(),
-            size: file_data.len() as u64,
-            mime_type: mime,
-        })
+        // 6. Create canonical staged record in SQLite (INV-A1, INV-A8)
+        let mut record = attachments::create_staged_attachment_with_id(
+            &self.db,
+            &id,
+            conversation_id,
+            &safe_name,
+            &dest_filename,
+            &mime,
+            file_data.len() as u64,
+            &sha256,
+            kind,
+        )?;
+        record.path = dest_path.to_string_lossy().to_string();
+        record.size = file_data.len() as u64;
+
+        Ok(record)
     }
 
     pub fn delete_attachment(
@@ -794,23 +821,23 @@ impl ConversationManager {
         uuid::Uuid::parse_str(attachment_id)
             .map_err(|_| crate::app::error::AppError::InvalidInput("Invalid attachment id".to_string()))?;
 
-        let mut root_path = dirs::data_local_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
-        root_path.push("Seralyn");
-        root_path.push("attachments");
-        if !root_path.exists() {
-            return Ok(());
-        }
-        let canon_root = root_path.canonicalize()?;
-        let conv_dir = canon_root.join(conversation_id);
-
-        if conv_dir.exists() {
-            let canon_dir = conv_dir.canonicalize()?;
-            if !canon_dir.starts_with(&canon_root) || canon_dir.parent() != Some(canon_root.as_path()) {
+        // 1. If attachment exists in DB, verify ownership and remove DB record (INV-A2)
+        if let Ok(Some(record)) = attachments::get_attachment(&self.db, attachment_id) {
+            if record.conversation_id != conversation_id {
                 return Err(crate::app::error::AppError::InvalidInput(
-                    "Junction/symlink traversal detected in attachment deletion".to_string(),
+                    "Attachment does not belong to specified conversation".to_string(),
                 ));
             }
-            if let Ok(entries) = std::fs::read_dir(&canon_dir) {
+            attachments::delete_attachment_record(&self.db, attachment_id)?;
+
+            if let Ok(canon_path) = resolve_and_verify_managed_path(conversation_id, &record.stored_name) {
+                let _ = std::fs::remove_file(canon_path);
+            }
+        }
+
+        // 2. Also clean up any lingering disk files for this attachment id (defense in depth)
+        if let Ok(conv_dir) = get_conversation_attachment_dir(conversation_id) {
+            if let Ok(entries) = std::fs::read_dir(&conv_dir) {
                 for entry in entries.flatten() {
                     let file_name = entry.file_name().to_string_lossy().to_string();
                     if file_name.starts_with(&format!("{}_", attachment_id)) {
@@ -819,6 +846,7 @@ impl ConversationManager {
                 }
             }
         }
+
         Ok(())
     }
 

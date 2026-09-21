@@ -17,7 +17,7 @@ use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::json_rpc::{JsonRpcNotification, JsonRpcServerRequest, JsonRpcTransport};
 use crate::app::process::{detect_executable, spawn, SpawnConfig};
 use crate::app::providers::{
-    resolve_profile_dir, AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
+    resolve_profile_dir, AttachmentKind, AttachmentRef, AuthStatus, InstallationInfo, PermissionMode, Provider, ProviderCapabilities,
     ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
 use parser::{gemini_notification_to_normalized, gemini_server_request_to_normalized};
@@ -77,7 +77,7 @@ impl Provider for GeminiProvider {
     fn capabilities(&self) -> ProviderCapabilities {
         ProviderCapabilities {
             text: true,
-            image: false,
+            image: true,
             file: false,
             tools: true,
             skills: false,
@@ -129,13 +129,18 @@ impl Provider for GeminiProvider {
         let (transport, notif_rx, server_req_rx) = JsonRpcTransport::new(process);
 
         // Step 1: ACP v1 initialize request -> await response
-        let _ = transport.request(
+        let init_resp = transport.request(
             "initialize",
             json!({
                 "protocolVersion": 1,
                 "clientCapabilities": {}
             }),
         ).await?;
+
+        let server_capabilities = init_resp
+            .get("serverCapabilities")
+            .or_else(|| init_resp.get("capabilities"))
+            .cloned();
 
         // Optional authenticate if API key is explicitly provided in environment
         if let Ok(key) = std::env::var("GEMINI_API_KEY") {
@@ -168,6 +173,7 @@ impl Provider for GeminiProvider {
         let session = GeminiSession::new(
             transport,
             session_id,
+            server_capabilities,
             config.conversation_id,
             config.model,
             config.event_sender,
@@ -223,13 +229,18 @@ impl Provider for GeminiProvider {
         let (transport, notif_rx, server_req_rx) = JsonRpcTransport::new(process);
 
         // Step 1: ACP v1 initialize -> await response
-        let _ = transport.request(
+        let init_resp = transport.request(
             "initialize",
             json!({
                 "protocolVersion": 1,
                 "clientCapabilities": {}
             }),
         ).await?;
+
+        let server_capabilities = init_resp
+            .get("serverCapabilities")
+            .or_else(|| init_resp.get("capabilities"))
+            .cloned();
 
         // Optional authenticate if API key is explicitly provided in environment
         if let Ok(key) = std::env::var("GEMINI_API_KEY") {
@@ -257,6 +268,7 @@ impl Provider for GeminiProvider {
         let session = GeminiSession::new(
             transport,
             Some(native_session_id.to_string()),
+            server_capabilities,
             config.conversation_id,
             config.model,
             config.event_sender,
@@ -275,6 +287,7 @@ impl Provider for GeminiProvider {
 pub struct GeminiSession {
     transport: Arc<JsonRpcTransport>,
     session_id: Arc<RwLock<Option<String>>>,
+    server_capabilities: Arc<RwLock<Option<Value>>>,
     conversation_id: String,
     model: Option<String>,
     event_sender: mpsc::Sender<NormalizedEvent>,
@@ -291,6 +304,7 @@ impl GeminiSession {
     pub fn new(
         transport: Arc<JsonRpcTransport>,
         session_id: Option<String>,
+        server_capabilities: Option<Value>,
         conversation_id: String,
         model: Option<String>,
         event_sender: mpsc::Sender<NormalizedEvent>,
@@ -301,6 +315,7 @@ impl GeminiSession {
         Self {
             transport,
             session_id: Arc::new(RwLock::new(session_id)),
+            server_capabilities: Arc::new(RwLock::new(server_capabilities)),
             conversation_id,
             model,
             event_sender,
@@ -311,6 +326,15 @@ impl GeminiSession {
             replay_complete: Arc::new(AtomicBool::new(!is_resume)),
             replay_ready: Arc::new(Notify::new()),
             is_resume,
+        }
+    }
+
+    pub async fn supports_images(&self) -> bool {
+        let caps = self.server_capabilities.read().await;
+        if let Some(ref c) = *caps {
+            check_acp_image_support(c)
+        } else {
+            false
         }
     }
 
@@ -478,6 +502,13 @@ impl ProviderSession for GeminiSession {
     async fn send(&self, message: ProviderMessage) -> Result<()> {
         let sid = self.session_id.read().await.clone().unwrap_or_default();
 
+        let has_images = message.attachments.iter().any(|a| a.kind == AttachmentKind::Image);
+        if has_images && !self.supports_images().await {
+            return Err(crate::app::error::AppError::InvalidInput(
+                "Gemini ACP instance does not support image attachments".to_string(),
+            ));
+        }
+
         // Resume replay barrier: ensure historical replay is complete before sending prompt
         if !self.replay_complete.load(Ordering::SeqCst) {
             let notified = self.replay_ready.notified();
@@ -488,7 +519,7 @@ impl ProviderSession for GeminiSession {
 
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
-        let prompt_params = build_gemini_prompt_params(&sid, &prompt_text);
+        let prompt_params = build_gemini_prompt_params(&sid, &prompt_text, &message.attachments);
 
         let _ = self.transport.request_with_timeout(
             "session/prompt",
@@ -604,6 +635,15 @@ impl ProviderSession for GeminiSession {
     fn is_active(&self) -> bool {
         self.transport.is_active()
     }
+
+    async fn supports_images(&self) -> bool {
+        let caps = self.server_capabilities.read().await;
+        if let Some(ref c) = *caps {
+            check_acp_image_support(c)
+        } else {
+            false
+        }
+    }
 }
 
 pub fn resolve_canonical_cwd(working_dir: Option<&std::path::Path>) -> String {
@@ -629,15 +669,44 @@ pub fn resolve_canonical_cwd(working_dir: Option<&std::path::Path>) -> String {
     }
 }
 
-pub fn build_gemini_prompt_params(session_id: &str, prompt_text: &str) -> Value {
+pub fn check_acp_image_support(capabilities: &Value) -> bool {
+    let caps = capabilities
+        .get("serverCapabilities")
+        .or_else(|| capabilities.get("capabilities"))
+        .unwrap_or(capabilities);
+
+    caps.get("promptCapabilities")
+        .and_then(|p| p.get("image"))
+        .or_else(|| caps.get("image"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+pub fn build_gemini_prompt_params(
+    session_id: &str,
+    prompt_text: &str,
+    attachments: &[AttachmentRef],
+) -> Value {
+    let mut prompt_blocks = vec![json!({
+        "type": "text",
+        "text": prompt_text,
+    })];
+
+    for att in attachments {
+        if att.kind == AttachmentKind::Image {
+            let data = std::fs::read(&att.path).unwrap_or_default();
+            let b64 = crate::app::attachments::base64_encode(&data);
+            prompt_blocks.push(json!({
+                "type": "image",
+                "data": b64,
+                "mimeType": att.mime_type,
+            }));
+        }
+    }
+
     json!({
         "sessionId": session_id,
-        "prompt": [
-            {
-                "type": "text",
-                "text": prompt_text,
-            }
-        ]
+        "prompt": prompt_blocks,
     })
 }
 

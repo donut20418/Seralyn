@@ -6,8 +6,11 @@ import type {
   ProviderStatus,
   ProviderKind,
   AttachmentInfo,
+  AttachmentRecord,
   UsageSnapshot,
 } from './types';
+
+export type { AttachmentRecord, AttachmentInfo };
 
 export async function createConversation(title?: string): Promise<Conversation> {
   return invoke('create_conversation', { title });
@@ -37,16 +40,19 @@ export async function sendMessage(
   conversationId: string,
   content: string,
   provider: ProviderKind,
-  attachments?: AttachmentInfo[],
+  attachments?: AttachmentInfo[] | string[],
   model?: string,
   account?: string,
   effort?: string
 ): Promise<void> {
+  const attachmentIds = attachments
+    ? attachments.map(a => (typeof a === 'string' ? a : a.id))
+    : [];
   return invoke('send_message', {
     conversationId,
     content,
     provider,
-    attachments: attachments || [],
+    attachmentIds,
     model: model || null,
     account: account || null,
     effort: effort || null,

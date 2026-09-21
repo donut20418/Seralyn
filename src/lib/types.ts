@@ -47,13 +47,23 @@ export type EventPayload =
   | { kind: 'FileChange'; path: string; change_type: string }
   | { kind: 'Empty' };
 
-export interface AttachmentInfo {
+export interface AttachmentRecord {
   id: string;
+  conversation_id?: string;
+  message_id?: string;
   name: string;
-  path: string;
-  size: number;
+  stored_name?: string;
   mime_type: string;
+  size_bytes?: number;
+  size: number;
+  path: string;
+  sha256?: string;
+  kind?: 'image' | 'text' | 'binary';
+  state?: string;
+  created_at?: string;
 }
+
+export type AttachmentInfo = AttachmentRecord;
 
 export interface UsageSnapshot {
   id?: string;

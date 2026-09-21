@@ -7,9 +7,11 @@ pub mod conversations;
 pub mod messages;
 pub mod provider_sessions;
 pub mod usage_snapshots;
+pub mod attachments;
 
 const MIGRATION_001: &str = include_str!("../../../migrations/001_initial.sql");
 const MIGRATION_002: &str = include_str!("../../../migrations/002_sync_cursor.sql");
+const MIGRATION_003: &str = include_str!("../../../migrations/003_attachments.sql");
 
 pub struct Database {
     pub conn: Mutex<Connection>,
@@ -103,6 +105,7 @@ impl Database {
         let migrations: Vec<(i32, &str)> = vec![
             (1, MIGRATION_001),
             (2, MIGRATION_002),
+            (3, MIGRATION_003),
         ];
 
         for (ver, sql) in migrations {
@@ -202,8 +205,11 @@ mod tests {
 
         let v1: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 1)", [], |r| r.get(0)).unwrap();
         let v2: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 2)", [], |r| r.get(0)).unwrap();
+        let v3: bool = conn.query_row("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = 3)", [], |r| r.get(0)).unwrap();
         assert!(v1);
         assert!(v2);
+        assert!(v3);
+        assert!(table_has_column(&conn, "attachments", "sha256"));
     }
 
     #[test]

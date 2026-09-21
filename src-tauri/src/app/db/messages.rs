@@ -1,5 +1,6 @@
 use serde::{Serialize, Deserialize};
 use crate::app::db::Database;
+use crate::app::db::attachments::AttachmentRecord;
 use crate::app::error::{AppError, Result};
 use chrono::Utc;
 use uuid::Uuid;
@@ -19,6 +20,8 @@ pub struct Message {
     pub created_at: String,
     pub token_estimate: Option<i64>,
     pub metadata_json: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentRecord>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96,6 +99,7 @@ pub fn create_message_with_metadata(
         created_at: now,
         token_estimate,
         metadata_json: metadata_json.map(|s| s.to_string()),
+        attachments: Vec::new(),
     })
 }
 
@@ -120,6 +124,7 @@ pub fn get_messages(db: &Database, conversation_id: &str) -> Result<Vec<Message>
             created_at: row.get(9)?,
             token_estimate: row.get(10)?,
             metadata_json: row.get(11)?,
+            attachments: Vec::new(),
         })
     }).map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -127,6 +132,58 @@ pub fn get_messages(db: &Database, conversation_id: &str) -> Result<Vec<Message>
     for row in iter {
         res.push(row.map_err(|e| AppError::Database(e.to_string()))?);
     }
+
+    let has_attachments_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='attachments')",
+        [],
+        |row| row.get(0),
+    ).unwrap_or(false);
+
+    if has_attachments_table {
+        let mut att_stmt = conn.prepare(
+            "SELECT id, conversation_id, message_id, name, stored_name, mime_type, size_bytes, sha256, kind, state, created_at
+             FROM attachments
+             WHERE conversation_id = ?1 AND state = 'attached' AND message_id IS NOT NULL
+             ORDER BY rowid ASC",
+        ).map_err(|e| AppError::Database(e.to_string()))?;
+
+        let att_iter = att_stmt.query_map(params![conversation_id], |row| {
+            let kind_str: String = row.get(8)?;
+            let kind = kind_str.parse::<crate::app::attachments::AttachmentKind>()
+                .unwrap_or(crate::app::attachments::AttachmentKind::Binary);
+            let size_raw: i64 = row.get(6)?;
+            let msg_id: String = row.get(2)?;
+
+            Ok((msg_id, AttachmentRecord {
+                id: row.get(0)?,
+                conversation_id: row.get(1)?,
+                message_id: Some(row.get(2)?),
+                name: row.get(3)?,
+                stored_name: row.get(4)?,
+                mime_type: row.get(5)?,
+                size_bytes: size_raw as u64,
+                size: size_raw as u64,
+                sha256: row.get(7)?,
+                kind,
+                state: row.get(9)?,
+                created_at: row.get(10)?,
+            }))
+        }).map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut att_map: std::collections::HashMap<String, Vec<AttachmentRecord>> = std::collections::HashMap::new();
+        for r in att_iter {
+            if let Ok((mid, att)) = r {
+                att_map.entry(mid).or_default().push(att);
+            }
+        }
+
+        for msg in &mut res {
+            if let Some(atts) = att_map.remove(&msg.id) {
+                msg.attachments = atts;
+            }
+        }
+    }
+
     Ok(res)
 }
 
@@ -135,28 +192,37 @@ pub fn get_messages_for_conversation(db: &Database, conversation_id: &str) -> Re
 }
 
 pub fn get_message(db: &Database, id: &str) -> Result<Message> {
-    let conn = db.conn.lock().unwrap();
-    conn.query_row(
-        "SELECT id, conversation_id, seq, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
-         FROM messages WHERE id = ?1",
-        params![id],
-        |row| {
-            Ok(Message {
-                id: row.get(0)?,
-                conversation_id: row.get(1)?,
-                seq: row.get(2)?,
-                parent_id: row.get(3)?,
-                role: row.get(4)?,
-                content: row.get(5)?,
-                provider: row.get(6)?,
-                model: row.get(7)?,
-                provider_session_id: row.get(8)?,
-                created_at: row.get(9)?,
-                token_estimate: row.get(10)?,
-                metadata_json: row.get(11)?,
-            })
-        },
-    ).map_err(|e| AppError::Database(e.to_string()))
+    let mut msg = {
+        let conn = db.conn.lock().unwrap();
+        conn.query_row(
+            "SELECT id, conversation_id, seq, parent_id, role, content, provider, model, provider_session_id, created_at, token_estimate, metadata_json
+             FROM messages WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(Message {
+                    id: row.get(0)?,
+                    conversation_id: row.get(1)?,
+                    seq: row.get(2)?,
+                    parent_id: row.get(3)?,
+                    role: row.get(4)?,
+                    content: row.get(5)?,
+                    provider: row.get(6)?,
+                    model: row.get(7)?,
+                    provider_session_id: row.get(8)?,
+                    created_at: row.get(9)?,
+                    token_estimate: row.get(10)?,
+                    metadata_json: row.get(11)?,
+                    attachments: Vec::new(),
+                })
+            },
+        ).map_err(|e| AppError::Database(e.to_string()))?
+    };
+
+    if let Ok(atts) = crate::app::db::attachments::get_attachments_for_message(db, id) {
+        msg.attachments = atts;
+    }
+
+    Ok(msg)
 }
 
 pub fn get_recent_messages(db: &Database, conversation_id: &str, limit: usize) -> Result<Vec<Message>> {
@@ -182,6 +248,7 @@ pub fn get_recent_messages(db: &Database, conversation_id: &str, limit: usize) -
             created_at: row.get(9)?,
             token_estimate: row.get(10)?,
             metadata_json: row.get(11)?,
+            attachments: Vec::new(),
         })
     }).map_err(|e| AppError::Database(e.to_string()))?;
 

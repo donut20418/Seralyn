@@ -164,8 +164,19 @@ impl ProviderSession for ClaudeSession {
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
 
+        let final_prompt = if !message.attachments.is_empty() {
+            let att_header = message.attachments
+                .iter()
+                .map(|a| format!("[Attached File: {} ({}, {:.1} KB)]", a.path.to_string_lossy(), a.name, a.size_bytes as f64 / 1024.0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}\n\n{}", att_header, prompt_text)
+        } else {
+            prompt_text
+        };
+
         let args = build_claude_args(
-            &prompt_text,
+            &final_prompt,
             self.model.as_deref(),
             self.config.effort.as_deref(),
             sid_opt.as_deref(),

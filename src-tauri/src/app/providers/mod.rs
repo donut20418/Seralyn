@@ -88,6 +88,11 @@ pub trait ProviderSession: Send + Sync {
 
     /// Check if the session is still active.
     fn is_active(&self) -> bool;
+
+    /// Check whether this session supports image attachments.
+    async fn supports_images(&self) -> bool {
+        true
+    }
 }
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -179,20 +184,50 @@ pub struct ProviderMessage {
     pub attachments: Vec<AttachmentRef>,
 }
 
+pub use crate::app::attachments::AttachmentKind;
+
+/// Reference to an attachment sent to a provider session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentRef {
+    pub id: String,
+    pub name: String,
+    pub path: PathBuf,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub kind: AttachmentKind,
+}
+
+/// Lightweight descriptor of an attachment in conversation context.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttachmentDescriptor {
+    pub id: String,
+    pub name: String,
+    pub mime_type: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub kind: AttachmentKind,
+}
+
 /// A message in the conversation context sent to providers.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextMessage {
     pub role: String,
     pub content: String,
     pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<AttachmentDescriptor>,
 }
 
-/// Reference to an attachment (Phase 2 stub).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AttachmentRef {
-    pub id: String,
-    pub path: PathBuf,
-    pub mime_type: String,
+impl ContextMessage {
+    pub fn new(role: impl Into<String>, content: impl Into<String>, provider: Option<String>) -> Self {
+        Self {
+            role: role.into(),
+            content: content.into(),
+            provider,
+            attachments: Vec::new(),
+        }
+    }
 }
 
 /// Session metadata returned by a provider session.

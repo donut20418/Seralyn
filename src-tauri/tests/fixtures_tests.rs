@@ -1444,7 +1444,7 @@ fn test_adapter_profile_isolation_and_native_effort_contracts() {
     assert!(gemini_studio.to_string_lossy().contains("studio"));
 
     // 2. Real production Codex builder contracts:
-    let turn_params = seralyn_lib::app::providers::codex::build_codex_turn_params("tid-123", "Hello", Some("o3-mini"), Some("high"));
+    let turn_params = seralyn_lib::app::providers::codex::build_codex_turn_params("tid-123", "Hello", &[], Some("o3-mini"), Some("high"));
     assert_eq!(turn_params.get("effort").and_then(|v| v.as_str()), Some("high"));
     assert!(turn_params.get("reasoningEffort").is_none(), "Codex turn/start must use 'effort', NOT 'reasoningEffort'");
 
@@ -1458,7 +1458,7 @@ fn test_adapter_profile_isolation_and_native_effort_contracts() {
     assert!(start_params.get("reasoningEffort").is_none(), "Codex thread/start must use 'effort', NOT 'reasoningEffort'");
 
     // 3. Real production Gemini prompt builder contract:
-    let prompt_params = seralyn_lib::app::providers::gemini::build_gemini_prompt_params("sid-123", "Hello");
+    let prompt_params = seralyn_lib::app::providers::gemini::build_gemini_prompt_params("sid-123", "Hello", &[]);
     assert!(prompt_params.get("prompt").is_some());
     assert!(prompt_params.get("model").is_none(), "Gemini ACP session/prompt must NOT contain 'model'");
 
@@ -3112,6 +3112,735 @@ async fn test_resume_session_failure_falls_back_to_fresh_session_with_restored_h
         (ctx as u64) < 25_000,
         "Fresh session context tokens ({ctx}) must not inherit dead-session occupancy"
     );
+}
+
+// =========================================================================
+// PHASE 2.6 ACCEPTANCE TESTS (AT-01 to AT-16)
+// =========================================================================
+
+#[derive(Clone)]
+struct AttachmentMockSession {
+    provider: ProviderKind,
+    supports_img: bool,
+    fail_send: bool,
+    sent_messages: Arc<tokio::sync::Mutex<Vec<seralyn_lib::app::providers::ProviderMessage>>>,
+}
+
+#[async_trait::async_trait]
+impl seralyn_lib::app::providers::ProviderSession for AttachmentMockSession {
+    async fn send(&self, msg: seralyn_lib::app::providers::ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+        if self.fail_send {
+            return Err(seralyn_lib::app::error::AppError::ProviderError("Mock send failure".to_string()));
+        }
+        self.sent_messages.lock().await.push(msg);
+        Ok(())
+    }
+    async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+    async fn respond_to_approval(&self, _approval_id: &str, _approved: bool) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+    async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+    async fn close(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
+    fn native_session_id(&self) -> Option<String> { Some("mock-native-id".to_string()) }
+    fn metadata(&self) -> seralyn_lib::app::providers::SessionMetadata {
+        seralyn_lib::app::providers::SessionMetadata {
+            provider: self.provider.clone(),
+            native_session_id: Some("mock-native-id".to_string()),
+            model: None,
+            created_at: String::new(),
+        }
+    }
+    fn is_active(&self) -> bool { true }
+    async fn supports_images(&self) -> bool { self.supports_img }
+}
+
+struct AttachmentMockProvider {
+    kind: ProviderKind,
+    session: AttachmentMockSession,
+    fail_resume: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl seralyn_lib::app::providers::Provider for AttachmentMockProvider {
+    fn kind(&self) -> ProviderKind { self.kind.clone() }
+    async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+        Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
+    }
+    async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+        Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+    }
+    fn capabilities(&self) -> seralyn_lib::app::providers::ProviderCapabilities {
+        seralyn_lib::app::providers::ProviderCapabilities {
+            image: self.session.supports_img,
+            ..Default::default()
+        }
+    }
+    async fn create_session(&self, _config: seralyn_lib::app::providers::SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn seralyn_lib::app::providers::ProviderSession>> {
+        Ok(Box::new(self.session.clone()))
+    }
+    async fn resume_session(&self, _native_session_id: &str, _config: seralyn_lib::app::providers::SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn seralyn_lib::app::providers::ProviderSession>> {
+        if self.fail_resume.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(seralyn_lib::app::error::AppError::ProviderError("Mock resume failed".to_string()));
+        }
+        Ok(Box::new(self.session.clone()))
+    }
+}
+
+fn create_attachment_test_manager(
+    kind: ProviderKind,
+    supports_img: bool,
+    fail_send: bool,
+) -> (
+    Arc<Database>,
+    seralyn_lib::app::conversation::ConversationManager,
+    Arc<tokio::sync::Mutex<Vec<seralyn_lib::app::providers::ProviderMessage>>>,
+    Arc<std::sync::atomic::AtomicBool>,
+) {
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let sent_messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let fail_resume = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let session = AttachmentMockSession {
+        provider: kind.clone(),
+        supports_img,
+        fail_send,
+        sent_messages: sent_messages.clone(),
+    };
+
+    let provider = Arc::new(AttachmentMockProvider {
+        kind: kind.clone(),
+        session,
+        fail_resume: fail_resume.clone(),
+    });
+
+    let mut map = std::collections::HashMap::new();
+    map.insert(kind, provider as Arc<dyn seralyn_lib::app::providers::Provider>);
+    let provider_manager = Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(map));
+    let manager = seralyn_lib::app::conversation::ConversationManager::new(db.clone(), provider_manager);
+
+    (db, manager, sent_messages, fail_resume)
+}
+
+#[tokio::test]
+async fn test_phase26_at01_multi_file_staging_and_message_association() {
+    let (db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-01 Multi File")).unwrap();
+
+    // 1. Stage 3 files: Image, Text, Binary
+    let png_bytes = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00];
+    let att_img = manager.save_attachment(&conv.id, "diagram.png", png_bytes, Some("image/png")).unwrap();
+    assert_eq!(att_img.kind, seralyn_lib::app::attachments::AttachmentKind::Image);
+    assert_eq!(att_img.mime_type, "image/png");
+    assert_eq!(att_img.state, "staged");
+    assert!(att_img.message_id.is_none());
+
+    let att_txt = manager.save_attachment(&conv.id, "notes.txt", b"meeting notes content", Some("text/plain")).unwrap();
+    assert_eq!(att_txt.kind, seralyn_lib::app::attachments::AttachmentKind::Text);
+    assert_eq!(att_txt.mime_type, "text/plain");
+
+    let att_bin = manager.save_attachment(&conv.id, "archive.bin", &[0x00, 0x01, 0x02, 0x03], None).unwrap();
+    assert_eq!(att_bin.kind, seralyn_lib::app::attachments::AttachmentKind::Binary);
+
+    // Verify all 3 staged in SQLite and disk
+    let staged = seralyn_lib::app::db::attachments::get_staged_attachments(&db, &conv.id).unwrap();
+    assert_eq!(staged.len(), 3);
+    for s in &staged {
+        assert_eq!(s.state, "staged");
+        assert!(s.message_id.is_none());
+        assert!(std::path::Path::new(&s.path).exists());
+    }
+
+    // 2. Send message with all 3 attachment IDs
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Here are my 3 project files",
+        ProviderKind::Claude,
+        vec![att_img.id.clone(), att_txt.id.clone(), att_bin.id.clone()],
+        None,
+        None,
+        None,
+        tx,
+    ).await.unwrap();
+
+    // Verify user message in SQLite is pure text (INV-A7: no fake text header)
+    let msgs = messages::get_messages(&db, &conv.id).unwrap();
+    assert_eq!(msgs.len(), 1);
+    let user_msg = &msgs[0];
+    assert_eq!(user_msg.role, "user");
+    assert_eq!(user_msg.content, "Here are my 3 project files");
+    assert_eq!(user_msg.attachments.len(), 3);
+
+    // Verify all 3 attachments transitioned to state = 'attached' with message_id = user_msg.id
+    let attached = seralyn_lib::app::db::attachments::get_attachments_for_message(&db, &user_msg.id).unwrap();
+    assert_eq!(attached.len(), 3);
+    for a in &attached {
+        assert_eq!(a.state, "attached");
+        assert_eq!(a.message_id.as_deref(), Some(user_msg.id.as_str()));
+    }
+}
+
+#[tokio::test]
+async fn test_phase26_at02_forged_local_path_injection_rejection() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-02 Forged Path")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    // Passing arbitrary filesystem path as attachment ID must be rejected (INV-A3)
+    let res = manager.send_message_with_attachments(
+        &conv.id,
+        "Trying forged path",
+        ProviderKind::Claude,
+        vec!["C:\\Windows\\System32\\calc.exe".to_string()],
+        None,
+        None,
+        None,
+        tx,
+    ).await;
+
+    assert!(res.is_err(), "Forged filesystem path ID must be rejected");
+}
+
+#[tokio::test]
+async fn test_phase26_at03_cross_conversation_isolation() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv_a = manager.create_conversation(Some("AT-03 Conv A")).unwrap();
+    let conv_b = manager.create_conversation(Some("AT-03 Conv B")).unwrap();
+
+    let att_a = manager.save_attachment(&conv_a.id, "secret_a.txt", b"Confidential A", None).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    // Attempting to send conv_a's attachment in conv_b must be rejected (INV-A2)
+    let res = manager.send_message_with_attachments(
+        &conv_b.id,
+        "Sneak secret A into B",
+        ProviderKind::Claude,
+        vec![att_a.id.clone()],
+        None,
+        None,
+        None,
+        tx,
+    ).await;
+
+    assert!(res.is_err(), "Cross-conversation attachment injection must be rejected");
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("does not belong to conversation"));
+}
+
+#[tokio::test]
+async fn test_phase26_at04_path_traversal_defense() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-04 Path Traversal")).unwrap();
+
+    // 1. Directory traversal in conversation ID -> rejected
+    let res1 = manager.save_attachment("../../evil_dir", "file.txt", b"bad", None);
+    assert!(res1.is_err(), "Must reject traversal in conversation_id");
+
+    // 2. Traversal in filename -> leaf sanitized, safe containment
+    let att = manager.save_attachment(&conv.id, "../../../etc/passwd", b"root:x:0:0", None).unwrap();
+    assert_eq!(att.name, "passwd");
+    let p = std::path::PathBuf::from(&att.path);
+    assert!(p.exists());
+    let parent = p.parent().unwrap();
+    assert!(parent.to_string_lossy().contains(&conv.id));
+}
+
+#[tokio::test]
+async fn test_phase26_at05_single_file_size_limit() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-05 Size Limit")).unwrap();
+
+    // 26MB exceeds 25MB single file limit (INV-A5)
+    let large_data = vec![0u8; 26 * 1024 * 1024];
+    let res = manager.save_attachment(&conv.id, "huge.bin", &large_data, None);
+    assert!(res.is_err(), "Must reject files > 25MB");
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("exceeds maximum limit of 25MB"));
+}
+
+#[tokio::test]
+async fn test_phase26_at06_aggregate_size_and_count_limits() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-06 Limits")).unwrap();
+
+    // 1. Turn count limit: > 10 attachments per turn rejected
+    let dummy_ids: Vec<String> = (0..11).map(|i| format!("00000000-0000-0000-0000-0000000000{:02}", i)).collect();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    let res1 = manager.send_message_with_attachments(
+        &conv.id,
+        "11 files",
+        ProviderKind::Claude,
+        dummy_ids,
+        None,
+        None,
+        None,
+        tx.clone(),
+    ).await;
+    assert!(res1.is_err(), "Must reject > 10 attachments");
+    assert!(res1.unwrap_err().to_string().contains("maximum allowed is 10"));
+
+    // 2. Aggregate size limit: 3 files of 18MB each = 54MB > 50MB rejected
+    let f1 = manager.save_attachment(&conv.id, "f1.dat", &vec![0u8; 18 * 1024 * 1024], None).unwrap();
+    let f2 = manager.save_attachment(&conv.id, "f2.dat", &vec![0u8; 18 * 1024 * 1024], None).unwrap();
+    let f3 = manager.save_attachment(&conv.id, "f3.dat", &vec![0u8; 18 * 1024 * 1024], None).unwrap();
+
+    let res2 = manager.send_message_with_attachments(
+        &conv.id,
+        "54MB aggregate",
+        ProviderKind::Claude,
+        vec![f1.id, f2.id, f3.id],
+        None,
+        None,
+        None,
+        tx,
+    ).await;
+    assert!(res2.is_err(), "Must reject aggregate size > 50MB");
+    assert!(res2.unwrap_err().to_string().contains("exceeds limit of 50MB"));
+}
+
+#[tokio::test]
+async fn test_phase26_at07_codex_structured_local_image_delivery() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Codex, true, false);
+    let conv = manager.create_conversation(Some("AT-07 Codex Images")).unwrap();
+
+    let png_bytes = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let img = manager.save_attachment(&conv.id, "chart.png", png_bytes, Some("image/png")).unwrap();
+    let txt = manager.save_attachment(&conv.id, "notes.txt", b"Sample text", Some("text/plain")).unwrap();
+
+    let img_ref = seralyn_lib::app::providers::AttachmentRef {
+        id: img.id,
+        name: img.name,
+        path: std::path::PathBuf::from(&img.path),
+        mime_type: img.mime_type,
+        size_bytes: img.size_bytes,
+        sha256: img.sha256,
+        kind: img.kind,
+    };
+    let txt_ref = seralyn_lib::app::providers::AttachmentRef {
+        id: txt.id,
+        name: txt.name,
+        path: std::path::PathBuf::from(&txt.path),
+        mime_type: txt.mime_type,
+        size_bytes: txt.size_bytes,
+        sha256: txt.sha256,
+        kind: txt.kind,
+    };
+
+    let params = seralyn_lib::app::providers::codex::build_codex_turn_params(
+        "thread-123",
+        "Describe the chart",
+        &[img_ref.clone(), txt_ref],
+        Some("o3-mini"),
+        Some("high"),
+    );
+
+    let input_arr = params.get("input").and_then(|v| v.as_array()).expect("input must be an array");
+    // Structured delivery: first item is localImage, second is text
+    assert_eq!(input_arr.len(), 2);
+    assert_eq!(input_arr[0].get("type").and_then(|v| v.as_str()), Some("localImage"));
+    assert_eq!(input_arr[0].get("path").and_then(|v| v.as_str()), Some(img_ref.path.to_str().unwrap()));
+    assert_eq!(input_arr[1].get("type").and_then(|v| v.as_str()), Some("text"));
+    assert_eq!(input_arr[1].get("text").and_then(|v| v.as_str()), Some("Describe the chart"));
+}
+
+#[tokio::test]
+async fn test_phase26_at08_gemini_preflight_and_content_block() {
+    // 1. Pre-flight rejection when session capability has supports_images = false
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Gemini, false, false);
+    let conv = manager.create_conversation(Some("AT-08 Gemini")).unwrap();
+
+    let png_bytes = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+    let img = manager.save_attachment(&conv.id, "photo.png", png_bytes, Some("image/png")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    let res = manager.send_message_with_attachments(
+        &conv.id,
+        "What is in this picture?",
+        ProviderKind::Gemini,
+        vec![img.id.clone()],
+        None,
+        None,
+        None,
+        tx,
+    ).await;
+
+    assert!(res.is_err(), "Must reject image when provider does not support images");
+    assert!(res.unwrap_err().to_string().contains("Image attachments are not supported"));
+
+    // 2. Structured ContentBlock delivery when building Gemini prompt params
+    let img_ref = seralyn_lib::app::providers::AttachmentRef {
+        id: img.id,
+        name: img.name,
+        path: std::path::PathBuf::from(&img.path),
+        mime_type: img.mime_type,
+        size_bytes: img.size_bytes,
+        sha256: img.sha256,
+        kind: img.kind,
+    };
+
+    let params = seralyn_lib::app::providers::gemini::build_gemini_prompt_params(
+        "session-123",
+        "Describe photo",
+        &[img_ref],
+    );
+
+    let prompt_arr = params.get("prompt").and_then(|v| v.as_array()).expect("prompt must be an array");
+    assert_eq!(prompt_arr.len(), 2);
+    // Item 1 is image ContentBlock
+    assert_eq!(prompt_arr[0].get("type").and_then(|v| v.as_str()), Some("image"));
+    assert_eq!(prompt_arr[0].get("mimeType").and_then(|v| v.as_str()), Some("image/png"));
+    assert!(prompt_arr[0].get("data").is_some(), "Must contain base64 image data");
+    // Item 2 is text ContentBlock
+    assert_eq!(prompt_arr[1].get("type").and_then(|v| v.as_str()), Some("text"));
+    assert_eq!(prompt_arr[1].get("text").and_then(|v| v.as_str()), Some("Describe photo"));
+}
+
+#[tokio::test]
+async fn test_phase26_at09_claude_adapter_boundary_isolation() {
+    let (db, manager, sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-09 Claude Isolation")).unwrap();
+
+    let att = manager.save_attachment(&conv.id, "data.csv", b"a,b,c\n1,2,3", Some("text/csv")).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Analyze CSV dataset",
+        ProviderKind::Claude,
+        vec![att.id],
+        None,
+        None,
+        None,
+        tx,
+    ).await.unwrap();
+
+    // 1. In SQLite: content is pure text, no path header
+    let msgs = messages::get_messages(&db, &conv.id).unwrap();
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, "Analyze CSV dataset");
+
+    // 2. In ProviderMessage passed to session: content is pure text, attachments array contains AttachmentRef
+    let sent_guard = sent.lock().await;
+    assert_eq!(sent_guard.len(), 1);
+    assert_eq!(sent_guard[0].content, "Analyze CSV dataset");
+    assert_eq!(sent_guard[0].attachments.len(), 1);
+    assert_eq!(sent_guard[0].attachments[0].name, "data.csv");
+}
+
+#[tokio::test]
+async fn test_phase26_at10_provider_switch_context_preserves_attachments() {
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let sent_codex = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let sent_claude = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    let codex_session = AttachmentMockSession {
+        provider: ProviderKind::Codex,
+        supports_img: true,
+        fail_send: false,
+        sent_messages: sent_codex.clone(),
+    };
+    let claude_session = AttachmentMockSession {
+        provider: ProviderKind::Claude,
+        supports_img: true,
+        fail_send: false,
+        sent_messages: sent_claude.clone(),
+    };
+
+    let mut map = std::collections::HashMap::new();
+    map.insert(
+        ProviderKind::Codex,
+        Arc::new(AttachmentMockProvider {
+            kind: ProviderKind::Codex,
+            session: codex_session,
+            fail_resume: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }) as Arc<dyn seralyn_lib::app::providers::Provider>,
+    );
+    map.insert(
+        ProviderKind::Claude,
+        Arc::new(AttachmentMockProvider {
+            kind: ProviderKind::Claude,
+            session: claude_session,
+            fail_resume: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }) as Arc<dyn seralyn_lib::app::providers::Provider>,
+    );
+
+    let provider_manager = Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(map));
+    let manager = seralyn_lib::app::conversation::ConversationManager::new(db.clone(), provider_manager);
+    let conv = manager.create_conversation(Some("AT-10 Switch Provider")).unwrap();
+
+    // Turn 1: Codex with attachment
+    let att = manager.save_attachment(&conv.id, "diagram.png", &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], Some("image/png")).unwrap();
+    let (tx1, _rx1) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Analyze diagram on Codex",
+        ProviderKind::Codex,
+        vec![att.id.clone()],
+        None,
+        None,
+        None,
+        tx1,
+    ).await.unwrap();
+
+    // Assistant response to Turn 1
+    let asst = messages::create_message_with_metadata(
+        &db,
+        &conv.id,
+        None,
+        "assistant",
+        "Diagram analyzed",
+        Some("codex"),
+        None,
+        None,
+        None,
+        None,
+    ).unwrap();
+
+    // Update synced seq for codex
+    let sessions = seralyn_lib::app::db::provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    if let Some(s) = sessions.first() {
+        let _ = seralyn_lib::app::db::provider_sessions::update_synced_seq(&db, &s.id, asst.seq);
+    }
+
+    // Turn 2: Switch to Claude
+    let (tx2, _rx2) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Now review this on Claude",
+        ProviderKind::Claude,
+        vec![],
+        None,
+        None,
+        None,
+        tx2,
+    ).await.unwrap();
+
+    let claude_msgs = sent_claude.lock().await;
+    assert_eq!(claude_msgs.len(), 1);
+    let turn2_msg = &claude_msgs[0];
+    // Claude session must receive full canonical history including Turn 1 with its attachment descriptor!
+    assert!(turn2_msg.context.len() >= 2);
+    let turn1_in_context = &turn2_msg.context[0];
+    assert_eq!(turn1_in_context.role, "user");
+    assert_eq!(turn1_in_context.attachments.len(), 1);
+    assert_eq!(turn1_in_context.attachments[0].name, "diagram.png");
+    assert_eq!(turn1_in_context.attachments[0].kind, seralyn_lib::app::attachments::AttachmentKind::Image);
+}
+
+#[tokio::test]
+async fn test_phase26_at11_resume_failure_fallback_context_delivery() {
+    let (db, manager, sent, fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-11 Resume Fallback")).unwrap();
+
+    let att = manager.save_attachment(&conv.id, "report.pdf", b"%PDF-1.4 report", Some("application/pdf")).unwrap();
+    let (tx1, _rx1) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Here is report",
+        ProviderKind::Claude,
+        vec![att.id.clone()],
+        None,
+        None,
+        None,
+        tx1,
+    ).await.unwrap();
+
+    // Assistant response
+    let asst = messages::create_message_with_metadata(
+        &db,
+        &conv.id,
+        None,
+        "assistant",
+        "Report received",
+        Some("claude"),
+        None,
+        None,
+        None,
+        None,
+    ).unwrap();
+    let sessions = seralyn_lib::app::db::provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    if let Some(s) = sessions.first() {
+        let _ = seralyn_lib::app::db::provider_sessions::update_synced_seq(&db, &s.id, asst.seq);
+    }
+
+    // Simulate native resume failure
+    fail_resume.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // Turn 2: send new prompt
+    let (tx2, _rx2) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Followup after crash",
+        ProviderKind::Claude,
+        vec![],
+        None,
+        None,
+        None,
+        tx2,
+    ).await.unwrap();
+
+    let msgs = sent.lock().await;
+    assert_eq!(msgs.len(), 2);
+    let fresh_msg = &msgs[1];
+    // Fallback creates fresh session and delivers full canonical history including Turn 1 attachment descriptor
+    assert!(fresh_msg.context.len() >= 2);
+    let turn1 = &fresh_msg.context[0];
+    assert_eq!(turn1.attachments.len(), 1);
+    assert_eq!(turn1.attachments[0].name, "report.pdf");
+}
+
+#[tokio::test]
+async fn test_phase26_at12_staged_attachment_removal() {
+    let (db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-12 Removal")).unwrap();
+
+    let att = manager.save_attachment(&conv.id, "draft.txt", b"Draft text", None).unwrap();
+    assert!(seralyn_lib::app::db::attachments::get_attachment(&db, &att.id).unwrap().is_some());
+    assert!(std::path::Path::new(&att.path).exists());
+
+    // User removes attachment from composer before sending
+    manager.delete_attachment(&conv.id, &att.id).unwrap();
+
+    // DB record deleted
+    assert!(seralyn_lib::app::db::attachments::get_attachment(&db, &att.id).unwrap().is_none());
+    // Disk file removed
+    assert!(!std::path::Path::new(&att.path).exists());
+}
+
+#[test]
+fn test_phase26_at13_compaction_format_attachments_no_rollover_loop() {
+    let msg = seralyn_lib::app::providers::ContextMessage {
+        role: "user".to_string(),
+        content: "Here are project files".to_string(),
+        provider: None,
+        attachments: vec![
+            seralyn_lib::app::providers::AttachmentDescriptor {
+                id: "att-1".to_string(),
+                name: "architecture.png".to_string(),
+                mime_type: "image/png".to_string(),
+                size_bytes: 1024 * 1024,
+                sha256: "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855".to_string(),
+                kind: seralyn_lib::app::attachments::AttachmentKind::Image,
+            },
+            seralyn_lib::app::providers::AttachmentDescriptor {
+                id: "att-2".to_string(),
+                name: "spec.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                size_bytes: 4096,
+                sha256: "ca978112ca1bbdcafac231b39a23dc4da786eff8147c4e72b9807785afee48bb".to_string(),
+                kind: seralyn_lib::app::attachments::AttachmentKind::Text,
+            },
+        ],
+    };
+
+    let summary = seralyn_lib::app::conversation::context::compact_older_messages(&[msg]);
+    // Verifies compact descriptor format (INV-A9)
+    assert!(summary.contains("[Attachment: architecture.png | image/png | sha256:e3b0c442]"));
+    assert!(summary.contains("[Attachment: spec.txt | text/plain | sha256:ca978112]"));
+    // Verifies no base64 or raw content pollution
+    assert!(!summary.contains("base64"));
+    // Token estimation is small, preventing rollover explosion
+    let tokens = seralyn_lib::app::tokens::TokenManager::estimate_tokens(&summary);
+    assert!(tokens < 50, "Attachment descriptors in compaction must occupy minimal tokens ({tokens})");
+}
+
+#[tokio::test]
+async fn test_phase26_at14_execution_failure_preserves_message_and_attachments() {
+    let (db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, true);
+    let conv = manager.create_conversation(Some("AT-14 Failure Preserves")).unwrap();
+
+    let att = manager.save_attachment(&conv.id, "important.doc", b"Important document", None).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    let res = manager.send_message_with_attachments(
+        &conv.id,
+        "Failed prompt",
+        ProviderKind::Claude,
+        vec![att.id.clone()],
+        None,
+        None,
+        None,
+        tx,
+    ).await;
+
+    assert!(res.is_err(), "Provider execution was set to fail");
+
+    // Message and attachment link must remain intact in DB (INV-A8)
+    let msgs = messages::get_messages(&db, &conv.id).unwrap();
+    assert_eq!(msgs.len(), 1);
+    let user_msg = &msgs[0];
+    assert_eq!(user_msg.content, "Failed prompt");
+
+    let att_rec = seralyn_lib::app::db::attachments::get_attachment(&db, &att.id).unwrap().unwrap();
+    assert_eq!(att_rec.state, "attached");
+    assert_eq!(att_rec.message_id.as_deref(), Some(user_msg.id.as_str()));
+}
+
+#[tokio::test]
+async fn test_phase26_at15_delete_conversation_cascading_purge() {
+    let (db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-15 Delete Cascade")).unwrap();
+
+    let att1 = manager.save_attachment(&conv.id, "file1.txt", b"Content 1", None).unwrap();
+    let att2 = manager.save_attachment(&conv.id, "file2.txt", b"Content 2", None).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Save both",
+        ProviderKind::Claude,
+        vec![att1.id.clone(), att2.id.clone()],
+        None,
+        None,
+        None,
+        tx,
+    ).await.unwrap();
+
+    let conv_dir = seralyn_lib::app::attachments::get_conversation_attachment_dir(&conv.id).unwrap();
+    assert!(conv_dir.exists());
+
+    manager.delete_conversation(&conv.id).await.unwrap();
+
+    // Conversation and attachments purged from DB
+    assert!(conversations::get_conversation(&db, &conv.id).is_err());
+    let atts = seralyn_lib::app::db::attachments::get_attachments_for_conversation(&db, &conv.id).unwrap();
+    assert_eq!(atts.len(), 0);
+
+    // Attachment directory purged from disk
+    assert!(!conv_dir.exists());
+}
+
+#[tokio::test]
+async fn test_phase26_at16_full_regression_verification() {
+    let (db, manager, sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-16 Regression")).unwrap();
+
+    // Hard budget check with attachment:
+    let att = manager.save_attachment(&conv.id, "code.rs", b"fn main() {}", Some("text/plain")).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Check code",
+        ProviderKind::Claude,
+        vec![att.id],
+        Some("claude-3-7-sonnet".to_string()),
+        Some("work".to_string()),
+        Some("high".to_string()),
+        tx,
+    ).await.unwrap();
+
+    let msgs = sent.lock().await;
+    assert_eq!(msgs.len(), 1);
+    assert_eq!(msgs[0].content, "Check code");
+    assert_eq!(msgs[0].attachments.len(), 1);
+
+    // Verify session record created with metadata
+    let sessions = seralyn_lib::app::db::provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].provider, "claude");
+    assert_eq!(sessions[0].model.as_deref(), Some("claude-3-7-sonnet"));
 }
 
 
