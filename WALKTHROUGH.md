@@ -892,4 +892,52 @@ Following audit on commit `2c297fe`, the remaining items have been comprehensive
   - `Rust Backend (ubuntu-latest)`: **success** (34 unit + 36 fixture = 70/70 tests passed)
   - `Rust Backend (windows-latest)`: **success** (34 unit + 36 fixture = 70/70 tests passed)
 
+---
+
+# Phase 2.6: First-Class Attachment Pipeline & Provider-Aware Delivery
+
+Phase 2.6 introduces an end-to-end, security-hardened attachment pipeline with canonical SQLite persistence, cross-conversation isolation, strict size/count limits, and provider-aware delivery across Codex, Gemini, and Claude.
+
+## 1. Architectural Invariants Enforced
+- **Canonical Storage & Database Schema (`003_attachments.sql`, `app/db/attachments.rs`)**:
+  - `attachments` table with `id`, `conversation_id`, `message_id`, `name`, `stored_name`, `mime_type`, `size_bytes`, `sha256`, `kind`, `state` (`staged` | `attached`), and `created_at`.
+  - Canonical storage under `%APPDATA%/Seralyn/attachments/<conversation_id>/<attachment_id>.<ext>`.
+  - Full lifecycle support: `staged` (composer upload), atomic transition to `attached` (message dispatch), and pre-dispatch deletion with automatic file & DB cleanup.
+- **INV-A2 (Cross-Conversation Isolation)**: Rejects attaching file records originating from another conversation with `AppError::InvalidInput`.
+- **INV-A3 (No Client Paths Over IPC)**: Client submits bytes and original filename; backend assigns opaque server UUIDs. Arbitrary client filesystem paths are never accepted over IPC.
+- **INV-A4 & INV-A10 (Path Traversal & NTFS Junction Defense)**: Cross-platform leaf filename sanitization supporting `/` and `\`. Canonical directory boundary containment verified before disk operations.
+- **INV-A5 (Size & Count Limits)**: Max 25 MB single file, max 50 MB aggregate, max 10 attachments per message.
+- **INV-A6 & INV-A7 (Multimodal Ordering)**: Structured `localImage` in `turn/start.input` for Codex and base64 `ContentBlock::Image` in `prompt` for Gemini, strictly ordered preceding user prompt text. Capability preflight via `supports_images`.
+- **INV-A8 (Adapter Boundary Isolation)**: Claude adapter safely isolates unsupported image inputs with explicit errors while supporting documents.
+- **INV-A9 (Context Compaction without Base64 Inflation)**: History compaction summarizes older turns with compact descriptors (`[Attachment: <name> | <mime> | sha256:<hash>]`) without binary/base64 payload inflation.
+
+## 2. Automated Verification Tests (`fixtures_tests.rs`)
+1. `test_phase26_at01_staged_attachment_lifecycle`: Staged upload, SHA-256 computation, and transition to attached.
+2. `test_phase26_at02_cross_conversation_isolation`: Cross-conversation attachment isolation enforcement.
+3. `test_phase26_at03_opaque_uuid_ipc_boundary`: Opaque UUID enforcement and path rejection over IPC.
+4. `test_phase26_at04_path_traversal_and_ntfs_junction_defense`: Directory containment and traversal defense.
+5. `test_phase26_at05_payload_and_count_limits`: Enforcement of 25MB single, 50MB aggregate, and 10 attachment limits.
+6. `test_phase26_at06_mime_and_kind_classification`: MIME type and kind detection accuracy.
+7. `test_phase26_at07_codex_provider_local_image_delivery`: Codex structured localImage preceding prompt text.
+8. `test_phase26_at08_gemini_provider_image_content_block_delivery`: Gemini base64 image blocks preceding prompt text.
+9. `test_phase26_at09_claude_adapter_boundary_isolation`: Claude adapter capability validation and error handling.
+10. `test_phase26_at10_compacted_history_attachment_descriptor`: Compact descriptor retention during compaction without base64 inflation.
+11. `test_phase26_at11_resume_failure_fallback_context_delivery`: Resumption fallback with complete canonical context and attachment metadata.
+12. `test_phase26_at12_staged_attachment_removal`: Deletion of staged attachments with disk and DB cleanup.
+13. `test_phase26_at13_conversation_deletion_cascade`: Deletion cascade cleaning conversation attachments.
+14. `test_phase26_at14_binary_attachment_base64_delivery`: Base64 serialization for non-text payloads.
+15. `test_phase26_at15_multi_attachment_ordering`: Multi-attachment sequence preservation.
+16. `test_phase26_at16_gemini_capability_preflight_rejection`: Upfront rejection for incapable Gemini configurations.
+
+---
+
+## Phase 2.6 CI Verification Status
+- **Commit**: `5a6751818b50b00440e5abd5946bebd87b47c517` (`origin/main`)
+- **Workflow Run**: [35588379736](https://github.com/donut20418/Seralyn/actions/runs/35588379736) (**Success**)
+- **Job Results**:
+  - `Frontend TypeScript & Vite Build`: **success** (1,911 modules transformed cleanly)
+  - `Rust Backend (ubuntu-latest)`: **success** (34 unit + 52 fixture = 86/86 tests passed)
+  - `Rust Backend (windows-latest)`: **success** (34 unit + 52 fixture = 86/86 tests passed)
+
+
 
