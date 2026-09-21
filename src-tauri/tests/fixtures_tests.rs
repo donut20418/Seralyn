@@ -2514,8 +2514,8 @@ async fn test_send_message_rolls_over_saturated_session_with_compacted_handoff_w
     let (tx, _rx) = tokio::sync::mpsc::channel(100);
 
     // 1. Create canonical history in SQLite that exceeds fresh session budget (> 150K tokens)
-    // 4 messages with ~164K characters each = ~41,000 tokens * 4 = ~164,000 tokens
-    let big_segment = "Detailed conversation history record segment with canonical context data. ".repeat(2_000);
+    // 4 messages with ~185K characters each = ~46,250 tokens * 4 = ~185,000 tokens
+    let big_segment = "Detailed conversation history record segment with canonical context data. ".repeat(2_500);
     for i in 1..=4 {
         let role = if i % 2 == 1 { "user" } else { "assistant" };
         messages::create_message(&db, &conv.id, None, role, &big_segment, None, None, None, None).unwrap();
