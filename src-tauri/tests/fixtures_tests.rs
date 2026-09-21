@@ -2856,17 +2856,17 @@ async fn test_gemini_multi_turn_dynamic_estimated_snapshots_and_rollover_no_loop
         messages::create_message(&db, &conv.id, None, role, &big_segment, Some("gemini"), None, Some(&s1_rec.id), None).unwrap();
     }
 
-    // Set usage snapshot on Session 1 to 910,000 tokens so 910,000 + prompt > 916,000
+    // Set usage snapshot on Session 1 to 916,000 tokens so 916,000 + prompt (17) > 916,000 base_input_budget
     usage_snapshots::create_usage_snapshot(
         &db,
         &conv.id,
         Some(&s1_rec.id),
         Some(900_000),
-        Some(10_000),
+        Some(16_000),
         None,
         None,
         None,
-        Some(910_000),
+        Some(916_000),
         Some(1_000_000),
         "ESTIMATED",
     ).unwrap();
