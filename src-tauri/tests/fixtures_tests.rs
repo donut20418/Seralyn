@@ -3440,7 +3440,10 @@ async fn test_phase26_at07_codex_structured_local_image_delivery() {
     assert_eq!(input_arr[0].get("type").and_then(|v| v.as_str()), Some("localImage"));
     assert_eq!(input_arr[0].get("path").and_then(|v| v.as_str()), Some(img_ref.path.to_str().unwrap()));
     assert_eq!(input_arr[1].get("type").and_then(|v| v.as_str()), Some("text"));
-    assert_eq!(input_arr[1].get("text").and_then(|v| v.as_str()), Some("Describe the chart"));
+    let txt_val = input_arr[1].get("text").and_then(|v| v.as_str()).unwrap();
+    assert!(txt_val.contains("Describe the chart"));
+    assert!(txt_val.contains("notes.txt"));
+    assert!(txt_val.contains("[Attached File:"));
 }
 
 #[tokio::test]

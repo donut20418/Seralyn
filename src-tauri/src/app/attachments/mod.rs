@@ -111,7 +111,12 @@ pub fn classify_mime_and_kind(
         }
     }
 
-    // 3. Known text file extensions
+    // 3. Document check (PDF)
+    if ext == "pdf" || data.starts_with(b"%PDF-") || client_mime == Some("application/pdf") {
+        return ("application/pdf".to_string(), AttachmentKind::Binary);
+    }
+
+    // 4. Known text file extensions
     let text_extensions = [
         "txt", "md", "rs", "ts", "tsx", "js", "jsx", "json", "toml", "yaml", "yml",
         "html", "htm", "css", "c", "cpp", "h", "hpp", "py", "sh", "sql", "xml", "csv",
