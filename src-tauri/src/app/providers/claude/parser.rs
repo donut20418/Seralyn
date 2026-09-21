@@ -9,8 +9,19 @@ use crate::app::events::{EventPayload, EventType, NormalizedEvent, ProviderKind,
 pub struct ClaudeUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    #[serde(alias = "cache_read_input_tokens")]
     pub cache_read_tokens: Option<u64>,
+    #[serde(alias = "cache_creation_input_tokens")]
     pub cache_creation_tokens: Option<u64>,
+}
+
+impl ClaudeUsage {
+    pub fn estimated_total_context(&self) -> u64 {
+        let cache_read = self.cache_read_tokens.unwrap_or(0);
+        let cache_creation = self.cache_creation_tokens.unwrap_or(0);
+        let total_input = self.input_tokens.saturating_add(cache_read).saturating_add(cache_creation);
+        total_input.saturating_add(self.output_tokens)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -251,9 +262,9 @@ pub fn claude_event_to_normalized(
                     output_tokens: Some(u.output_tokens),
                     cache_read_tokens: u.cache_read_tokens,
                     reasoning_tokens: None,
-                    context_tokens: u.cache_creation_tokens, // Approximate
+                    context_tokens: Some(u.estimated_total_context()),
                     context_window: None,
-                    confidence: TokenConfidence::Exact,
+                    confidence: TokenConfidence::Estimated,
                 };
             } else {
                 normalized.event_type = EventType::SessionFinished;
@@ -338,6 +349,36 @@ mod tests {
                 assert_eq!(thinking, None);
             }
             _ => panic!("Expected ContentBlockDelta"),
+        }
+    }
+
+    #[test]
+    fn test_parse_claude_result_usage() {
+        let line = r#"{"type":"result","session_id":"sess_abc123","result":{"type":"success"},"usage":{"input_tokens":42,"output_tokens":28,"cache_read_input_tokens":10,"cache_creation_input_tokens":5},"model":"claude-sonnet-4-20250514"}"#;
+        let event = parse_claude_line(line).unwrap().unwrap();
+        match &event {
+            ClaudeEvent::Result { session_id, usage, .. } => {
+                assert_eq!(session_id.as_deref(), Some("sess_abc123"));
+                let u = usage.as_ref().unwrap();
+                assert_eq!(u.input_tokens, 42);
+                assert_eq!(u.output_tokens, 28);
+                assert_eq!(u.cache_read_tokens, Some(10));
+                assert_eq!(u.cache_creation_tokens, Some(5));
+                assert_eq!(u.estimated_total_context(), 42 + 10 + 5 + 28); // 85
+            }
+            _ => panic!("Expected Result event"),
+        }
+
+        let norm = claude_event_to_normalized(event, ProviderKind::Claude, "conv-1", None).unwrap();
+        assert_eq!(norm.event_type, EventType::UsageUpdated);
+        if let EventPayload::Usage { input_tokens, output_tokens, cache_read_tokens, context_tokens, confidence, .. } = norm.payload {
+            assert_eq!(input_tokens, Some(42));
+            assert_eq!(output_tokens, Some(28));
+            assert_eq!(cache_read_tokens, Some(10));
+            assert_eq!(context_tokens, Some(85));
+            assert_eq!(confidence, TokenConfidence::Estimated);
+        } else {
+            panic!("Expected Usage payload");
         }
     }
 }

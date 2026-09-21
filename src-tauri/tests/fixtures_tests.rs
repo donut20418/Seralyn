@@ -2290,24 +2290,18 @@ async fn test_send_message_updates_exact_session_last_used() {
     );
 }
 
-#[tokio::test]
-async fn test_send_message_rolls_over_saturated_native_session_with_compacted_handoff() {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use seralyn_lib::app::conversation::ConversationManager;
-    use seralyn_lib::app::providers::{Provider, ProviderSession, SessionConfig, ProviderMessage, ProviderCapabilities, SessionMetadata};
-    use seralyn_lib::app::db::{provider_sessions, usage_snapshots};
-
     #[derive(Clone)]
     struct TrackedSession {
         id: String,
-        sent_messages: Arc<tokio::sync::Mutex<Vec<ProviderMessage>>>,
-        closed: Arc<AtomicBool>,
+        provider: ProviderKind,
+        model: String,
+        sent_messages: Arc<tokio::sync::Mutex<Vec<seralyn_lib::app::providers::ProviderMessage>>>,
+        closed: Arc<std::sync::atomic::AtomicBool>,
     }
 
     #[async_trait::async_trait]
-    impl ProviderSession for TrackedSession {
-        async fn send(&self, msg: ProviderMessage) -> seralyn_lib::app::error::Result<()> {
+    impl seralyn_lib::app::providers::ProviderSession for TrackedSession {
+        async fn send(&self, msg: seralyn_lib::app::providers::ProviderMessage) -> seralyn_lib::app::error::Result<()> {
             self.sent_messages.lock().await.push(msg);
             Ok(())
         }
@@ -2315,50 +2309,61 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
         async fn respond_to_approval(&self, _approval_id: &str, _approved: bool) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         async fn cancel(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
         async fn close(&self) -> seralyn_lib::app::error::Result<()> {
-            self.closed.store(true, Ordering::SeqCst);
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
         fn native_session_id(&self) -> Option<String> { Some(self.id.clone()) }
-        fn metadata(&self) -> SessionMetadata {
-            SessionMetadata {
-                provider: ProviderKind::Claude,
+        fn metadata(&self) -> seralyn_lib::app::providers::SessionMetadata {
+            seralyn_lib::app::providers::SessionMetadata {
+                provider: self.provider.clone(),
                 native_session_id: Some(self.id.clone()),
-                model: Some("haiku".to_string()),
+                model: Some(self.model.clone()),
                 created_at: String::new(),
             }
         }
-        fn is_active(&self) -> bool { !self.closed.load(Ordering::SeqCst) }
+        fn is_active(&self) -> bool { !self.closed.load(std::sync::atomic::Ordering::SeqCst) }
     }
 
     struct DynamicMultiSessionProvider {
+        kind: ProviderKind,
         session_counter: Arc<std::sync::atomic::AtomicUsize>,
         created_sessions: Arc<tokio::sync::Mutex<Vec<TrackedSession>>>,
     }
 
     #[async_trait::async_trait]
-    impl Provider for DynamicMultiSessionProvider {
-        fn kind(&self) -> ProviderKind { ProviderKind::Claude }
+    impl seralyn_lib::app::providers::Provider for DynamicMultiSessionProvider {
+        fn kind(&self) -> ProviderKind { self.kind.clone() }
         async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
             Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
         }
         async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
             Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
         }
-        fn capabilities(&self) -> ProviderCapabilities { Default::default() }
-        async fn create_session(&self, _config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
-            let n = self.session_counter.fetch_add(1, Ordering::SeqCst);
+        fn capabilities(&self) -> seralyn_lib::app::providers::ProviderCapabilities { Default::default() }
+        async fn create_session(&self, config: seralyn_lib::app::providers::SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn seralyn_lib::app::providers::ProviderSession>> {
+            let n = self.session_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let sess = TrackedSession {
                 id: format!("native-sess-{}", n),
+                provider: self.kind.clone(),
+                model: config.model.unwrap_or_else(|| "default".to_string()),
                 sent_messages: Arc::new(tokio::sync::Mutex::new(Vec::new())),
-                closed: Arc::new(AtomicBool::new(false)),
+                closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             };
             self.created_sessions.lock().await.push(sess.clone());
             Ok(Box::new(sess))
         }
-        async fn resume_session(&self, _native_session_id: &str, config: SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn ProviderSession>> {
+        async fn resume_session(&self, _native_session_id: &str, config: seralyn_lib::app::providers::SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn seralyn_lib::app::providers::ProviderSession>> {
             self.create_session(config).await
         }
     }
+
+#[tokio::test]
+async fn test_send_message_rolls_over_saturated_native_session_restores_history() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::Provider;
+    use seralyn_lib::app::db::{provider_sessions, usage_snapshots};
 
     let db = Arc::new(Database::new_in_memory().unwrap());
     db.run_migrations().unwrap();
@@ -2366,6 +2371,7 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
     let session_counter = Arc::new(std::sync::atomic::AtomicUsize::new(1));
     let created_sessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let provider = DynamicMultiSessionProvider {
+        kind: ProviderKind::Claude,
         session_counter: session_counter.clone(),
         created_sessions: created_sessions.clone(),
     };
@@ -2384,7 +2390,7 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
         messages::create_message(&db, &conv.id, None, role, &format!("Turn {i}: canonical conversation history content data."), None, None, None, None).unwrap();
     }
 
-    // 2. Initial message through manager on Haiku (base_budget = 116,000 for 200K window)
+    // 2. Initial message through manager on Haiku (base_budget = 150,000 for 200K window)
     manager.send_message_with_attachments(
         &conv.id,
         "Initial prompt to Haiku",
@@ -2406,9 +2412,7 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
     let session_1_mock = created_guard[0].clone();
     drop(created_guard);
 
-    // 3. Simulate that session 1 has grown to 115,900 native context tokens in SQLite!
     // 3. Simulate that session 1 has grown to 149,900 native context tokens in SQLite!
-    // Base budget for Haiku is 150,000 (200,000 window - 50,000 reserve).
     usage_snapshots::create_usage_snapshot(
         &db,
         &conv.id,
@@ -2423,7 +2427,7 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
         "EXACT",
     ).unwrap();
 
-    // 4. Now send a new message with prompt > 100 tokens (e.g. repeated sentence)
+    // 4. Now send a new message with prompt > 100 tokens (158 tokens)
     // 149,900 native tokens + 158 prompt tokens = 150,058 > 150,000 base_input_budget!
     let next_prompt = "Please explain the architectural details and invariant guarantees of Seralyn multi-provider framework in complete depth. ".repeat(6);
     let prompt_tokens = seralyn_lib::app::tokens::TokenManager::estimate_tokens(&next_prompt);
@@ -2479,6 +2483,263 @@ async fn test_send_message_rolls_over_saturated_native_session_with_compacted_ha
         "Total tokens in fresh session ({} native + {} prompt + {} working = {}) MUST be <= base input budget 150,000",
         fresh_native_tokens, prompt_tokens, working_tokens, total_fresh_tokens
     );
+}
+
+#[tokio::test]
+async fn test_send_message_rolls_over_saturated_session_with_compacted_handoff_when_history_exceeds_budget() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::Provider;
+    use seralyn_lib::app::db::{provider_sessions, usage_snapshots};
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let session_counter = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let created_sessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = DynamicMultiSessionProvider {
+        kind: ProviderKind::Claude,
+        session_counter: session_counter.clone(),
+        created_sessions: created_sessions.clone(),
+    };
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Claude, Arc::new(provider) as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("Rollover Compaction Test")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    // 1. Create canonical history in SQLite that exceeds fresh session budget (> 150K tokens)
+    // 4 messages with ~164K characters each = ~41,000 tokens * 4 = ~164,000 tokens
+    let big_segment = "Detailed conversation history record segment with canonical context data. ".repeat(2_000);
+    for i in 1..=4 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(&db, &conv.id, None, role, &big_segment, None, None, None, None).unwrap();
+    }
+
+    // 2. Initial message through manager on Haiku
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Initial prompt to Haiku",
+        ProviderKind::Claude,
+        Vec::new(),
+        Some("haiku".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    let sessions_snap1 = provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    let session_1_rec = sessions_snap1.iter().find(|s| s.model.as_deref() == Some("haiku")).unwrap().clone();
+    assert_eq!(session_1_rec.status, "active");
+
+    let created_guard = created_sessions.lock().await;
+    assert_eq!(created_guard.len(), 1);
+    let session_1_mock = created_guard[0].clone();
+    drop(created_guard);
+
+    // 3. Mark session 1 as saturated in usage snapshots (149,900 tokens)
+    usage_snapshots::create_usage_snapshot(
+        &db,
+        &conv.id,
+        Some(&session_1_rec.id),
+        Some(140_000),
+        Some(9_900),
+        None,
+        None,
+        None,
+        Some(149_900),
+        Some(200_000),
+        "EXACT",
+    ).unwrap();
+
+    // 4. Send prompt of 158 tokens -> 149,900 + 158 = 150,058 > 150,000 base_budget
+    let next_prompt = "Please explain the architectural details and invariant guarantees of Seralyn multi-provider framework in complete depth. ".repeat(6);
+    let prompt_tokens = seralyn_lib::app::tokens::TokenManager::estimate_tokens(&next_prompt);
+
+    manager.send_message_with_attachments(
+        &conv.id,
+        &next_prompt,
+        ProviderKind::Claude,
+        Vec::new(),
+        Some("haiku".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    // 5. Verification:
+    // a) Session 1 closed in memory and SQLite
+    assert!(session_1_mock.closed.load(Ordering::SeqCst), "Session 1 must be closed");
+    let all_db_sessions = provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    let old_db_sess = all_db_sessions.iter().find(|s| s.id == session_1_rec.id).unwrap();
+    assert_eq!(old_db_sess.status, "closed");
+
+    // b) Fresh session 2 created
+    let created_guard = created_sessions.lock().await;
+    assert_eq!(created_guard.len(), 2);
+    let session_2_mock = created_guard[1].clone();
+    drop(created_guard);
+
+    // c) Fresh session receives compacted handoff because history exceeded 150K
+    let s2_msgs = session_2_mock.sent_messages.lock().await;
+    assert_eq!(s2_msgs.len(), 1);
+    let sent_msg = &s2_msgs[0];
+    assert!(
+        sent_msg.context.iter().any(|m| m.content.contains("[Context Hand-off:")),
+        "Compacted handoff MUST be generated when canonical history exceeds fresh session budget"
+    );
+
+    // d) Hard budget invariant holds on fresh session: total <= 150,000
+    let fresh_native_tokens = 0u64;
+    let working_tokens: u64 = sent_msg.context.iter().map(|m| seralyn_lib::app::tokens::TokenManager::estimate_tokens(&m.content)).sum();
+    let total_fresh_tokens = fresh_native_tokens + prompt_tokens + working_tokens;
+    assert!(
+        total_fresh_tokens <= 150_000,
+        "Total tokens in fresh session ({} native + {} prompt + {} working = {}) MUST be <= base input budget 150,000",
+        fresh_native_tokens, prompt_tokens, working_tokens, total_fresh_tokens
+    );
+}
+
+#[tokio::test]
+async fn test_send_message_rejects_oversized_prompt_without_creating_db_record() {
+    use std::sync::Arc;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::Provider;
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let session_counter = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let created_sessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = DynamicMultiSessionProvider {
+        kind: ProviderKind::Claude,
+        session_counter,
+        created_sessions,
+    };
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Claude, Arc::new(provider) as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("Oversized Prompt DB Consistency Test")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    // Haiku base_input_budget = 150,000. Create prompt with > 150,000 tokens (e.g. 600,004 chars = 150,001 tokens)
+    let huge_prompt = "A".repeat(600_004);
+    let res = manager.send_message_with_attachments(
+        &conv.id,
+        &huge_prompt,
+        ProviderKind::Claude,
+        Vec::new(),
+        Some("haiku".to_string()),
+        None,
+        None,
+        tx,
+    ).await;
+
+    assert!(res.is_err(), "Must return error when prompt exceeds budget");
+    let msgs = messages::get_messages(&db, &conv.id).unwrap();
+    assert!(msgs.is_empty(), "DB must not contain any message records for rejected oversized prompt");
+}
+
+#[test]
+fn test_claude_parser_real_fixture_usage_telemetry() {
+    let line = r#"{"type":"result","session_id":"sess_abc123","result":{"type":"success"},"usage":{"input_tokens":42,"output_tokens":28,"cache_read_input_tokens":10,"cache_creation_input_tokens":5},"model":"claude-sonnet-4-20250514"}"#;
+    let parsed = parse_claude_line(line).unwrap().unwrap();
+    let norm = claude_event_to_normalized(parsed, ProviderKind::Claude, "conv-1", None).unwrap();
+    assert_eq!(norm.event_type, EventType::UsageUpdated);
+    if let EventPayload::Usage { input_tokens, output_tokens, cache_read_tokens, context_tokens, confidence, .. } = norm.payload {
+        assert_eq!(input_tokens, Some(42));
+        assert_eq!(output_tokens, Some(28));
+        assert_eq!(cache_read_tokens, Some(10));
+        assert_eq!(context_tokens, Some(42 + 28 + 10 + 5)); // 85
+        assert_eq!(confidence, seralyn_lib::app::events::TokenConfidence::Estimated);
+    } else {
+        panic!("Expected UsageUpdated payload");
+    }
+}
+
+#[tokio::test]
+async fn test_gemini_conservative_history_estimation_triggers_saturation_rollover() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::Provider;
+    use seralyn_lib::app::db::provider_sessions;
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let session_counter = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let created_sessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = DynamicMultiSessionProvider {
+        kind: ProviderKind::Gemini,
+        session_counter: session_counter.clone(),
+        created_sessions: created_sessions.clone(),
+    };
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Gemini, Arc::new(provider) as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("Gemini Fallback Saturation Test")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    // Initial message through manager on Gemini (1M window -> base_budget = 916,000)
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Initial prompt to Gemini",
+        ProviderKind::Gemini,
+        Vec::new(),
+        Some("gemini-2.5-pro".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    let created_guard = created_sessions.lock().await;
+    assert_eq!(created_guard.len(), 1);
+    let session_1_mock = created_guard[0].clone();
+    drop(created_guard);
+
+    let sessions_snap1 = provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    let session_1_rec = sessions_snap1.iter().find(|s| s.provider == "gemini").unwrap().clone();
+
+    // Create 5 large messages totaling > 916,000 tokens in SQLite
+    // 5 * 184,000 tokens = 920,000 tokens
+    let block = "A".repeat(736_000); // 736,000 / 4 = 184,000 tokens
+    for i in 2..=6 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(&db, &conv.id, None, role, &block, Some("gemini"), None, Some(&session_1_rec.id), None).unwrap();
+    }
+    provider_sessions::update_synced_seq(&db, &session_1_rec.id, 6).unwrap();
+
+    // Send next prompt: conservative fallback estimates accumulated native tokens from SQLite canonical history (> 916,000)
+    // 920,000 + prompt > 916,000 base_input_budget!
+    let next_prompt = "Next prompt to Gemini";
+    manager.send_message_with_attachments(
+        &conv.id,
+        next_prompt,
+        ProviderKind::Gemini,
+        Vec::new(),
+        Some("gemini-2.5-pro".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    // Verification:
+    // Even without native telemetry, conservative SQLite history estimation detected saturation!
+    // Old session closed, fresh session 2 created!
+    assert!(session_1_mock.closed.load(Ordering::SeqCst), "Gemini session 1 must be closed by conservative saturation rollover");
+    let created_guard = created_sessions.lock().await;
+    assert_eq!(created_guard.len(), 2, "Fresh Gemini session 2 must be created");
 }
 
 

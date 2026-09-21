@@ -812,31 +812,47 @@ Following audit on commit `2c297fe`, the remaining items have been comprehensive
 - **Native Session Saturation Rollover (`send_message_with_attachments`)**:
   - When a native session is saturated such that `existing_native_tokens.saturating_add(prompt_tokens) > base_input_budget`, Seralyn does not fail or send an overflowing prompt to CLI backends.
   - Seralyn automatically and transparently retires the saturated session (`close_session(&db)` and in-memory `close()`), spawns a fresh session for the same provider/account/model, and invokes `build_adaptive_context(synced_through_seq = 0, existing_native_tokens = 0)`.
-  - The entire conversation history in SQLite is compacted into a structured handoff message (`[Context Hand-off: ...]`) fitting within `base_input_budget - prompt_tokens`.
-  - The fresh session receives the handoff summary and current prompt, strictly enforcing:
+  - The entire conversation history in SQLite is restored to the fresh session (compacted into a structured handoff message `[Context Hand-off: ...]` if history exceeds `base_input_budget - prompt_tokens`).
+  - The fresh session receives the history and current prompt, strictly enforcing:
     $$\text{fresh\_native\_tokens (0)} + \text{prompt\_tokens} + \text{working\_tokens} \le \text{base\_input\_budget}$$
 
-### 3. Backend Routing Ambiguity Elimination (`conversation/mod.rs`)
-- **Strict Disambiguation**: In `respond_to_approval` and `interrupt_turn`, if `model` is `None` and multiple active model sessions exist for the account, the backend returns `Err(AppError::InvalidInput("Ambiguous ... target: multiple active model sessions exist for this account; specify model"))`.
-- Eliminates any non-deterministic `.next()` selection or accidental broadcasting to multiple models.
+### 3. Real Claude Token Telemetry (`providers/claude/parser.rs`)
+- **JSON Field Alignment**: `ClaudeUsage` deserializes `cache_read_input_tokens` and `cache_creation_input_tokens` via serde aliases, matching exact Claude CLI/NDJSON output.
+- **True Native Context Metric**: Computes `estimated_total_context() = input_tokens + cache_read + cache_creation + output_tokens`, accurately reflecting the native conversation state held for the next turn.
+- **Estimated Confidence**: Normalized `TokenConfidence` is correctly set to `Estimated`.
 
-### 4. Multibyte & Thai Conservative Token Estimation (`tokens/mod.rs`)
+### 4. Conservative History Estimation for Telemetry-less Providers (`conversation/mod.rs`)
+- **Unknown vs Zero Disambiguation**: Differentiates `Some(tokens)` from `None`. When a provider lacks native usage telemetry (e.g. Gemini) or before the first usage snapshot, Seralyn conservatively estimates accumulated native context by summing estimated tokens of all canonical SQLite messages up to `synced_through_seq`.
+- **Gemini Saturation Rollover**: Gemini sessions now benefit from automated saturation detection and transparent rollover just like Claude and Codex.
+- **Turn Finish Snapshot**: Sessions without provider telemetry record an estimated usage snapshot in SQLite on turn completion.
+
+### 5. Pre-DB Prompt Budget Validation (`conversation/mod.rs`)
+- **Canonical DB Consistency**: `provider_prompt` is built and evaluated against `base_input_budget` *before* inserting `user_msg` into SQLite. Oversized prompts are rejected without polluting SQLite history or titles.
+
+### 6. Backend Routing Ambiguity Elimination (`conversation/mod.rs`)
+- **Strict Disambiguation**: In `respond_to_approval` and `interrupt_turn`, if `model` is `None` and multiple active model sessions exist for the account, the backend returns `Err(AppError::InvalidInput("Ambiguous ... target: multiple active model sessions exist for this account; specify model"))`.
+
+### 7. Multibyte & Thai Conservative Token Estimation (`tokens/mod.rs`)
 - **Ceil Division for ASCII**: Uses `(ascii_count + 3) / 4` so 1-3 character words and punctuation are never truncated to 0 tokens.
 - **1 Token / Char for Non-ASCII**: Conservative 1 token per character for Thai, CJK, and emojis.
 - **Non-Empty Min 1**: Guarantees any non-empty input evaluates to at least 1 token.
 
-### 5. Direct Session Tracking for `last_used_at` (`conversation/mod.rs`)
+### 8. Direct Session Tracking for `last_used_at` (`conversation/mod.rs`)
 - **Exact Record ID**: `ActiveSessionEntry` stores `pub db_session_id: String`.
 - After `session.send()`, `update_session_used` directly updates `active_db_session_id`, eliminating ambiguity from account-only queries when multiple models exist for the same account.
 
-### 6. Inspector Strict Model Matching & Stream Completion Scoping (`App.tsx`, `useConversation.ts`)
+### 9. Inspector Strict Model Matching & Stream Completion Scoping (`App.tsx`, `useConversation.ts`)
 - **Strict Inspector Lookup**: `findSession` matches exact `(account, model)` or `(account, legacy null)`, prioritizing `s.status === "active"` and returning `null` rather than falling back to an unrelated model under the same account.
 - **Completion Model State**: `useConversation.ts` tracks `streamingModel` during turn execution and passes it to `selectConversation` on `SessionFinished` and `Error`.
 
-### 7. Automated Verification Tests (`fixtures_tests.rs`)
+### 10. Automated Verification Tests (`fixtures_tests.rs`)
 1. `test_token_estimator_multibyte_and_ceil`: Asserts ceil division on ASCII and conservative estimation on Thai and CJK.
 2. `test_adaptive_context_strict_total_budget_invariant`: Asserts total model input budget invariant under normal, near-exhaustion, and zero-budget conditions.
-3. `test_conversation_manager_model_scoped_approval_and_interrupt`: Proves that approvals and interrupts target the exact model, and that omitting model when multiple models are active returns an ambiguity error.
-4. `test_send_message_updates_exact_session_last_used`: Proves that sending a message on one model updates only that specific session's `last_used_at` record in SQLite.
-5. `test_send_message_rolls_over_saturated_native_session_with_compacted_handoff`: Verifies that when `existing_native + prompt > base_input_budget`, `send_message_with_attachments` closes the old session in memory and SQLite, spawns a fresh session, and delivers a compacted handoff satisfying the hard budget invariant $\le \text{base\_input\_budget}$.
+3. `test_conversation_manager_model_scoped_approval_and_interrupt`: Proves model-scoped approval and interrupt routing and ambiguity error when `model=None` with multiple models active.
+4. `test_send_message_updates_exact_session_last_used`: Proves sending a message on one model updates only that specific session's `last_used_at` record in SQLite.
+5. `test_send_message_rolls_over_saturated_native_session_restores_history`: Verifies that when `existing_native + prompt > base_input_budget`, old session is closed, fresh session is spawned, and all canonical history turns are restored.
+6. `test_send_message_rolls_over_saturated_session_with_compacted_handoff_when_history_exceeds_budget`: Verifies rollover when canonical history exceeds fresh budget (>150K tokens), asserting `[Context Hand-off:]` compaction and total budget invariant $\le 150,000$.
+7. `test_send_message_rejects_oversized_prompt_without_creating_db_record`: Verifies that oversized prompts return `Err` without creating any message records in SQLite.
+8. `test_claude_parser_real_fixture_usage_telemetry`: Verifies parsing of Claude `cache_read_input_tokens`, `cache_creation_input_tokens`, `estimated_total_context()`, and `TokenConfidence::Estimated`.
+9. `test_gemini_conservative_history_estimation_triggers_saturation_rollover`: Verifies that Gemini sessions without telemetry conservatively estimate native context from SQLite history and trigger saturation rollover.
 

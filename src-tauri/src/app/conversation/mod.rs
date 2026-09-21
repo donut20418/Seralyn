@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::app::conversation::context::{
-    build_adaptive_context, build_context_delta, calculate_input_budget, resolve_model_context_window,
+    build_adaptive_context, calculate_input_budget, resolve_model_context_window,
 };
 use crate::app::tokens::TokenManager;
 pub use crate::app::db::conversations::{Conversation, ConversationSummary};
@@ -161,7 +161,30 @@ impl ConversationManager {
         effort: Option<String>,
         event_sender: mpsc::Sender<NormalizedEvent>,
     ) -> Result<()> {
-        // 1. Save user message to DB with attachments in metadata -> returns user_msg with assigned sequence number
+        // 1. Build provider_prompt with attachment header and validate prompt budget BEFORE writing to DB
+        let provider_prompt = if !attachments.is_empty() {
+            let attachment_header = attachments
+                .iter()
+                .map(|a| format!("[Attached File: {} ({}, {:.1} KB)]", a.path, a.name, a.size as f64 / 1024.0))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}\n\n{}", attachment_header, content)
+        } else {
+            content.to_string()
+        };
+
+        let context_window = resolve_model_context_window(provider_kind.clone(), model.as_deref());
+        let base_input_budget = calculate_input_budget(context_window);
+        let prompt_tokens = TokenManager::estimate_tokens(&provider_prompt);
+
+        if prompt_tokens > base_input_budget {
+            return Err(crate::app::error::AppError::InvalidInput(format!(
+                "Prompt size ({} tokens) exceeds model's maximum input budget ({} tokens)",
+                prompt_tokens, base_input_budget
+            )));
+        }
+
+        // 2. Save user message to DB with attachments in metadata -> returns user_msg with assigned sequence number
         let user_metadata = if !attachments.is_empty() {
             Some(serde_json::to_string(&serde_json::json!({ "attachments": attachments }))?)
         } else {
@@ -193,29 +216,6 @@ impl ConversationManager {
             }
         }
 
-        // 2. Create provider_prompt with attachment header and user message content
-        let provider_prompt = if !attachments.is_empty() {
-            let attachment_header = attachments
-                .iter()
-                .map(|a| format!("[Attached File: {} ({}, {:.1} KB)]", a.path, a.name, a.size as f64 / 1024.0))
-                .collect::<Vec<_>>()
-                .join("\n");
-            format!("{}\n\n{}", attachment_header, content)
-        } else {
-            content.to_string()
-        };
-
-        let context_window = resolve_model_context_window(provider_kind.clone(), model.as_deref());
-        let base_input_budget = calculate_input_budget(context_window);
-        let prompt_tokens = TokenManager::estimate_tokens(&provider_prompt);
-
-        if prompt_tokens > base_input_budget {
-            return Err(crate::app::error::AppError::InvalidInput(format!(
-                "Prompt size ({} tokens) exceeds model's maximum input budget ({} tokens)",
-                prompt_tokens, base_input_budget
-            )));
-        }
-
         let provider = self.provider_manager.get(provider_kind.clone())?;
         let provider_str = provider_kind.to_string();
         
@@ -242,28 +242,47 @@ impl ConversationManager {
             .map(|e| e.db_session_id.clone())
             .or_else(|| existing_record.as_ref().map(|r| r.id.clone()));
 
-        let existing_native_tokens = if let Some(ref db_id) = existing_db_id {
-            usage_snapshots::get_latest_usage_snapshot_for_session(&self.db, conversation_id, db_id)
+        let synced_through_seq = existing_record.as_ref().map(|r| r.synced_through_seq).unwrap_or(0);
+
+        let existing_native_tokens: Option<u64> = if let Some(ref db_id) = existing_db_id {
+            let snapshot_tokens = usage_snapshots::get_latest_usage_snapshot_for_session(&self.db, conversation_id, db_id)
                 .ok()
                 .flatten()
                 .and_then(|s| s.context_tokens)
-                .unwrap_or(0) as u64
+                .map(|v| v as u64);
+
+            if snapshot_tokens.is_some() {
+                snapshot_tokens
+            } else if synced_through_seq > 0 {
+                // Conservative fallback when provider lacks native telemetry (e.g. Gemini):
+                // Estimate accumulated native context from canonical SQLite history synced through `synced_through_seq`
+                let all_messages = messages::get_messages(&self.db, conversation_id).unwrap_or_default();
+                let est_tokens: u64 = all_messages
+                    .into_iter()
+                    .filter(|m| m.seq <= synced_through_seq)
+                    .map(|m| TokenManager::estimate_tokens(&m.content))
+                    .sum();
+                Some(est_tokens)
+            } else {
+                Some(0)
+            }
         } else {
-            0
+            None
         };
 
         // Hard Budget Saturation Check:
         // If the current native session cannot accommodate the prompt without exceeding the model's base input budget,
         // transparently roll over: retire the saturated native session and start a fresh session with a compacted handoff.
-        let is_saturated = existing_native_tokens > 0
-            && existing_native_tokens.saturating_add(prompt_tokens) > base_input_budget;
+        let current_native = existing_native_tokens.unwrap_or(0);
+        let is_saturated = current_native > 0
+            && current_native.saturating_add(prompt_tokens) > base_input_budget;
 
         if is_saturated {
             tracing::info!(
                 conversation_id = %conversation_id,
                 provider = %provider_str,
                 model = ?model,
-                existing_native_tokens = existing_native_tokens,
+                existing_native_tokens = current_native,
                 prompt_tokens = prompt_tokens,
                 base_input_budget = base_input_budget,
                 "Native session saturated; rolling over to fresh session with compacted handoff"
@@ -287,7 +306,7 @@ impl ConversationManager {
         }
 
         let synced_through_seq = existing_record.as_ref().map(|r| r.synced_through_seq).unwrap_or(0);
-        let effective_existing_native_tokens = if is_saturated { 0 } else { existing_native_tokens };
+        let effective_existing_native_tokens = if is_saturated { 0 } else { current_native };
         let should_reuse_session = existing_entry.is_some();
 
         let (session, active_db_session_id): (Arc<dyn ProviderSession>, String) = if should_reuse_session {
@@ -460,6 +479,33 @@ impl ConversationManager {
                             if let Ok(msg) = msg_res {
                                 // Sync cursor update: this provider session is now synced through this assistant response!
                                 let _ = provider_sessions::update_synced_seq(&db_clone, &ps_id, msg.seq);
+
+                                // If this provider doesn't report native telemetry (e.g. Gemini),
+                                // record an estimated usage snapshot based on accumulated SQLite history up to msg.seq
+                                let has_snapshot = usage_snapshots::get_latest_usage_snapshot_for_session(&db_clone, &conv_id, &ps_id)
+                                    .map(|s| s.is_some())
+                                    .unwrap_or(false);
+                                if !has_snapshot {
+                                    let all_msgs = messages::get_messages(&db_clone, &conv_id).unwrap_or_default();
+                                    let est_tokens: u64 = all_msgs
+                                        .into_iter()
+                                        .filter(|m| m.seq <= msg.seq)
+                                        .map(|m| TokenManager::estimate_tokens(&m.content))
+                                        .sum();
+                                    let _ = usage_snapshots::create_usage_snapshot(
+                                        &db_clone,
+                                        &conv_id,
+                                        Some(&ps_id),
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        None,
+                                        Some(est_tokens as i64),
+                                        None,
+                                        "ESTIMATED",
+                                    );
+                                }
                             }
                             current_text.clear();
                             current_thinking.clear();
