@@ -12,8 +12,6 @@ use tokio::process::Command;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::timeout;
 
-#[cfg(windows)]
-use std::os::windows::process::CommandExt;
 
 use crate::app::error::{AppError, Result};
 

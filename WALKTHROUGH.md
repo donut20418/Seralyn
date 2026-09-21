@@ -847,7 +847,21 @@ Following audit on commit `2c297fe`, the remaining items have been comprehensive
 - **Strict Inspector Lookup**: `findSession` matches exact `(account, model)` or `(account, legacy null)`, prioritizing `s.status === "active"` and returning `null` rather than falling back to an unrelated model under the same account.
 - **Completion Model State**: `useConversation.ts` tracks `streamingModel` during turn execution and passes it to `selectConversation` on `SessionFinished` and `Error`.
 
-### 10. Automated Verification Tests (`fixtures_tests.rs`)
+### 11. Native Session Resume Failure Fallback & Canonical History Restoration (`conversation/mod.rs`, `process/mod.rs`)
+- **Root Cause & Comprehensive Resolution**: When resuming a native session failed (`provider.resume_session(native_id, ...).await` returned `Err(_)`), Seralyn fell back to `create_session`, but previously:
+  1. Failed to close the old session record in SQLite (`record.id`), leaving duplicate active sessions for the same `(account, model)`.
+  2. Maintained the old session's `synced_through_seq` and `effective_existing_native_tokens` captured prior to the match block. When `build_adaptive_context` ran for the fresh session, it used the old `synced_through_seq` (starving the fresh session of prior messages 1..=$N$) and old `effective_existing_native_tokens` (falsely inflating native context occupancy).
+- **The Fix**:
+  - In `send_message_with_attachments`, `synced_through_seq` and `effective_existing_native_tokens` are declared mutable.
+  - In the `Err(err)` handler of `resume_session` (and in the unresumable `!can_resume` fallback branch):
+    1. Seralyn logs a warning detailing the conversation, provider, native ID, and error.
+    2. Retires the old SQLite record via `provider_sessions::close_session(&self.db, &record.id)`.
+    3. Resets `synced_through_seq = 0;` so `build_adaptive_context` delivers all prior canonical messages (seq 1..=$N$) to the fresh session.
+    4. Resets `effective_existing_native_tokens = 0;` so the fresh session starts from zero native context without inheriting dead session occupancy.
+- **Windows Warning Clean-up**:
+  - Removed unused `#[cfg(windows)] use std::os::windows::process::CommandExt;` in [`src/app/process/mod.rs`](file:///P:/asset_team/Seralyn/src-tauri/src/app/process/mod.rs), as `tokio::process::Command::creation_flags` is an inherent method on Windows.
+
+### 12. Automated Verification Tests (`fixtures_tests.rs`)
 1. `test_token_estimator_multibyte_and_ceil`: Asserts ceil division on ASCII and conservative estimation on Thai and CJK.
 2. `test_adaptive_context_strict_total_budget_invariant`: Asserts total model input budget invariant under normal, near-exhaustion, and zero-budget conditions.
 3. `test_conversation_manager_model_scoped_approval_and_interrupt`: Proves model-scoped approval and interrupt routing and ambiguity error when `model=None` with multiple models active.
@@ -862,6 +876,11 @@ Following audit on commit `2c297fe`, the remaining items have been comprehensive
    - Saturation rollover triggering compacted handoff.
    - Fresh session snapshot accurately reflecting compacted context ($\le 916\text{K}$).
    - Fresh session reuse on subsequent turns without rollover loop.
+11. `test_resume_session_failure_falls_back_to_fresh_session_with_restored_history`: Verifies that when native session resume fails:
+   - Dead session is retired in SQLite (`status == "closed"`).
+   - Fresh session is created and active (`status == "active"`), maintaining exactly 1 active session.
+   - Fresh session receives all prior canonical history messages (seq 1..=5) because `synced_through_seq` is reset to 0.
+   - Fresh session context tokens start clean without inheriting the dead session's 25,000 native tokens.
 
 ---
 

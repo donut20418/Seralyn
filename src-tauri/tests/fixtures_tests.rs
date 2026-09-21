@@ -2935,5 +2935,183 @@ async fn test_gemini_multi_turn_dynamic_estimated_snapshots_and_rollover_no_loop
     assert_eq!(final_created.len(), 2, "Must NOT create session 3; rollover loop is successfully prevented!");
 }
 
+#[tokio::test]
+async fn test_resume_session_failure_falls_back_to_fresh_session_with_restored_history() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::Provider;
+    use seralyn_lib::app::db::{conversations, messages, provider_sessions, usage_snapshots};
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let conv = conversations::create_conversation(&db, Some("Resume Failure Fallback Test")).unwrap();
+
+    // 1. Setup 5 prior messages (seq 1..=5) in SQLite canonical history
+    for i in 1..=5 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(
+            &db,
+            &conv.id,
+            None,
+            role,
+            &format!("Turn {i}: Prior canonical message content data"),
+            Some("claude"),
+            None,
+            None,
+            None,
+        ).unwrap();
+    }
+
+    // 2. Setup existing provider session record in SQLite that was synced through seq 5
+    let meta_json = serde_json::json!({ "account": "work" }).to_string();
+    let old_sess = provider_sessions::create_provider_session_with_metadata(
+        &db,
+        &conv.id,
+        "claude",
+        Some("dead-native-session-999"),
+        Some("haiku"),
+        Some(&meta_json),
+    ).unwrap();
+    provider_sessions::update_synced_seq(&db, &old_sess.id, 5).unwrap();
+
+    // 3. Setup usage snapshot on old session with 25,000 context tokens
+    usage_snapshots::create_usage_snapshot(
+        &db,
+        &conv.id,
+        Some(&old_sess.id),
+        Some(20_000),
+        Some(5_000),
+        None,
+        None,
+        None,
+        Some(25_000),
+        Some(200_000),
+        "EXACT",
+    ).unwrap();
+
+    // 4. Mock provider where resume_session fails (e.g. process died, native session expired)
+    struct FailingResumeProvider {
+        kind: ProviderKind,
+        session_counter: Arc<std::sync::atomic::AtomicUsize>,
+        created_sessions: Arc<tokio::sync::Mutex<Vec<TrackedSession>>>,
+        resumed_attempts: Arc<tokio::sync::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for FailingResumeProvider {
+        fn kind(&self) -> ProviderKind { self.kind.clone() }
+        async fn detect_installation(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::InstallationInfo> {
+            Ok(seralyn_lib::app::providers::InstallationInfo { installed: true, executable_path: None, version: None })
+        }
+        async fn check_authentication(&self) -> seralyn_lib::app::error::Result<seralyn_lib::app::providers::AuthStatus> {
+            Ok(seralyn_lib::app::providers::AuthStatus::Authenticated)
+        }
+        fn capabilities(&self) -> seralyn_lib::app::providers::ProviderCapabilities { Default::default() }
+        async fn create_session(&self, config: seralyn_lib::app::providers::SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn seralyn_lib::app::providers::ProviderSession>> {
+            let n = self.session_counter.fetch_add(1, Ordering::SeqCst);
+            let sess = TrackedSession {
+                id: format!("fresh-native-sess-{}", n),
+                provider: self.kind.clone(),
+                model: config.model.unwrap_or_else(|| "default".to_string()),
+                conversation_id: config.conversation_id.clone(),
+                sent_messages: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+                closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                event_sender: Some(config.event_sender),
+            };
+            self.created_sessions.lock().await.push(sess.clone());
+            Ok(Box::new(sess))
+        }
+        async fn resume_session(&self, native_session_id: &str, _config: seralyn_lib::app::providers::SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn seralyn_lib::app::providers::ProviderSession>> {
+            self.resumed_attempts.lock().await.push(native_session_id.to_string());
+            Err(seralyn_lib::app::error::AppError::Provider(format!("Native session '{native_session_id}' not found")))
+        }
+    }
+
+    let session_counter = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let created_sessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let resumed_attempts = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+
+    let provider = FailingResumeProvider {
+        kind: ProviderKind::Claude,
+        session_counter: session_counter.clone(),
+        created_sessions: created_sessions.clone(),
+        resumed_attempts: resumed_attempts.clone(),
+    };
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Claude, Arc::new(provider) as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    // 5. Send message: resume_session should fail, and fallback must create fresh session with full canonical history
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Prompt after crash",
+        ProviderKind::Claude,
+        Vec::new(),
+        Some("haiku".to_string()),
+        Some("work".to_string()),
+        None,
+        tx,
+    ).await.unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // 6. Assertions:
+    // a) resume_session was attempted with the dead session ID
+    let attempts = resumed_attempts.lock().await;
+    assert_eq!(attempts.as_slice(), &["dead-native-session-999"], "Must attempt to resume old native session");
+    drop(attempts);
+
+    // b) Dead session record in SQLite was closed
+    let all_sessions = provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    let old_rec = all_sessions.iter().find(|s| s.id == old_sess.id).expect("Old session record must exist");
+    assert_eq!(old_rec.status, "closed", "Dead session MUST be marked closed in SQLite");
+
+    // c) Exactly one active session in SQLite for (work, haiku), and it is the new session
+    let active_sess = provider_sessions::get_active_session_for_account_model(&db, &conv.id, "claude", Some("work"), Some("haiku")).unwrap().expect("Active session must exist");
+    assert_ne!(active_sess.id, old_sess.id, "Active session MUST be the newly created session");
+    assert_eq!(active_sess.status, "active");
+
+    let active_count = all_sessions.iter().filter(|s| s.status == "active").count();
+    assert_eq!(active_count, 1, "There must be exactly one active session in SQLite");
+
+    // d) Fresh session received ALL 5 canonical messages (seq 1..=5) because synced_through_seq was reset to 0
+    let created_guard = created_sessions.lock().await;
+    assert_eq!(created_guard.len(), 1, "Exactly one fresh native session created");
+    let fresh_session = &created_guard[0];
+    let sent_guard = fresh_session.sent_messages.lock().await;
+    assert_eq!(sent_guard.len(), 1);
+    let sent_msg = &sent_guard[0];
+    assert_eq!(sent_msg.content, "Prompt after crash");
+    assert_eq!(
+        sent_msg.context.len(),
+        5,
+        "Fresh session MUST receive all 5 prior canonical messages (seq 1..=5) because synced_through_seq was reset to 0!"
+    );
+    for i in 1..=5 {
+        assert!(
+            sent_msg.context.iter().any(|m| m.content.contains(&format!("Turn {i}:"))),
+            "Turn {i} message must be present in fresh session context handoff"
+        );
+    }
+    drop(sent_guard);
+    drop(created_guard);
+
+    // e) The fresh session's snapshot does NOT inherit the 25,000 native context tokens of the dead session
+    let new_snap = usage_snapshots::get_latest_usage_snapshot_for_session(&db, &conv.id, &active_sess.id).unwrap();
+    if let Some(snap) = new_snap {
+        if let Some(ctx) = snap.context_tokens {
+            assert!(
+                (ctx as u64) < 25_000,
+                "Fresh session context tokens ({ctx}) must NOT inherit the 25,000 native context tokens of the dead session"
+            );
+        }
+    }
+}
+
 
 

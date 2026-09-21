@@ -307,8 +307,8 @@ impl ConversationManager {
             existing_record = None;
         }
 
-        let synced_through_seq = existing_record.as_ref().map(|r| r.synced_through_seq).unwrap_or(0);
-        let effective_existing_native_tokens = if is_saturated { 0 } else { current_native };
+        let mut synced_through_seq = existing_record.as_ref().map(|r| r.synced_through_seq).unwrap_or(0);
+        let mut effective_existing_native_tokens = if is_saturated { 0 } else { current_native };
         let should_reuse_session = existing_entry.is_some();
 
         let (session, active_db_session_id, active_turn_input_tokens): (Arc<dyn ProviderSession>, String, Arc<AtomicU64>) = if should_reuse_session {
@@ -366,7 +366,18 @@ impl ConversationManager {
                 let native_id = record.provider_session_id.as_ref().unwrap();
                 match provider.resume_session(native_id, config.clone()).await {
                     Ok(sess) => (Arc::from(sess), record.id.clone()),
-                    Err(_) => {
+                    Err(err) => {
+                        tracing::warn!(
+                            conversation_id = %conversation_id,
+                            provider = %provider_str,
+                            native_id = %native_id,
+                            error = %err,
+                            "Native session resume failed; retiring old session and starting fresh session"
+                        );
+                        let _ = provider_sessions::close_session(&self.db, &record.id);
+                        synced_through_seq = 0;
+                        effective_existing_native_tokens = 0;
+
                         let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
                         let meta_json = serde_json::json!({ "account": profile_id }).to_string();
                         let rec = provider_sessions::create_provider_session_with_metadata(
@@ -381,6 +392,11 @@ impl ConversationManager {
                     }
                 }
             } else {
+                if let Some(ref record) = existing_record {
+                    let _ = provider_sessions::close_session(&self.db, &record.id);
+                    synced_through_seq = 0;
+                    effective_existing_native_tokens = 0;
+                }
                 let sess: Arc<dyn ProviderSession> = Arc::from(provider.create_session(config).await?);
                 let meta_json = serde_json::json!({ "account": profile_id }).to_string();
                 let rec = provider_sessions::create_provider_session_with_metadata(
