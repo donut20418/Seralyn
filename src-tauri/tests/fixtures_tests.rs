@@ -2296,14 +2296,27 @@ async fn test_send_message_updates_exact_session_last_used() {
         id: String,
         provider: ProviderKind,
         model: String,
+        conversation_id: String,
         sent_messages: Arc<tokio::sync::Mutex<Vec<seralyn_lib::app::providers::ProviderMessage>>>,
         closed: Arc<std::sync::atomic::AtomicBool>,
+        event_sender: Option<tokio::sync::mpsc::Sender<seralyn_lib::app::events::NormalizedEvent>>,
     }
 
     #[async_trait::async_trait]
     impl seralyn_lib::app::providers::ProviderSession for TrackedSession {
         async fn send(&self, msg: seralyn_lib::app::providers::ProviderMessage) -> seralyn_lib::app::error::Result<()> {
             self.sent_messages.lock().await.push(msg);
+            if let Some(ref tx) = self.event_sender {
+                let _ = tx.send(seralyn_lib::app::events::NormalizedEvent::text_delta(
+                    self.provider,
+                    self.conversation_id.clone(),
+                    "Assistant response text turn data.".to_string(),
+                )).await;
+                let _ = tx.send(seralyn_lib::app::events::NormalizedEvent::session_finished(
+                    self.provider,
+                    self.conversation_id.clone(),
+                )).await;
+            }
             Ok(())
         }
         async fn interrupt(&self) -> seralyn_lib::app::error::Result<()> { Ok(()) }
@@ -2329,6 +2342,7 @@ async fn test_send_message_updates_exact_session_last_used() {
         kind: ProviderKind,
         session_counter: Arc<std::sync::atomic::AtomicUsize>,
         created_sessions: Arc<tokio::sync::Mutex<Vec<TrackedSession>>>,
+        emit_events: bool,
     }
 
     #[async_trait::async_trait]
@@ -2347,8 +2361,10 @@ async fn test_send_message_updates_exact_session_last_used() {
                 id: format!("native-sess-{}", n),
                 provider: self.kind.clone(),
                 model: config.model.unwrap_or_else(|| "default".to_string()),
+                conversation_id: config.conversation_id.clone(),
                 sent_messages: Arc::new(tokio::sync::Mutex::new(Vec::new())),
                 closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                event_sender: if self.emit_events { Some(config.event_sender) } else { None },
             };
             self.created_sessions.lock().await.push(sess.clone());
             Ok(Box::new(sess))
@@ -2375,6 +2391,7 @@ async fn test_send_message_rolls_over_saturated_native_session_restores_history(
         kind: ProviderKind::Claude,
         session_counter: session_counter.clone(),
         created_sessions: created_sessions.clone(),
+        emit_events: false,
     };
 
     let mut provider_map = std::collections::HashMap::new();
@@ -2503,6 +2520,7 @@ async fn test_send_message_rolls_over_saturated_session_with_compacted_handoff_w
         kind: ProviderKind::Claude,
         session_counter: session_counter.clone(),
         created_sessions: created_sessions.clone(),
+        emit_events: false,
     };
 
     let mut provider_map = std::collections::HashMap::new();
@@ -2620,6 +2638,7 @@ async fn test_send_message_rejects_oversized_prompt_without_creating_db_record()
         kind: ProviderKind::Claude,
         session_counter,
         created_sessions,
+        emit_events: false,
     };
 
     let mut provider_map = std::collections::HashMap::new();
@@ -2682,6 +2701,7 @@ async fn test_gemini_conservative_history_estimation_triggers_saturation_rollove
         kind: ProviderKind::Gemini,
         session_counter: session_counter.clone(),
         created_sessions: created_sessions.clone(),
+        emit_events: false,
     };
 
     let mut provider_map = std::collections::HashMap::new();
@@ -2742,5 +2762,177 @@ async fn test_gemini_conservative_history_estimation_triggers_saturation_rollove
     let created_guard = created_sessions.lock().await;
     assert_eq!(created_guard.len(), 2, "Fresh Gemini session 2 must be created");
 }
+
+#[tokio::test]
+async fn test_gemini_multi_turn_dynamic_estimated_snapshots_and_rollover_no_loop() {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+    use seralyn_lib::app::conversation::ConversationManager;
+    use seralyn_lib::app::providers::Provider;
+    use seralyn_lib::app::db::{provider_sessions, usage_snapshots};
+
+    let db = Arc::new(Database::new_in_memory().unwrap());
+    db.run_migrations().unwrap();
+
+    let session_counter = Arc::new(std::sync::atomic::AtomicUsize::new(1));
+    let created_sessions = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    let provider = DynamicMultiSessionProvider {
+        kind: ProviderKind::Gemini,
+        session_counter: session_counter.clone(),
+        created_sessions: created_sessions.clone(),
+        emit_events: true, // Enables simulated assistant TextDelta + SessionFinished per turn
+    };
+
+    let mut provider_map = std::collections::HashMap::new();
+    provider_map.insert(ProviderKind::Gemini, Arc::new(provider) as Arc<dyn Provider>);
+
+    let manager = ConversationManager::new(db.clone(), Arc::new(seralyn_lib::app::providers::ProviderManager::with_providers(provider_map)));
+    let conv = manager.create_conversation(Some("Gemini Multi-Turn Dynamic Telemetry Test")).unwrap();
+
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    // 1. Turn 1
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Turn 1 prompt to Gemini",
+        ProviderKind::Gemini,
+        Vec::new(),
+        Some("gemini-2.5-pro".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let sessions1 = provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    let s1_rec = sessions1.iter().find(|s| s.provider == "gemini").unwrap().clone();
+    let snap1 = usage_snapshots::get_latest_usage_snapshot_for_session(&db, &conv.id, &s1_rec.id).unwrap().expect("Snapshot 1 must exist");
+    assert_eq!(snap1.confidence, "ESTIMATED");
+    let t1 = snap1.context_tokens.expect("context_tokens must be set") as u64;
+    assert!(t1 > 0, "Snapshot 1 must have positive context tokens");
+
+    // 2. Turn 2: verify snapshot grows (eliminates stale snapshot bug!)
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Turn 2 prompt to Gemini with additional queries",
+        ProviderKind::Gemini,
+        Vec::new(),
+        Some("gemini-2.5-pro".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let snap2 = usage_snapshots::get_latest_usage_snapshot_for_session(&db, &conv.id, &s1_rec.id).unwrap().expect("Snapshot 2 must exist");
+    let t2 = snap2.context_tokens.expect("context_tokens must be set") as u64;
+    assert!(t2 > t1, "Snapshot after Turn 2 ({t2}) MUST be strictly greater than Turn 1 ({t1})");
+
+    // 3. Turn 3: verify snapshot grows further
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Turn 3 prompt to Gemini with further context",
+        ProviderKind::Gemini,
+        Vec::new(),
+        Some("gemini-2.5-pro".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let snap3 = usage_snapshots::get_latest_usage_snapshot_for_session(&db, &conv.id, &s1_rec.id).unwrap().expect("Snapshot 3 must exist");
+    let t3 = snap3.context_tokens.expect("context_tokens must be set") as u64;
+    assert!(t3 > t2, "Snapshot after Turn 3 ({t3}) MUST be strictly greater than Turn 2 ({t2})");
+
+    // 4. Turn 4: Saturated rollover + Compacted Handoff
+    // Create large canonical history in SQLite so total history exceeds fresh budget (> 916K tokens)
+    let big_segment = "Deep canonical conversation history data segment for multi-turn testing. ".repeat(2_700);
+    for i in 1..=5 {
+        let role = if i % 2 == 1 { "user" } else { "assistant" };
+        messages::create_message(&db, &conv.id, None, role, &big_segment, Some("gemini"), None, Some(&s1_rec.id), None).unwrap();
+    }
+
+    // Set usage snapshot on Session 1 to 910,000 tokens so 910,000 + prompt > 916,000
+    usage_snapshots::create_usage_snapshot(
+        &db,
+        &conv.id,
+        Some(&s1_rec.id),
+        Some(900_000),
+        Some(10_000),
+        None,
+        None,
+        None,
+        Some(910_000),
+        Some(1_000_000),
+        "ESTIMATED",
+    ).unwrap();
+
+    let rollover_prompt = "Rollover prompt to trigger fresh session with compacted handoff";
+    manager.send_message_with_attachments(
+        &conv.id,
+        rollover_prompt,
+        ProviderKind::Gemini,
+        Vec::new(),
+        Some("gemini-2.5-pro".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Verify Session 1 closed, fresh Session 2 created
+    let created_guard = created_sessions.lock().await;
+    assert_eq!(created_guard.len(), 2, "Fresh Gemini session 2 must be created");
+    let session_1_mock = created_guard[0].clone();
+    let session_2_mock = created_guard[1].clone();
+    drop(created_guard);
+
+    assert!(session_1_mock.closed.load(Ordering::SeqCst), "Session 1 must be closed");
+    assert!(!session_2_mock.closed.load(Ordering::SeqCst), "Session 2 must be active");
+
+    let s2_msgs = session_2_mock.sent_messages.lock().await;
+    assert_eq!(s2_msgs.len(), 1);
+    assert!(
+        s2_msgs[0].context.iter().any(|m| m.content.contains("[Context Hand-off:")),
+        "Compacted handoff must be generated on fresh session"
+    );
+    drop(s2_msgs);
+
+    // Verify Session 2 snapshot in DB reflects compacted context, NOT full 1M+ canonical history!
+    let all_db_sessions = provider_sessions::get_sessions_for_conversation(&db, &conv.id).unwrap();
+    let s2_rec = all_db_sessions.iter().find(|s| s.id != s1_rec.id && s.provider == "gemini").unwrap();
+    let s2_snap = usage_snapshots::get_latest_usage_snapshot_for_session(&db, &conv.id, &s2_rec.id).unwrap().expect("Fresh session snapshot must exist");
+    let s2_tokens = s2_snap.context_tokens.expect("Session 2 context_tokens must be set") as u64;
+    assert!(
+        s2_tokens <= 916_000,
+        "Session 2 estimated context ({s2_tokens}) MUST reflect compacted handoff (<= 916,000), not full canonical SQLite history (>1M)!"
+    );
+
+    // 5. Turn 5: Reusing Fresh Session 2 (NO Rollover Loop!)
+    // Send follow-up prompt on Gemini. Since s2_tokens <= 916,000, Session 2 MUST be reused!
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Follow-up prompt on fresh session 2",
+        ProviderKind::Gemini,
+        Vec::new(),
+        Some("gemini-2.5-pro".to_string()),
+        Some("work".to_string()),
+        None,
+        tx.clone(),
+    ).await.unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    // Verify Session 2 was NOT rolled over!
+    assert!(!session_2_mock.closed.load(Ordering::SeqCst), "Session 2 MUST remain active and NOT be rolled over again!");
+    let final_created = created_sessions.lock().await;
+    assert_eq!(final_created.len(), 2, "Must NOT create session 3; rollover loop is successfully prevented!");
+}
+
 
 

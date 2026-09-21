@@ -2,6 +2,7 @@ pub mod context;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, Mutex};
 
@@ -50,6 +51,7 @@ pub struct ActiveSessionEntry {
     pub session: Arc<dyn ProviderSession>,
     pub db_session_id: String,
     pub event_tx: Arc<tokio::sync::RwLock<Option<mpsc::Sender<NormalizedEvent>>>>,
+    pub turn_input_tokens: Arc<AtomicU64>,
 }
 
 pub struct ConversationManager {
@@ -309,15 +311,17 @@ impl ConversationManager {
         let effective_existing_native_tokens = if is_saturated { 0 } else { current_native };
         let should_reuse_session = existing_entry.is_some();
 
-        let (session, active_db_session_id): (Arc<dyn ProviderSession>, String) = if should_reuse_session {
+        let (session, active_db_session_id, active_turn_input_tokens): (Arc<dyn ProviderSession>, String, Arc<AtomicU64>) = if should_reuse_session {
             let entry = existing_entry.unwrap();
             // Dynamic event routing: update active event sender to the new channel for this turn!
             let mut tx_guard = entry.event_tx.write().await;
             *tx_guard = Some(event_sender.clone());
-            (entry.session.clone(), entry.db_session_id.clone())
+            (entry.session.clone(), entry.db_session_id.clone(), entry.turn_input_tokens.clone())
         } else {
             // Creation/resumption happens OUTSIDE active_sessions lock!
             let (internal_tx, mut internal_rx) = mpsc::channel(100);
+            let turn_input_tokens = Arc::new(AtomicU64::new(0));
+            let turn_input_tokens_clone = turn_input_tokens.clone();
             
             let mut env = HashMap::new();
             if let Some(eff) = &effort {
@@ -401,11 +405,13 @@ impl ConversationManager {
             let conv_id = conversation_id.to_string();
             let pk = provider_kind.clone();
             let ps_id = provider_session_id.clone();
+            let cw = context_window;
             
             // Dedicated tokio task listening for events from the session lifecycle
             tokio::spawn(async move {
                 let mut current_text = String::new();
                 let mut current_thinking = String::new();
+                let mut saw_usage_this_turn = false;
                 
                 while let Some(event) = internal_rx.recv().await {
                     // Update native session ID in DB when reported by provider
@@ -436,6 +442,7 @@ impl ConversationManager {
                         context_window,
                         confidence,
                     } = &event.payload {
+                        saw_usage_this_turn = true;
                         let conf_str = match confidence {
                             crate::app::events::TokenConfidence::Exact => "EXACT",
                             crate::app::events::TokenConfidence::Estimated => "ESTIMATED",
@@ -480,29 +487,24 @@ impl ConversationManager {
                                 // Sync cursor update: this provider session is now synced through this assistant response!
                                 let _ = provider_sessions::update_synced_seq(&db_clone, &ps_id, msg.seq);
 
-                                // If this provider doesn't report native telemetry (e.g. Gemini),
-                                // record an estimated usage snapshot based on accumulated SQLite history up to msg.seq
-                                let has_snapshot = usage_snapshots::get_latest_usage_snapshot_for_session(&db_clone, &conv_id, &ps_id)
-                                    .map(|s| s.is_some())
-                                    .unwrap_or(false);
-                                if !has_snapshot {
-                                    let all_msgs = messages::get_messages(&db_clone, &conv_id).unwrap_or_default();
-                                    let est_tokens: u64 = all_msgs
-                                        .into_iter()
-                                        .filter(|m| m.seq <= msg.seq)
-                                        .map(|m| TokenManager::estimate_tokens(&m.content))
-                                        .sum();
+                                // If this provider didn't report native telemetry for this turn (e.g. Gemini),
+                                // record an estimated usage snapshot based on accumulated native context sent to this session
+                                if !saw_usage_this_turn {
+                                    let assistant_tokens = TokenManager::estimate_tokens(&current_text);
+                                    let input_tokens = turn_input_tokens_clone.load(Ordering::SeqCst);
+                                    let total_context = input_tokens.saturating_add(assistant_tokens);
+
                                     let _ = usage_snapshots::create_usage_snapshot(
                                         &db_clone,
                                         &conv_id,
                                         Some(&ps_id),
+                                        Some(input_tokens as i64),
+                                        Some(assistant_tokens as i64),
                                         None,
                                         None,
                                         None,
-                                        None,
-                                        None,
-                                        Some(est_tokens as i64),
-                                        None,
+                                        Some(total_context as i64),
+                                        Some(cw as i64),
                                         "ESTIMATED",
                                     );
                                 }
@@ -510,6 +512,7 @@ impl ConversationManager {
                             current_text.clear();
                             current_thinking.clear();
                         }
+                        saw_usage_this_turn = false;
                     }
                     
                     // Forward to active caller channel if available; do NOT terminate loop on send error!
@@ -524,6 +527,7 @@ impl ConversationManager {
                 session: sess.clone(),
                 db_session_id: provider_session_id.clone(),
                 event_tx,
+                turn_input_tokens: turn_input_tokens.clone(),
             };
 
             // Register in active_sessions - brief lock only!
@@ -531,10 +535,10 @@ impl ConversationManager {
             if let Some(existing) = sessions.get(&session_key) {
                 let mut tx_guard = existing.event_tx.write().await;
                 *tx_guard = Some(event_sender.clone());
-                (existing.session.clone(), existing.db_session_id.clone())
+                (existing.session.clone(), existing.db_session_id.clone(), existing.turn_input_tokens.clone())
             } else {
                 sessions.insert(session_key.clone(), entry);
-                (sess, provider_session_id)
+                (sess, provider_session_id, turn_input_tokens)
             }
         };
 
@@ -566,6 +570,12 @@ impl ConversationManager {
             context: adaptive_ctx.messages,
             attachments: attachment_refs,
         };
+
+        let working_tokens: u64 = msg.context.iter().map(|m| TokenManager::estimate_tokens(&m.content)).sum();
+        let accumulated_input = effective_existing_native_tokens
+            .saturating_add(working_tokens)
+            .saturating_add(prompt_tokens);
+        active_turn_input_tokens.store(accumulated_input, Ordering::SeqCst);
 
         // 8. Call session.send(message) WITHOUT holding active_sessions lock!
         // This completely prevents approval and interrupt deadlocks!
