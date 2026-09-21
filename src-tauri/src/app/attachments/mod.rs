@@ -153,9 +153,9 @@ pub fn classify_mime_and_kind(
 
 /// Sanitizes an input filename to a safe leaf without control characters, path separators, or directory traversal.
 pub fn sanitize_file_name(file_name: &str) -> String {
-    let raw_leaf = Path::new(file_name)
-        .file_name()
-        .and_then(|n| n.to_str())
+    let raw_leaf = file_name
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
         .unwrap_or("attachment.bin");
 
     let sanitized: String = raw_leaf
