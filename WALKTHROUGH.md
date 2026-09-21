@@ -821,10 +821,12 @@ Following audit on commit `2c297fe`, the remaining items have been comprehensive
 - **True Native Context Metric**: Computes `estimated_total_context() = input_tokens + cache_read + cache_creation + output_tokens`, accurately reflecting the native conversation state held for the next turn.
 - **Estimated Confidence**: Normalized `TokenConfidence` is correctly set to `Estimated`.
 
-### 4. Conservative History Estimation for Telemetry-less Providers (`conversation/mod.rs`)
-- **Unknown vs Zero Disambiguation**: Differentiates `Some(tokens)` from `None`. When a provider lacks native usage telemetry (e.g. Gemini) or before the first usage snapshot, Seralyn conservatively estimates accumulated native context by summing estimated tokens of all canonical SQLite messages up to `synced_through_seq`.
-- **Gemini Saturation Rollover**: Gemini sessions now benefit from automated saturation detection and transparent rollover just like Claude and Codex.
-- **Turn Finish Snapshot**: Sessions without provider telemetry record an estimated usage snapshot in SQLite on turn completion.
+### 4. Gemini Multi-Turn Telemetry Lifecycle & Rollover Loop Prevention (`conversation/mod.rs`)
+- **Per-Turn Telemetry Tracking (`saw_usage_this_turn`)**: The session listener maintains a `saw_usage_this_turn` flag per turn. If a provider does not emit native telemetry (e.g. Gemini), an updated estimated usage snapshot is generated at `SessionFinished` and persisted to SQLite, eliminating the stale-snapshot bug.
+- **True Native Session Occupancy Formula**: Rather than summing the entire canonical SQLite database (which would erroneously include messages pruned or compacted away), Seralyn computes native session occupancy based on actual ingested tokens:
+  $$\text{native\_occupancy} = \text{previous\_native} + \text{working\_context\_tokens} + \text{prompt\_tokens} + \text{assistant\_output\_tokens}$$
+- **Rollover Loop Prevention**: After rollover and context compaction, the fresh session starts with $\text{previous\_native} = 0$. Its snapshot accurately reflects the compacted handoff ($\le \text{base\_input\_budget}$), ensuring that subsequent turns smoothly reuse the fresh session without triggering infinite rollover loops.
+- **Legacy Snapshot Fallback**: Differentiates `Some(tokens)` from `None`. Sessions lacking any usage snapshots in SQLite conservatively fall back to canonical SQLite history $\le \text{synced\_through\_seq}$.
 
 ### 5. Pre-DB Prompt Budget Validation (`conversation/mod.rs`)
 - **Canonical DB Consistency**: `provider_prompt` is built and evaluated against `base_input_budget` *before* inserting `user_msg` into SQLite. Oversized prompts are rejected without polluting SQLite history or titles.
@@ -855,15 +857,20 @@ Following audit on commit `2c297fe`, the remaining items have been comprehensive
 7. `test_send_message_rejects_oversized_prompt_without_creating_db_record`: Verifies that oversized prompts return `Err` without creating any message records in SQLite.
 8. `test_claude_parser_real_fixture_usage_telemetry`: Verifies parsing of Claude `cache_read_input_tokens`, `cache_creation_input_tokens`, `estimated_total_context()`, and `TokenConfidence::Estimated`.
 9. `test_gemini_conservative_history_estimation_triggers_saturation_rollover`: Verifies that Gemini sessions without telemetry conservatively estimate native context from SQLite history and trigger saturation rollover.
+10. `test_gemini_multi_turn_dynamic_estimated_snapshots_and_rollover_no_loop`: Verifies multi-turn Gemini lifecycle:
+   - Dynamic snapshot growth ($A < B < C$) across consecutive turns without stale freezing.
+   - Saturation rollover triggering compacted handoff.
+   - Fresh session snapshot accurately reflecting compacted context ($\le 916\text{K}$).
+   - Fresh session reuse on subsequent turns without rollover loop.
 
 ---
 
 ## CI Verification Status
-- **Commit**: `122bf77c2fccd14b46e368a1dd04cf16bc027a5a` (`origin/main`)
-- **Workflow Run**: [35555874046](https://github.com/donut20418/Seralyn/actions/runs/35555874046) (`success`)
+- **Commit**: `18f1d24e58a5783d05d9c3747640789b45c6eb64` (`origin/main`)
+- **Workflow Run**: [35568754220](https://github.com/donut20418/Seralyn/actions/runs/35568754220) (`success`)
 - **Job Results**:
   - `Frontend TypeScript & Vite Build`: **success** (1,911 modules transformed cleanly)
-  - `Rust Backend (ubuntu-latest)`: **success** (34 unit + 34 fixture = 68/68 tests passed)
-  - `Rust Backend (windows-latest)`: **success** (34 unit + 34 fixture = 68/68 tests passed)
+  - `Rust Backend (ubuntu-latest)`: **success** (34 unit + 35 fixture = 69/69 tests passed)
+  - `Rust Backend (windows-latest)`: **success** (34 unit + 35 fixture = 69/69 tests passed)
 
 
