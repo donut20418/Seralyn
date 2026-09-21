@@ -182,6 +182,7 @@ export function ChatView({
           disabled={!conversationId && messages.length === 0}
           isStreaming={isStreaming}
           streamingProvider={streamingProvider}
+          activeProvider={activeProvider}
         />
       </div>
 

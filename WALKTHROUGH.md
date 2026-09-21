@@ -912,32 +912,39 @@ Phase 2.6 introduces an end-to-end, security-hardened attachment pipeline with c
 - **INV-A9 (Context Compaction without Base64 Inflation)**: History compaction summarizes older turns with compact descriptors (`[Attachment: <name> | <mime> | sha256:<hash>]`) without binary/base64 payload inflation.
 
 ## 2. Automated Verification Tests (`fixtures_tests.rs`)
-1. `test_phase26_at01_staged_attachment_lifecycle`: Staged upload, SHA-256 computation, and transition to attached.
-2. `test_phase26_at02_cross_conversation_isolation`: Cross-conversation attachment isolation enforcement.
-3. `test_phase26_at03_opaque_uuid_ipc_boundary`: Opaque UUID enforcement and path rejection over IPC.
-4. `test_phase26_at04_path_traversal_and_ntfs_junction_defense`: Directory containment and traversal defense.
-5. `test_phase26_at05_payload_and_count_limits`: Enforcement of 25MB single, 50MB aggregate, and 10 attachment limits.
-6. `test_phase26_at06_mime_and_kind_classification`: MIME type and kind detection accuracy.
-7. `test_phase26_at07_codex_provider_local_image_delivery`: Codex structured localImage preceding prompt text.
-8. `test_phase26_at08_gemini_provider_image_content_block_delivery`: Gemini base64 image blocks preceding prompt text.
-9. `test_phase26_at09_claude_adapter_boundary_isolation`: Claude adapter capability validation and error handling.
-10. `test_phase26_at10_compacted_history_attachment_descriptor`: Compact descriptor retention during compaction without base64 inflation.
-11. `test_phase26_at11_resume_failure_fallback_context_delivery`: Resumption fallback with complete canonical context and attachment metadata.
-12. `test_phase26_at12_staged_attachment_removal`: Deletion of staged attachments with disk and DB cleanup.
-13. `test_phase26_at13_conversation_deletion_cascade`: Deletion cascade cleaning conversation attachments.
-14. `test_phase26_at14_binary_attachment_base64_delivery`: Base64 serialization for non-text payloads.
-15. `test_phase26_at15_multi_attachment_ordering`: Multi-attachment sequence preservation.
-16. `test_phase26_at16_gemini_capability_preflight_rejection`: Upfront rejection for incapable Gemini configurations.
+1. `test_phase26_at01_multi_file_staging_and_message_association`: Multi-file staged upload, SHA-256 computation, and transition to attached.
+2. `test_phase26_at02_forged_local_path_injection_rejection`: Reject arbitrary absolute client filesystem paths over IPC (INV-A3).
+3. `test_phase26_at03_cross_conversation_isolation`: Cross-conversation attachment isolation enforcement (INV-A2).
+4. `test_phase26_at04_path_traversal_defense`: Directory containment and traversal defense (INV-A4 & INV-A10).
+5. `test_phase26_at05_single_file_size_limit`: Enforcement of 25MB single file limit.
+6. `test_phase26_at06_aggregate_size_and_count_limits`: Enforcement of 50MB aggregate and 10 attachment limits.
+7. `test_phase26_at07_codex_structured_local_image_delivery`: Codex structured localImage preceding prompt text.
+8. `test_phase26_at08_gemini_preflight_and_content_block`: Gemini base64 image blocks preceding prompt text and capability preflight.
+9. `test_phase26_at09_claude_adapter_boundary_isolation`: Claude adapter capability validation, image rejection, and text document isolation.
+10. `test_phase26_at10_provider_switch_context_preserves_attachments`: Historical attachment descriptors serialized in prompt text upon provider switch.
+11. `test_phase26_at11_resume_failure_fallback_context_delivery`: Resumption fallback delivering complete canonical context and attachment metadata.
+12. `test_phase26_at12_staged_attachment_removal`: Deletion of staged attachments allowed, while deletion of already-attached attachments is rejected.
+13. `test_phase26_at13_compaction_format_attachments_no_rollover_loop`: Compaction retaining deterministic descriptors without base64 inflation.
+14. `test_phase26_at14_execution_failure_preserves_message_and_attachments`: Preserving canonical message and attachment records upon provider execution error.
+15. `test_phase26_at15_delete_conversation_cascading_purge`: Deletion cascade cleaning conversation attachment records and directory.
+16. `test_phase26_at16_full_regression_verification`: Full regression test verifying hard token budget, session metadata, and attachment pipeline.
+17. `test_phase26_at17_reusing_attached_attachment_rejected`: Rejecting reuse of already-attached attachment IDs in subsequent messages.
+18. `test_phase26_at18_duplicate_attachment_ids_rejected`: Rejecting duplicate attachment IDs in a single message request.
+19. `test_phase26_at19_claude_image_preflight_rejection`: Rejecting image attachments sent to Claude before message creation.
+20. `test_phase26_at20_non_image_attachments_delivered_to_codex_and_gemini`: Verifying non-image attachments (e.g. PDF/text) are delivered in prompt text for Codex and Gemini (no silent drop).
 
 ---
 
-## Phase 2.6 CI Verification Status
-- **Commit**: `5a6751818b50b00440e5abd5946bebd87b47c517` (`origin/main`)
-- **Workflow Run**: [35588379736](https://github.com/donut20418/Seralyn/actions/runs/35588379736) (**Success**)
-- **Job Results**:
-  - `Frontend TypeScript & Vite Build`: **success** (1,911 modules transformed cleanly)
-  - `Rust Backend (ubuntu-latest)`: **success** (34 unit + 52 fixture = 86/86 tests passed)
-  - `Rust Backend (windows-latest)`: **success** (34 unit + 52 fixture = 86/86 tests passed)
+## 3. Audit Remediation & Hardening Summary
+- **P1 — Historical Attachment Serialization**: `format_context_for_prompt` serializes `[Attachment: <name> | <mime> | sha256:<prefix>]` for each message containing attachments in prior cross-provider context.
+- **P1 — No Silent Drop in Codex & Gemini**: Non-image attachments are formatted as `[Attached File: <path> (<name>, <size> KB)]` directly in the prompt text for Codex and Gemini.
+- **P1 — Attached History Protection**: `delete_attachment` strictly verifies `record.state == "staged"` and `record.message_id.is_none()`.
+- **P1 — Claude Image Preflight**: `supports_images` defaults to `false`. Claude returns `false`, Codex returns `true`, and Gemini checks ACP capabilities. Claude rejects image attachments upfront.
+- **P2 — Reused/Duplicate Attachment IDs**: `send_message_with_attachments` rejects duplicate IDs and requires `record.state == "staged"`. `attach_to_message` asserts `rows == 1`.
+- **P2 — Gemini Error Propagation**: `build_gemini_prompt_params` returns `Result<Value>` and propagates file read errors with `?`.
+- **P2 — Frontend Status UX**: `ChatInput` provides per-item upload status (`uploading`, `ready`, `unsupported`, `failed`), capability warning banners, and disables Send when incompatible.
+- **P3 — Documentation & Metrics Reconciled**: Exact test names and comprehensive 90+ test suite reflected accurately.
+
 
 
 

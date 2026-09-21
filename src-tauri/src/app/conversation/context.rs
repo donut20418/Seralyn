@@ -358,7 +358,20 @@ pub fn format_context_for_prompt(context: &[ContextMessage], current_prompt: &st
             ("assistant", None) => "Assistant".to_string(),
             (other, _) => other.to_string(),
         };
-        out.push_str(&format!("{label}: {}\n\n", msg.content.trim()));
+        let mut msg_text = msg.content.trim().to_string();
+        if !msg.attachments.is_empty() {
+            let att_strs: Vec<String> = msg.attachments.iter()
+                .map(|a| {
+                    let hash_prefix = if a.sha256.len() >= 8 { &a.sha256[..8] } else { &a.sha256 };
+                    format!("[Attachment: {} | {} | sha256:{}]", a.name, a.mime_type, hash_prefix)
+                })
+                .collect();
+            if !msg_text.is_empty() {
+                msg_text.push('\n');
+            }
+            msg_text.push_str(&att_strs.join("\n"));
+        }
+        out.push_str(&format!("{label}: {}\n\n", msg_text));
     }
     out.push_str("[End of Prior History]\n\n");
     out.push_str(current_prompt);

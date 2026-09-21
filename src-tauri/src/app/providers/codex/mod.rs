@@ -428,6 +428,10 @@ impl ProviderSession for CodexSession {
     fn is_active(&self) -> bool {
         self.transport.is_active()
     }
+
+    async fn supports_images(&self) -> bool {
+        true
+    }
 }
 
 pub fn build_codex_start_params(
@@ -467,6 +471,7 @@ pub fn build_codex_turn_params(
     effort: Option<&str>,
 ) -> Value {
     let mut input_items = Vec::new();
+    let mut non_image_header = String::new();
 
     for att in attachments {
         if att.kind == AttachmentKind::Image {
@@ -474,12 +479,24 @@ pub fn build_codex_turn_params(
                 "type": "localImage",
                 "path": att.path.to_string_lossy().to_string(),
             }));
+        } else {
+            let line = format!("[Attached File: {} ({}, {:.1} KB)]", att.path.to_string_lossy(), att.name, att.size_bytes as f64 / 1024.0);
+            if !non_image_header.is_empty() {
+                non_image_header.push('\n');
+            }
+            non_image_header.push_str(&line);
         }
     }
 
+    let final_prompt = if !non_image_header.is_empty() {
+        format!("{}\n\n{}", non_image_header, prompt_text)
+    } else {
+        prompt_text.to_string()
+    };
+
     input_items.push(json!({
         "type": "text",
-        "text": prompt_text,
+        "text": final_prompt,
     }));
 
     let mut turn_params = json!({

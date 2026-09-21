@@ -159,6 +159,12 @@ impl ClaudeSession {
 #[async_trait]
 impl ProviderSession for ClaudeSession {
     async fn send(&self, message: ProviderMessage) -> Result<()> {
+        if message.attachments.iter().any(|a| a.kind == AttachmentKind::Image) {
+            return Err(crate::app::error::AppError::InvalidInput(
+                "Claude does not support image attachments".to_string(),
+            ));
+        }
+
         let sid_opt = self.native_session_id.read().await.clone();
 
         // Cross-provider context injection:
@@ -313,6 +319,10 @@ impl ProviderSession for ClaudeSession {
 
     fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
+    }
+
+    async fn supports_images(&self) -> bool {
+        false
     }
 }
 

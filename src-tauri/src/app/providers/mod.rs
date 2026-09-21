@@ -91,7 +91,7 @@ pub trait ProviderSession: Send + Sync {
 
     /// Check whether this session supports image attachments.
     async fn supports_images(&self) -> bool {
-        true
+        false
     }
 }
 

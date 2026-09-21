@@ -3482,7 +3482,7 @@ async fn test_phase26_at08_gemini_preflight_and_content_block() {
         "session-123",
         "Describe photo",
         &[img_ref],
-    );
+    ).unwrap();
 
     let prompt_arr = params.get("prompt").and_then(|v| v.as_array()).expect("prompt must be an array");
     assert_eq!(prompt_arr.len(), 2);
@@ -3627,6 +3627,10 @@ async fn test_phase26_at10_provider_switch_context_preserves_attachments() {
     assert_eq!(turn1_in_context.attachments.len(), 1);
     assert_eq!(turn1_in_context.attachments[0].name, "diagram.png");
     assert_eq!(turn1_in_context.attachments[0].kind, seralyn_lib::app::attachments::AttachmentKind::Image);
+
+    // Verify format_context_for_prompt serializes historical attachments into prompt text
+    let formatted_prompt = seralyn_lib::app::conversation::context::format_context_for_prompt(&turn2_msg.context, &turn2_msg.content);
+    assert!(formatted_prompt.contains("[Attachment: diagram.png | image/png"));
 }
 
 #[tokio::test]
@@ -3690,6 +3694,10 @@ async fn test_phase26_at11_resume_failure_fallback_context_delivery() {
     let turn1 = &fresh_msg.context[0];
     assert_eq!(turn1.attachments.len(), 1);
     assert_eq!(turn1.attachments[0].name, "report.pdf");
+
+    // Verify format_context_for_prompt serializes historical attachments into fallback prompt text
+    let formatted_prompt = seralyn_lib::app::conversation::context::format_context_for_prompt(&fresh_msg.context, &fresh_msg.content);
+    assert!(formatted_prompt.contains("[Attachment: report.pdf | application/pdf"));
 }
 
 #[tokio::test]
@@ -3708,6 +3716,27 @@ async fn test_phase26_at12_staged_attachment_removal() {
     assert!(seralyn_lib::app::db::attachments::get_attachment(&db, &att.id).unwrap().is_none());
     // Disk file removed
     assert!(!std::path::Path::new(&att.path).exists());
+
+    // Stage a new attachment and attach it to a message
+    let att2 = manager.save_attachment(&conv.id, "sent.txt", b"Sent file data", None).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Here is sent file",
+        ProviderKind::Claude,
+        vec![att2.id.clone()],
+        None,
+        None,
+        None,
+        tx,
+    ).await.unwrap();
+
+    // Verify deleting an already-attached attachment fails with AppError::InvalidInput
+    let del_attached_res = manager.delete_attachment(&conv.id, &att2.id);
+    assert!(del_attached_res.is_err(), "Cannot delete an attachment that is already attached");
+    assert!(del_attached_res.unwrap_err().to_string().contains("already been attached"));
+    assert!(seralyn_lib::app::db::attachments::get_attachment(&db, &att2.id).unwrap().is_some());
+    assert!(std::path::Path::new(&att2.path).exists());
 }
 
 #[test]
@@ -3842,6 +3871,134 @@ async fn test_phase26_at16_full_regression_verification() {
     assert_eq!(sessions.len(), 1);
     assert_eq!(sessions[0].provider, "claude");
     assert_eq!(sessions[0].model.as_deref(), Some("claude-3-7-sonnet"));
+}
+
+#[tokio::test]
+async fn test_phase26_at17_reusing_attached_attachment_rejected() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-17 Reusing Attached")).unwrap();
+
+    let att = manager.save_attachment(&conv.id, "file1.txt", b"Content 1", None).unwrap();
+    let (tx1, _rx1) = tokio::sync::mpsc::channel(100);
+    manager.send_message_with_attachments(
+        &conv.id,
+        "Message 1",
+        ProviderKind::Claude,
+        vec![att.id.clone()],
+        None,
+        None,
+        None,
+        tx1,
+    ).await.unwrap();
+
+    // Turn 2: Attempting to reuse the same attachment ID (which is now attached) must fail
+    let (tx2, _rx2) = tokio::sync::mpsc::channel(100);
+    let res2 = manager.send_message_with_attachments(
+        &conv.id,
+        "Message 2 reusing file1",
+        ProviderKind::Claude,
+        vec![att.id.clone()],
+        None,
+        None,
+        None,
+        tx2,
+    ).await;
+
+    assert!(res2.is_err(), "Reusing attached attachment must be rejected");
+    let err_str = res2.unwrap_err().to_string();
+    assert!(err_str.contains("not in 'staged' state"), "Error was: {}", err_str);
+}
+
+#[tokio::test]
+async fn test_phase26_at18_duplicate_attachment_ids_rejected() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, true, false);
+    let conv = manager.create_conversation(Some("AT-18 Duplicate IDs")).unwrap();
+
+    let att = manager.save_attachment(&conv.id, "single.txt", b"Single content", None).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    let res = manager.send_message_with_attachments(
+        &conv.id,
+        "Duplicate IDs test",
+        ProviderKind::Claude,
+        vec![att.id.clone(), att.id.clone()],
+        None,
+        None,
+        None,
+        tx,
+    ).await;
+
+    assert!(res.is_err(), "Duplicate attachment IDs must be rejected");
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("Duplicate attachment ID"), "Error was: {}", err_str);
+}
+
+#[tokio::test]
+async fn test_phase26_at19_claude_image_preflight_rejection() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Claude, false, false);
+    let conv = manager.create_conversation(Some("AT-19 Claude Image Rejection")).unwrap();
+
+    let img = manager.save_attachment(&conv.id, "pic.png", &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A], Some("image/png")).unwrap();
+    let (tx, _rx) = tokio::sync::mpsc::channel(100);
+    let res = manager.send_message_with_attachments(
+        &conv.id,
+        "Here is image for Claude",
+        ProviderKind::Claude,
+        vec![img.id],
+        None,
+        None,
+        None,
+        tx,
+    ).await;
+
+    assert!(res.is_err(), "Claude must reject image attachments");
+    let err_str = res.unwrap_err().to_string();
+    assert!(err_str.contains("Image attachments are not supported"), "Error was: {}", err_str);
+}
+
+#[tokio::test]
+async fn test_phase26_at20_non_image_attachments_delivered_to_codex_and_gemini() {
+    let (_db, manager, _sent, _fail_resume) = create_attachment_test_manager(ProviderKind::Codex, true, false);
+    let conv = manager.create_conversation(Some("AT-20 Non-image Delivery")).unwrap();
+
+    let doc = manager.save_attachment(&conv.id, "spec.pdf", b"%PDF-1.4 mock pdf content", Some("application/pdf")).unwrap();
+
+    let doc_ref = seralyn_lib::app::providers::AttachmentRef {
+        id: doc.id,
+        name: doc.name,
+        path: std::path::PathBuf::from(&doc.path),
+        mime_type: doc.mime_type,
+        size_bytes: doc.size_bytes,
+        sha256: doc.sha256,
+        kind: doc.kind,
+    };
+
+    // 1. In Codex: Non-image attachment must be formatted into input text
+    let codex_params = seralyn_lib::app::providers::codex::build_codex_turn_params(
+        "thread-123",
+        "Please read the attached spec",
+        &[doc_ref.clone()],
+        None,
+        None,
+    );
+    let codex_input = codex_params.get("input").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(codex_input.len(), 1);
+    let codex_text = codex_input[0].get("text").and_then(|v| v.as_str()).unwrap();
+    assert!(codex_text.contains("[Attached File:"));
+    assert!(codex_text.contains("spec.pdf"));
+    assert!(codex_text.contains("Please read the attached spec"));
+
+    // 2. In Gemini: Non-image attachment must be formatted into prompt text block
+    let gemini_params = seralyn_lib::app::providers::gemini::build_gemini_prompt_params(
+        "session-123",
+        "Please read the attached spec",
+        &[doc_ref],
+    ).unwrap();
+    let gemini_prompt = gemini_params.get("prompt").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(gemini_prompt.len(), 1);
+    let gemini_text = gemini_prompt[0].get("text").and_then(|v| v.as_str()).unwrap();
+    assert!(gemini_text.contains("[Attached File:"));
+    assert!(gemini_text.contains("spec.pdf"));
+    assert!(gemini_text.contains("Please read the attached spec"));
 }
 
 

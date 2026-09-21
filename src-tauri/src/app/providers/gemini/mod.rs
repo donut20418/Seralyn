@@ -519,7 +519,7 @@ impl ProviderSession for GeminiSession {
 
         // Cross-provider context injection:
         let prompt_text = format_context_for_prompt(&message.context, &message.content);
-        let prompt_params = build_gemini_prompt_params(&sid, &prompt_text, &message.attachments);
+        let prompt_params = build_gemini_prompt_params(&sid, &prompt_text, &message.attachments)?;
 
         let _ = self.transport.request_with_timeout(
             "session/prompt",
@@ -686,30 +686,44 @@ pub fn build_gemini_prompt_params(
     session_id: &str,
     prompt_text: &str,
     attachments: &[AttachmentRef],
-) -> Value {
+) -> Result<Value> {
     let mut prompt_blocks = Vec::new();
+    let mut non_image_header = String::new();
 
     for att in attachments {
         if att.kind == AttachmentKind::Image {
-            let data = std::fs::read(&att.path).unwrap_or_default();
+            let data = std::fs::read(&att.path)
+                .map_err(|e| crate::app::error::AppError::Io(e))?;
             let b64 = crate::app::attachments::base64_encode(&data);
             prompt_blocks.push(json!({
                 "type": "image",
                 "data": b64,
                 "mimeType": att.mime_type,
             }));
+        } else {
+            let line = format!("[Attached File: {} ({}, {:.1} KB)]", att.path.to_string_lossy(), att.name, att.size_bytes as f64 / 1024.0);
+            if !non_image_header.is_empty() {
+                non_image_header.push('\n');
+            }
+            non_image_header.push_str(&line);
         }
     }
 
+    let final_prompt = if !non_image_header.is_empty() {
+        format!("{}\n\n{}", non_image_header, prompt_text)
+    } else {
+        prompt_text.to_string()
+    };
+
     prompt_blocks.push(json!({
         "type": "text",
-        "text": prompt_text,
+        "text": final_prompt,
     }));
 
-    json!({
+    Ok(json!({
         "sessionId": session_id,
         "prompt": prompt_blocks,
-    })
+    }))
 }
 
 #[cfg(test)]

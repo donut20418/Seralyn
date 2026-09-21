@@ -154,8 +154,14 @@ pub fn attach_to_message(db: &Database, message_id: &str, attachment_ids: &[Stri
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
     for id in attachment_ids {
-        stmt.execute(params![message_id, id])
+        let rows = stmt.execute(params![message_id, id])
             .map_err(|e| AppError::Database(e.to_string()))?;
+        if rows != 1 {
+            return Err(AppError::Database(format!(
+                "Failed to attach attachment {}: expected 1 affected row, got {}",
+                id, rows
+            )));
+        }
     }
 
     Ok(())

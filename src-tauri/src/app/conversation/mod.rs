@@ -173,6 +173,15 @@ impl ConversationManager {
         }
 
         // 2. Validate and load attachment records (INV-A2, INV-A3, INV-A4, INV-A5)
+        let mut seen_ids = std::collections::HashSet::new();
+        for att_id in &attachment_ids {
+            if !seen_ids.insert(att_id) {
+                return Err(crate::app::error::AppError::InvalidInput(format!(
+                    "Duplicate attachment ID in message: {}", att_id
+                )));
+            }
+        }
+
         let mut aggregate_size: u64 = 0;
         let mut validated_records = Vec::with_capacity(attachment_ids.len());
         let mut attachment_refs = Vec::with_capacity(attachment_ids.len());
@@ -189,11 +198,11 @@ impl ConversationManager {
                 )));
             }
 
-            // Must be staged or attached to this conversation
-            if record.state != "staged" && record.state != "attached" {
+            // Must be staged (cannot reuse already attached attachments)
+            if record.state != "staged" || record.message_id.is_some() {
                 return Err(crate::app::error::AppError::InvalidInput(format!(
-                    "Attachment {} is not in a valid state (current: {})",
-                    att_id, record.state
+                    "Attachment {} is not in 'staged' state (current state: {}, message_id: {:?})",
+                    att_id, record.state, record.message_id
                 )));
             }
 
@@ -820,11 +829,16 @@ impl ConversationManager {
         uuid::Uuid::parse_str(attachment_id)
             .map_err(|_| crate::app::error::AppError::InvalidInput("Invalid attachment id".to_string()))?;
 
-        // 1. If attachment exists in DB, verify ownership and remove DB record (INV-A2)
+        // 1. If attachment exists in DB, verify ownership and ensure it is still staged (INV-A2)
         if let Ok(Some(record)) = attachments::get_attachment(&self.db, attachment_id) {
             if record.conversation_id != conversation_id {
                 return Err(crate::app::error::AppError::InvalidInput(
                     "Attachment does not belong to specified conversation".to_string(),
+                ));
+            }
+            if record.state != "staged" || record.message_id.is_some() {
+                return Err(crate::app::error::AppError::InvalidInput(
+                    "Cannot delete an attachment that has already been attached to a message".to_string(),
                 ));
             }
             attachments::delete_attachment_record(&self.db, attachment_id)?;
