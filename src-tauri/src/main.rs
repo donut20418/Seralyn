@@ -9,6 +9,7 @@ use seralyn_lib::app::events::ProviderKind;
 use seralyn_lib::app::providers::{ProviderManager, ProviderStatus};
 use std::str::FromStr;
 use std::sync::Arc;
+use serde::Deserialize;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use tracing::{error, info};

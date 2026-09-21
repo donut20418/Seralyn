@@ -3130,7 +3130,7 @@ struct AttachmentMockSession {
 impl seralyn_lib::app::providers::ProviderSession for AttachmentMockSession {
     async fn send(&self, msg: seralyn_lib::app::providers::ProviderMessage) -> seralyn_lib::app::error::Result<()> {
         if self.fail_send {
-            return Err(seralyn_lib::app::error::AppError::ProviderError("Mock send failure".to_string()));
+            return Err(seralyn_lib::app::error::AppError::Provider("Mock send failure".to_string()));
         }
         self.sent_messages.lock().await.push(msg);
         Ok(())
@@ -3178,7 +3178,7 @@ impl seralyn_lib::app::providers::Provider for AttachmentMockProvider {
     }
     async fn resume_session(&self, _native_session_id: &str, _config: seralyn_lib::app::providers::SessionConfig) -> seralyn_lib::app::error::Result<Box<dyn seralyn_lib::app::providers::ProviderSession>> {
         if self.fail_resume.load(std::sync::atomic::Ordering::SeqCst) {
-            return Err(seralyn_lib::app::error::AppError::ProviderError("Mock resume failed".to_string()));
+            return Err(seralyn_lib::app::error::AppError::Provider("Mock resume failed".to_string()));
         }
         Ok(Box::new(self.session.clone()))
     }
