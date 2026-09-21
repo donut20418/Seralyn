@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use seralyn_lib::app::db::conversations;
 use seralyn_lib::app::db::messages;
 use seralyn_lib::app::db::Database;
