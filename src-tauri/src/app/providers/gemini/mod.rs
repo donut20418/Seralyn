@@ -687,10 +687,7 @@ pub fn build_gemini_prompt_params(
     prompt_text: &str,
     attachments: &[AttachmentRef],
 ) -> Value {
-    let mut prompt_blocks = vec![json!({
-        "type": "text",
-        "text": prompt_text,
-    })];
+    let mut prompt_blocks = Vec::new();
 
     for att in attachments {
         if att.kind == AttachmentKind::Image {
@@ -703,6 +700,11 @@ pub fn build_gemini_prompt_params(
             }));
         }
     }
+
+    prompt_blocks.push(json!({
+        "type": "text",
+        "text": prompt_text,
+    }));
 
     json!({
         "sessionId": session_id,

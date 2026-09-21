@@ -3665,7 +3665,8 @@ async fn test_phase26_at11_resume_failure_fallback_context_delivery() {
         let _ = seralyn_lib::app::db::provider_sessions::update_synced_seq(&db, &s.id, asst.seq);
     }
 
-    // Simulate native resume failure
+    // Simulate native resume failure (drop in-memory cache to force resume from SQLite)
+    manager.close_all_sessions().await.unwrap();
     fail_resume.store(true, std::sync::atomic::Ordering::SeqCst);
 
     // Turn 2: send new prompt

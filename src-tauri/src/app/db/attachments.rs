@@ -84,6 +84,10 @@ pub fn create_staged_attachment_with_id(
         ],
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
+    let path = crate::app::attachments::get_conversation_attachment_dir(conversation_id)
+        .map(|d| d.join(stored_name).to_string_lossy().to_string())
+        .unwrap_or_default();
+
     Ok(AttachmentRecord {
         id: id.to_string(),
         conversation_id: conversation_id.to_string(),
@@ -93,11 +97,46 @@ pub fn create_staged_attachment_with_id(
         mime_type: mime_type.to_string(),
         size_bytes,
         size: size_bytes,
-        path: String::new(),
+        path,
         sha256: sha256.to_string(),
         kind,
         state: "staged".to_string(),
         created_at: now,
+    })
+}
+
+fn map_attachment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AttachmentRecord> {
+    let id: String = row.get(0)?;
+    let conversation_id: String = row.get(1)?;
+    let message_id: Option<String> = row.get(2)?;
+    let name: String = row.get(3)?;
+    let stored_name: String = row.get(4)?;
+    let mime_type: String = row.get(5)?;
+    let size_raw: i64 = row.get(6)?;
+    let sha256: String = row.get(7)?;
+    let kind_str: String = row.get(8)?;
+    let kind = kind_str.parse::<AttachmentKind>().map_err(|_| rusqlite::Error::InvalidQuery)?;
+    let state: String = row.get(9)?;
+    let created_at: String = row.get(10)?;
+
+    let path = crate::app::attachments::get_conversation_attachment_dir(&conversation_id)
+        .map(|d| d.join(&stored_name).to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    Ok(AttachmentRecord {
+        id,
+        conversation_id,
+        message_id,
+        name,
+        stored_name,
+        mime_type,
+        size_bytes: size_raw as u64,
+        size: size_raw as u64,
+        path,
+        sha256,
+        kind,
+        state,
+        created_at,
     })
 }
 
@@ -131,27 +170,7 @@ pub fn get_attachment(db: &Database, id: &str) -> Result<Option<AttachmentRecord
          WHERE id = ?1",
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
-    let res = stmt.query_row(params![id], |row| {
-        let kind_str: String = row.get(8)?;
-        let kind = kind_str.parse::<AttachmentKind>().map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let size_raw: i64 = row.get(6)?;
-
-        Ok(AttachmentRecord {
-            id: row.get(0)?,
-            conversation_id: row.get(1)?,
-            message_id: row.get(2)?,
-            name: row.get(3)?,
-            stored_name: row.get(4)?,
-            mime_type: row.get(5)?,
-            size_bytes: size_raw as u64,
-            size: size_raw as u64,
-            path: String::new(),
-            sha256: row.get(7)?,
-            kind,
-            state: row.get(9)?,
-            created_at: row.get(10)?,
-        })
-    });
+    let res = stmt.query_row(params![id], map_attachment_row);
 
     match res {
         Ok(rec) => Ok(Some(rec)),
@@ -170,27 +189,8 @@ pub fn get_attachments_for_message(db: &Database, message_id: &str) -> Result<Ve
          ORDER BY rowid ASC",
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
-    let iter = stmt.query_map(params![message_id], |row| {
-        let kind_str: String = row.get(8)?;
-        let kind = kind_str.parse::<AttachmentKind>().map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let size_raw: i64 = row.get(6)?;
-
-        Ok(AttachmentRecord {
-            id: row.get(0)?,
-            conversation_id: row.get(1)?,
-            message_id: row.get(2)?,
-            name: row.get(3)?,
-            stored_name: row.get(4)?,
-            mime_type: row.get(5)?,
-            size_bytes: size_raw as u64,
-            size: size_raw as u64,
-            path: String::new(),
-            sha256: row.get(7)?,
-            kind,
-            state: row.get(9)?,
-            created_at: row.get(10)?,
-        })
-    }).map_err(|e| AppError::Database(e.to_string()))?;
+    let iter = stmt.query_map(params![message_id], map_attachment_row)
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     let mut result = Vec::new();
     for r in iter {
@@ -209,27 +209,8 @@ pub fn get_attachments_for_conversation(db: &Database, conversation_id: &str) ->
          ORDER BY rowid ASC",
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
-    let iter = stmt.query_map(params![conversation_id], |row| {
-        let kind_str: String = row.get(8)?;
-        let kind = kind_str.parse::<AttachmentKind>().map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let size_raw: i64 = row.get(6)?;
-
-        Ok(AttachmentRecord {
-            id: row.get(0)?,
-            conversation_id: row.get(1)?,
-            message_id: row.get(2)?,
-            name: row.get(3)?,
-            stored_name: row.get(4)?,
-            mime_type: row.get(5)?,
-            size_bytes: size_raw as u64,
-            size: size_raw as u64,
-            path: String::new(),
-            sha256: row.get(7)?,
-            kind,
-            state: row.get(9)?,
-            created_at: row.get(10)?,
-        })
-    }).map_err(|e| AppError::Database(e.to_string()))?;
+    let iter = stmt.query_map(params![conversation_id], map_attachment_row)
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     let mut result = Vec::new();
     for r in iter {
@@ -248,27 +229,8 @@ pub fn get_staged_attachments(db: &Database, conversation_id: &str) -> Result<Ve
          ORDER BY rowid ASC",
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
-    let iter = stmt.query_map(params![conversation_id], |row| {
-        let kind_str: String = row.get(8)?;
-        let kind = kind_str.parse::<AttachmentKind>().map_err(|_| rusqlite::Error::InvalidQuery)?;
-        let size_raw: i64 = row.get(6)?;
-
-        Ok(AttachmentRecord {
-            id: row.get(0)?,
-            conversation_id: row.get(1)?,
-            message_id: row.get(2)?,
-            name: row.get(3)?,
-            stored_name: row.get(4)?,
-            mime_type: row.get(5)?,
-            size_bytes: size_raw as u64,
-            size: size_raw as u64,
-            path: String::new(),
-            sha256: row.get(7)?,
-            kind,
-            state: row.get(9)?,
-            created_at: row.get(10)?,
-        })
-    }).map_err(|e| AppError::Database(e.to_string()))?;
+    let iter = stmt.query_map(params![conversation_id], map_attachment_row)
+        .map_err(|e| AppError::Database(e.to_string()))?;
 
     let mut result = Vec::new();
     for r in iter {

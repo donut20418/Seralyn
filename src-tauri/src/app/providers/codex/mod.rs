@@ -466,10 +466,7 @@ pub fn build_codex_turn_params(
     model: Option<&str>,
     effort: Option<&str>,
 ) -> Value {
-    let mut input_items = vec![json!({
-        "type": "text",
-        "text": prompt_text,
-    })];
+    let mut input_items = Vec::new();
 
     for att in attachments {
         if att.kind == AttachmentKind::Image {
@@ -479,6 +476,11 @@ pub fn build_codex_turn_params(
             }));
         }
     }
+
+    input_items.push(json!({
+        "type": "text",
+        "text": prompt_text,
+    }));
 
     let mut turn_params = json!({
         "threadId": thread_id,
