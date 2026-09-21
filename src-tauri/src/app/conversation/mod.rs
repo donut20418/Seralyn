@@ -605,9 +605,8 @@ impl ConversationManager {
         )?;
 
         // 7. Transition attachments in DB from staged to attached and associate with user_msg (INV-A8)
-        for rec in &validated_records {
-            attachments::attach_to_message(&self.db, &rec.id, &user_msg.id)?;
-        }
+        let attached_ids: Vec<String> = validated_records.iter().map(|r| r.id.clone()).collect();
+        attachments::attach_to_message(&self.db, &user_msg.id, &attached_ids)?;
 
         // Auto-title conversation if title is unset or default
         if let Ok(conv) = conversations::get_conversation(&self.db, conversation_id) {

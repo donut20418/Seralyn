@@ -163,6 +163,7 @@ pub fn get_messages(db: &Database, conversation_id: &str) -> Result<Vec<Message>
                 mime_type: row.get(5)?,
                 size_bytes: size_raw as u64,
                 size: size_raw as u64,
+                path: String::new(),
                 sha256: row.get(7)?,
                 kind,
                 state: row.get(9)?,

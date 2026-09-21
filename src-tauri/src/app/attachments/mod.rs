@@ -176,8 +176,8 @@ pub fn get_attachments_base_dir() -> Result<PathBuf> {
     let mut root_path = dirs::data_local_dir().unwrap_or_else(|| PathBuf::from("."));
     root_path.push("Seralyn");
     root_path.push("attachments");
-    std::fs::create_dir_all(&root_path).map_err(AppError::Io)?;
-    root_path.canonicalize().map_err(AppError::Io)
+    std::fs::create_dir_all(&root_path)?;
+    Ok(root_path.canonicalize()?)
 }
 
 /// Returns and verifies the directory for a specific conversation:
@@ -190,8 +190,8 @@ pub fn get_conversation_attachment_dir(conversation_id: &str) -> Result<PathBuf>
 
     let base = get_attachments_base_dir()?;
     let conv_dir = base.join(conversation_id);
-    std::fs::create_dir_all(&conv_dir).map_err(AppError::Io)?;
-    let canon_conv_dir = conv_dir.canonicalize().map_err(AppError::Io)?;
+    std::fs::create_dir_all(&conv_dir)?;
+    let canon_conv_dir = conv_dir.canonicalize()?;
 
     // Strict containment verification: canon_conv_dir must be a direct child of base
     if !canon_conv_dir.starts_with(&base) || canon_conv_dir.parent() != Some(base.as_path()) {
@@ -216,7 +216,7 @@ pub fn resolve_and_verify_managed_path(conversation_id: &str, stored_name: &str)
         )));
     }
 
-    let canon_dest = dest_path.canonicalize().map_err(AppError::Io)?;
+    let canon_dest = dest_path.canonicalize()?;
     if !canon_dest.starts_with(&conv_dir) || canon_dest.parent() != Some(conv_dir.as_path()) {
         return Err(AppError::InvalidInput(
             "Path traversal or junction escape detected in attachment file path".to_string(),

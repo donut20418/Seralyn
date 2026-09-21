@@ -93,6 +93,7 @@ pub fn create_staged_attachment_with_id(
         mime_type: mime_type.to_string(),
         size_bytes,
         size: size_bytes,
+        path: String::new(),
         sha256: sha256.to_string(),
         kind,
         state: "staged".to_string(),
@@ -109,7 +110,7 @@ pub fn attach_to_message(db: &Database, message_id: &str, attachment_ids: &[Stri
     let conn = db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "UPDATE attachments
-         SET message_id = ?1, state = 'attached'
+         SET state = 'attached', message_id = ?1
          WHERE id = ?2 AND state = 'staged'",
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
@@ -121,12 +122,13 @@ pub fn attach_to_message(db: &Database, message_id: &str, attachment_ids: &[Stri
     Ok(())
 }
 
-/// Retrieves a single attachment record by its ID.
+/// Retrieves a single attachment by ID.
 pub fn get_attachment(db: &Database, id: &str) -> Result<Option<AttachmentRecord>> {
     let conn = db.conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, conversation_id, message_id, name, stored_name, mime_type, size_bytes, sha256, kind, state, created_at
-         FROM attachments WHERE id = ?1",
+         FROM attachments
+         WHERE id = ?1",
     ).map_err(|e| AppError::Database(e.to_string()))?;
 
     let res = stmt.query_row(params![id], |row| {
@@ -143,6 +145,7 @@ pub fn get_attachment(db: &Database, id: &str) -> Result<Option<AttachmentRecord
             mime_type: row.get(5)?,
             size_bytes: size_raw as u64,
             size: size_raw as u64,
+            path: String::new(),
             sha256: row.get(7)?,
             kind,
             state: row.get(9)?,
@@ -181,6 +184,7 @@ pub fn get_attachments_for_message(db: &Database, message_id: &str) -> Result<Ve
             mime_type: row.get(5)?,
             size_bytes: size_raw as u64,
             size: size_raw as u64,
+            path: String::new(),
             sha256: row.get(7)?,
             kind,
             state: row.get(9)?,
@@ -219,6 +223,7 @@ pub fn get_attachments_for_conversation(db: &Database, conversation_id: &str) ->
             mime_type: row.get(5)?,
             size_bytes: size_raw as u64,
             size: size_raw as u64,
+            path: String::new(),
             sha256: row.get(7)?,
             kind,
             state: row.get(9)?,
@@ -257,6 +262,7 @@ pub fn get_staged_attachments(db: &Database, conversation_id: &str) -> Result<Ve
             mime_type: row.get(5)?,
             size_bytes: size_raw as u64,
             size: size_raw as u64,
+            path: String::new(),
             sha256: row.get(7)?,
             kind,
             state: row.get(9)?,
