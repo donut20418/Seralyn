@@ -3058,7 +3058,7 @@ async fn test_resume_session_failure_falls_back_to_fresh_session_with_restored_h
         tx,
     ).await.unwrap();
 
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // 6. Assertions:
     // a) resume_session was attempted with the dead session ID
@@ -3102,15 +3102,16 @@ async fn test_resume_session_failure_falls_back_to_fresh_session_with_restored_h
     drop(created_guard);
 
     // e) The fresh session's snapshot does NOT inherit the 25,000 native context tokens of the dead session
-    let new_snap = usage_snapshots::get_latest_usage_snapshot_for_session(&db, &conv.id, &active_sess.id).unwrap();
-    if let Some(snap) = new_snap {
-        if let Some(ctx) = snap.context_tokens {
-            assert!(
-                (ctx as u64) < 25_000,
-                "Fresh session context tokens ({ctx}) must NOT inherit the 25,000 native context tokens of the dead session"
-            );
-        }
-    }
+    let snap = usage_snapshots::get_latest_usage_snapshot_for_session(&db, &conv.id, &active_sess.id)
+        .unwrap()
+        .expect("Fresh session snapshot must exist");
+    let ctx = snap
+        .context_tokens
+        .expect("Fresh session context_tokens must exist");
+    assert!(
+        (ctx as u64) < 25_000,
+        "Fresh session context tokens ({ctx}) must not inherit dead-session occupancy"
+    );
 }
 
 

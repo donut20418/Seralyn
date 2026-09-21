@@ -859,7 +859,7 @@ Following audit on commit `2c297fe`, the remaining items have been comprehensive
     3. Resets `synced_through_seq = 0;` so `build_adaptive_context` delivers all prior canonical messages (seq 1..=$N$) to the fresh session.
     4. Resets `effective_existing_native_tokens = 0;` so the fresh session starts from zero native context without inheriting dead session occupancy.
 - **Windows Warning Clean-up**:
-  - Removed unused `#[cfg(windows)] use std::os::windows::process::CommandExt;` in [`src/app/process/mod.rs`](file:///P:/asset_team/Seralyn/src-tauri/src/app/process/mod.rs), as `tokio::process::Command::creation_flags` is an inherent method on Windows.
+  - Removed unused `#[cfg(windows)] use std::os::windows::process::CommandExt;` in [`src/app/process/mod.rs`](src-tauri/src/app/process/mod.rs), as `tokio::process::Command::creation_flags` is an inherent method on Windows.
 
 ### 12. Automated Verification Tests (`fixtures_tests.rs`)
 1. `test_token_estimator_multibyte_and_ceil`: Asserts ceil division on ASCII and conservative estimation on Thai and CJK.
