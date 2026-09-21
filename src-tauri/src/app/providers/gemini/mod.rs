@@ -693,7 +693,7 @@ pub fn build_gemini_prompt_params(
     for att in attachments {
         if att.kind == AttachmentKind::Image {
             let data = std::fs::read(&att.path)
-                .map_err(|e| crate::app::error::AppError::Io(e))?;
+                .map_err(|e| crate::app::error::AppError::Io(e.to_string()))?;
             let b64 = crate::app::attachments::base64_encode(&data);
             prompt_blocks.push(json!({
                 "type": "image",

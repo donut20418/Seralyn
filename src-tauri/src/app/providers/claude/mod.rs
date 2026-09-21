@@ -13,7 +13,7 @@ use crate::app::error::Result;
 use crate::app::events::{NormalizedEvent, ProviderKind};
 use crate::app::process::{detect_executable, spawn, ManagedProcess, SpawnConfig};
 use crate::app::providers::{
-    resolve_profile_dir, AuthStatus, InstallationInfo, PermissionMode, Provider,
+    resolve_profile_dir, AttachmentKind, AuthStatus, InstallationInfo, PermissionMode, Provider,
     ProviderCapabilities, ProviderMessage, ProviderSession, SessionConfig, SessionMetadata,
 };
 use parser::{claude_event_to_normalized, parse_claude_line, ClaudeEvent};
