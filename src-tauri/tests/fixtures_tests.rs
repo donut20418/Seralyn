@@ -1458,7 +1458,7 @@ fn test_adapter_profile_isolation_and_native_effort_contracts() {
     assert!(start_params.get("reasoningEffort").is_none(), "Codex thread/start must use 'effort', NOT 'reasoningEffort'");
 
     // 3. Real production Gemini prompt builder contract:
-    let prompt_params = seralyn_lib::app::providers::gemini::build_gemini_prompt_params("sid-123", "Hello", &[]);
+    let prompt_params = seralyn_lib::app::providers::gemini::build_gemini_prompt_params("sid-123", "Hello", &[]).unwrap();
     assert!(prompt_params.get("prompt").is_some());
     assert!(prompt_params.get("model").is_none(), "Gemini ACP session/prompt must NOT contain 'model'");
 
